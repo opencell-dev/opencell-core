@@ -382,7 +382,7 @@ The user accepted every recommended answer of the draft, with the changes marked
 Settled afterwards (2026-09-27):
 - the VM is ID 115 at 10.0.0.60 (§16.2; both checked free on the host);
 - the additional IPv4 15.204.144.144 is **not available** to OpenCell (the user), so option (b) of §16.3 is dropped;
-- the routing authority key is held by the user, offline on the laptop (§14.2; the recommendation, not contradicted).
+- the routing authority key is held by the user **on the laptop and on the Proxmox host (147.135.11.61), never inside the oc-core VM** (§14.2; the user, 2026-09-27).
 
 ## 14. Several cores: home core and asynchronous replicas
 
@@ -414,7 +414,7 @@ The **longest prefix wins**, so an exchange block can sit inside another tenant'
 | `883 1 606 555` | 2 | B | core 2 (B's server) | core 1 | 3 |
 | `883 1 859` | 3 | A | core 1 | — | 1 |
 
-- **Signed** as a whole (version number, Ed25519) by the **routing authority**: an offline key held by the network's operator (today the user) and used by `oc-core admin route sign` on the laptop. Adding a core or a block, changing secondaries, and a block transfer (§14.5) are new versions.
+- **Signed** as a whole (version number, Ed25519) by the **routing authority**: an offline key held by the network's operator (today the user), kept on the laptop and on the Proxmox host (root-only, outside every VM; never in the oc-core VM or its backups), and used by `oc-core admin route sign` from either. Adding a core or a block, changing secondaries, and a block transfer (§14.5) are new versions.
 - **Takeover records** (§14.4) change one block's home and epoch without the authority. They are signed by the promoted core's key and valid only if that core is a listed secondary of the block and the epoch is exactly one higher.
 - Every core keeps the newest valid version and the takeover records, and passes them on over OCSS (§15.3). A core that sees a higher epoch for a block it holds as home stops writing it at once.
 - A single-core network has a table with one core and every block at home: the same code path, no OCSS links.

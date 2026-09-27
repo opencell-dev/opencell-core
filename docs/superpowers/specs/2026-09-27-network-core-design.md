@@ -379,10 +379,10 @@ The user accepted every recommended answer of the draft, with the changes marked
 13. *Added:* cores talk **OCSS**, the OpenCell Signalling System (§15); its message design gets its own spec in plan 10.
 14. *Added:* **numbering v2** throughout (`numbering-plan.md` v0.2).
 
-Still for the user (none blocks plans 6a–8):
-- the VM's ID and address (recommended 115 and 10.0.0.60, §16.2);
-- whether the additional IPv4 15.204.144.144 is free for OpenCell (§16.3 option b);
-- who holds the routing authority key (recommended: the user, offline on the laptop, §14.2).
+Settled afterwards (2026-09-27):
+- the VM is ID 115 at 10.0.0.60 (§16.2; both checked free on the host);
+- the additional IPv4 15.204.144.144 is **not available** to OpenCell (the user), so option (b) of §16.3 is dropped;
+- the routing authority key is held by the user, offline on the laptop (§14.2; the recommendation, not contradicted).
 
 ## 14. Several cores: home core and asynchronous replicas
 
@@ -589,10 +589,10 @@ An ISO install works too. The cloud image is recommended because the same script
 | Option | How | For | Against |
 |---|---|---|---|
 | **(a) Port forward on the main address (recommended now)** | A host nftables rule, next to the existing NAT for `internal`: TCP `147.135.11.61:7443` → `10.0.0.60:7443`, plus a forward accept for that port only | One rule; the VM stays private; nothing else on the host changes | A non-standard port, which some guest networks block |
-| (b) The additional IPv4 | `15.204.144.144` forwarded to the VM (443 and 7443), or routed to it as a /32 | Port 443 passes almost everywhere; a dedicated address and DNS name for OpenCell | Only if the address is not already in use (not checked); it is the host's only spare IPv4 |
+| ~~(b) The additional IPv4~~ | Dropped: `15.204.144.144` is not available to OpenCell (the user, 2026-09-27) | | |
 | (c) Tailscale | Tailscale in the VM, or the host advertising 10.0.0.0/24 as a subnet route; Pis join the tailnet | No public port; convenient for the user's own Pis | Every cell needs a tailnet login; not for other tenants' cells |
 
-- **Recommendation:** (a) now; (b) once the user confirms 15.204.144.144 is free, and cells then use port 443. (c) serves admin SSH (the VM's SSH is reachable only from the host and the tailnet) and, optionally, the user's own Pis during bring-up.
+- **Decision:** (a). If port 7443 proves blocked on guest networks, a later change can add 443 on the main address only if the host's existing services leave it free (it is not checked here). (c) serves admin SSH (the VM's SSH is reachable only from the host and the tailnet) and, optionally, the user's own Pis during bring-up.
 - mTLS is required on every path: neither Tailscale nor NAT is the trust boundary. Cell connections always go out from the cell (§6), so a Pi behind home NAT needs no port forwarding with any option.
 - Not through `nginx-proxy`: `oc-core` terminates its own mTLS and checks client certificates, which an HTTP proxy would break. If port 443 on the main address is ever wanted, nginx's `stream` module with SNI passthrough can forward it without terminating TLS.
 - No IPv6 for the VM: the host has a single /128.

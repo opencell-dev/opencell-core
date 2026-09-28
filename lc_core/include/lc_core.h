@@ -12,9 +12,12 @@
 #include "lc_core_store.h"
 #include "lc_sig_qr.h"
 
-#define LC_CORE_LINKS   16u
-#define LC_CORE_PING_US 5000000u  /* PING when nothing was sent on a link for this long */
-#define LC_CORE_DEAD_US 15000000u /* a link that sent nothing for this long is down */
+#define LC_CORE_LINKS    16u
+#define LC_CORE_PING_US  5000000u  /* PING when nothing was sent on a link for this long */
+#define LC_CORE_DEAD_US  15000000u /* a link that sent nothing for this long is down */
+#define LC_CORE_CALLS    32u
+#define LC_CORE_SETUP_US 10000000u /* CALL_ROUTE to the callee's alert or release (§7.4) */
+#define LC_CORE_ECHO_US  3000000u  /* the echo service rings this long, then answers */
 
 typedef struct {
     uint16_t core_id;
@@ -40,6 +43,23 @@ typedef struct {
     uint64_t last_rx, last_tx;
 } lc_core_link_t;
 
+/* One leg of a call: a cell and the ref the leg started with. */
+typedef struct {
+    uint32_t cell; /* 0: the echo service */
+    uint32_t ref;
+} lc_core_leg_t;
+
+enum { LC_CORE_CALL_ROUTING = 1, LC_CORE_CALL_ALERTING = 2, LC_CORE_CALL_ACTIVE = 3 };
+
+typedef struct {
+    int           used;
+    uint8_t       state;
+    lc_core_leg_t a, b; /* a: the caller's leg (the cell's ref); b: the callee's (a core ref) */
+    uint8_t       caller[LC_SIG_NUMBER_LEN], called[LC_SIG_NUMBER_LEN];
+    uint64_t      due;           /* ROUTING: give up then; the echo service: answer then */
+    uint32_t      setup, answer; /* unix s; answer 0 = not answered */
+} lc_core_call_t;
+
 typedef struct {
     lc_core_io_t    io;
     lc_core_cfg_t   cfg;
@@ -47,6 +67,8 @@ typedef struct {
     lc_core_route_t route;
     lc_core_link_t  links[LC_CORE_LINKS];
     uint64_t        now; /* the now_us of the call being served */
+    lc_core_call_t  calls[LC_CORE_CALLS];
+    uint32_t        next_ref;
 } lc_core_t;
 
 /* A new network key pair (X25519 from random32) with its registration

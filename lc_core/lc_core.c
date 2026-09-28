@@ -69,11 +69,13 @@ int lc_core_send(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m)
     return l != NULL ? send_link(k, l, m) : -1;
 }
 
-/* A cell's link is gone: what depended on it goes too. */
+/* A cell's link is gone: its calls go too (§7.9, "Done means": no
+ * half-open call on the other side). Its locations stay until a new boot. */
 static void cell_gone(lc_core_t *k, uint32_t cell_id, uint64_t now)
 {
     (void)now;
     lc_core_logf(k, "cell %u: link down", (unsigned)cell_id);
+    lc_core_sw_cell_gone(k, cell_id);
 }
 
 /* The core drops a link itself: the transport is told to close it. */
@@ -174,6 +176,7 @@ static void on_hello(lc_core_t *k, lc_core_link_t *l, const lc_core_msg_t *m, ui
          * never used went with it (network-core spec §7.9) */
         k->st.loc_purge_cell(k->st.ctx, id);
         k->st.av_drop_cell(k->st.ctx, id);
+        lc_core_sw_cell_gone(k, id);
         c.boot_id = m->u.hello.boot_id;
         lc_core_logf(k, "cell %u: new boot, its locations purged", (unsigned)id);
     }
@@ -207,6 +210,13 @@ void lc_core_rx(lc_core_t *k, uint32_t link, const lc_core_msg_t *m, uint64_t no
     }
     if (l->cell_id == 0) return; /* nothing but HELLO before HELLO */
     switch (m->type) { /* each family goes to its own file: HSS, registry, switch */
+    case LC_CORE_CALL_ROUTE:
+    case LC_CORE_CALL_ALERT:
+    case LC_CORE_CALL_ANSWER:
+    case LC_CORE_CALL_RELEASE:
+    case LC_CORE_MEDIA:
+        lc_core_sw_rx(k, l->cell_id, m);
+        break;
     default:
         break;
     }
@@ -228,6 +238,7 @@ void lc_core_tick(lc_core_t *k, uint64_t now_us)
             send_link(k, l, &p);
         }
     }
+    lc_core_sw_tick(k);
 }
 
 int lc_core_cell_add(lc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id)

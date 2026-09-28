@@ -10,6 +10,7 @@
 #include "lc_core_msg.h"
 #include "lc_core_route.h"
 #include "lc_core_store.h"
+#include "lc_sig_qr.h"
 
 #define LC_CORE_LINKS   16u
 #define LC_CORE_PING_US 5000000u  /* PING when nothing was sent on a link for this long */
@@ -68,5 +69,17 @@ void lc_core_tick(lc_core_t *k, uint64_t now_us);
  * drops its link. */
 int  lc_core_cell_add(lc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id);
 int  lc_core_cell_revoke(lc_core_t *k, uint32_t cell_id, uint64_t now_us);
+
+/* Subscribers (admin). number NULL: a random free number in the first NANP
+ * block this core is home for (numbering-plan.md "Assignment Modes"). 0 with
+ * the number in out, or -1: not a valid number, reserved, not in a block
+ * this core is home for, already a subscriber, or the store failed. */
+int  lc_core_sub_add(lc_core_t *k, const uint8_t *number, uint8_t out[LC_SIG_NUMBER_LEN]);
+/* A new activation token for number, valid for valid_s; the number's unused
+ * tokens are voided. *qr is what its QR code carries. 0 or -1. */
+int  lc_core_token_issue(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t valid_s, lc_sig_qr_t *qr);
+/* The subscriber can no longer register: its tokens are voided and its cell
+ * is told (LOC_CANCEL disabled). 0 or -1. */
+int  lc_core_sub_disable(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint64_t now_us);
 
 #endif

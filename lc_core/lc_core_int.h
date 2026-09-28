@@ -14,4 +14,10 @@ int      lc_core_linked(const lc_core_t *k, uint32_t cell_id);
 void     lc_core_audit(lc_core_t *k, uint8_t event, const uint8_t *number, uint32_t tmid, uint32_t cell_id,
                        const char *detail);
 
+/* lc_core_reg.c: the number's location if it is live (an expired one is
+ * deleted): 0 or -1. */
+int      lc_core_loc_live(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out);
+/* Tell the number's cell to drop it (LOC_CANCEL) and forget the location. */
+void     lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint8_t cause);
+
 #endif

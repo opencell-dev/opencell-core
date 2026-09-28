@@ -9,14 +9,17 @@ static int num_eq(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, LC_S
 
 static int begin(void *c)
 {
-    M(c)->undo = M(c)->d;
-    M(c)->in_txn = 1;
+    lc_core_mem_t *m = M(c);
+    if (m->in_txn) return -1; /* already inside a transaction: leave it be */
+    m->undo = m->d;
+    m->in_txn = 1;
     return 0;
 }
 
 static int commit(void *c)
 {
     lc_core_mem_t *m = M(c);
+    if (!m->in_txn) return -1; /* no matching begin(): nothing to commit */
     m->in_txn = 0;
     if (m->fail_commits > 0) {
         m->fail_commits--;
@@ -133,7 +136,7 @@ static int token_put(void *c, const lc_core_token_t *t)
             return 0;
         }
     }
-    if (d->ntoken >= LC_CORE_MEM_SUBS) return -1;
+    if (d->ntoken >= LC_CORE_MEM_TOKENS) return -1;
     d->token[d->ntoken++] = *t;
     return 0;
 }

@@ -1,17 +1,23 @@
 /* The in-memory store: plain arrays behind lc_core_store_t, for the host
  * tests and the simulation. A core restarted over the same lc_core_mem_t
  * keeps everything, as it would over its database. CDRs and audit records
- * keep the newest LC_CORE_MEM_LOG of each. */
+ * keep the newest LC_CORE_MEM_LOG of each.
+ *
+ * The token table is sized separately from LC_CORE_MEM_SUBS: token_void only
+ * deletes a number's *unused* tokens (network-core spec §5), so a used token
+ * is kept forever, and the table must have room for that history to grow
+ * past one live token per subscriber. */
 #ifndef LC_CORE_MEM_H
 #define LC_CORE_MEM_H
 
 #include "lc_core_store.h"
 
-#define LC_CORE_MEM_KEYS  4u
-#define LC_CORE_MEM_CELLS 16u
-#define LC_CORE_MEM_SUBS  64u
-#define LC_CORE_MEM_AVS   256u
-#define LC_CORE_MEM_LOG   64u
+#define LC_CORE_MEM_KEYS   4u
+#define LC_CORE_MEM_CELLS  16u
+#define LC_CORE_MEM_SUBS   64u
+#define LC_CORE_MEM_TOKENS (2u * LC_CORE_MEM_SUBS)
+#define LC_CORE_MEM_AVS    256u
+#define LC_CORE_MEM_LOG    64u
 
 typedef struct {
     lc_core_netkey_t    key[LC_CORE_MEM_KEYS];
@@ -20,7 +26,7 @@ typedef struct {
     unsigned            ncell;
     lc_core_sub_t       sub[LC_CORE_MEM_SUBS];
     unsigned            nsub;
-    lc_core_token_t     token[LC_CORE_MEM_SUBS];
+    lc_core_token_t     token[LC_CORE_MEM_TOKENS];
     unsigned            ntoken;
     lc_core_av_issued_t av[LC_CORE_MEM_AVS];
     unsigned            nav;

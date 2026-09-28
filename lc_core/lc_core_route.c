@@ -9,6 +9,11 @@ void lc_core_route_init(lc_core_route_t *r, uint16_t self)
     r->self = self;
 }
 
+static int nanp_code_ok(const char *c) /* NPA or NXX: 2-9 first, not N11 (numbering-plan.md v0.2) */
+{
+    return c[0] >= '2' && c[0] <= '9' && !(c[1] == '1' && c[2] == '1');
+}
+
 static int prefix_ok(const char *p)
 {
     size_t n = strlen(p);
@@ -16,7 +21,10 @@ static int prefix_ok(const char *p)
     for (size_t i = 0; i < n; i++) {
         if (p[i] < '0' || p[i] > '9') return 0;
     }
-    return p[3] != '1' || n == 7 || n == 10;
+    if (p[3] != '1') return 1; /* not NANP: any 883-prefixed digit string in range */
+    if (n != 7 && n != 10) return 0; /* NANP: NPA or NPA-NXX only */
+    if (!nanp_code_ok(p + 4) || strncmp(p + 4, "883", 3) == 0) return 0; /* illegal or ambiguous NPA */
+    return n != 10 || nanp_code_ok(p + 7); /* illegal NXX */
 }
 
 int lc_core_route_add(lc_core_route_t *r, const char *prefix, uint16_t block_idx, uint16_t home_core)

@@ -64,10 +64,26 @@ static void test_bad_blocks_are_refused(void)
     lc_core_route_init(&r, 1);
     for (unsigned i = 0; i < LC_CORE_BLOCKS; i++) {
         char p[16];
-        snprintf(p, sizeof(p), "8831%03u", 200u + i);
+        unsigned npa = 200u + i + (i >= 11u ? 1u : 0u); /* skip 211: N11, illegal */
+        snprintf(p, sizeof(p), "8831%03u", npa);
         TEST_ASSERT_EQUAL_INT(0, lc_core_route_add(&r, p, (uint16_t)(i + 1u), 1));
     }
     TEST_ASSERT_EQUAL_INT(-1, lc_core_route_add(&r, "8831999", 999, 1)); /* full */
+}
+
+static void test_illegal_nanp_codes_are_refused(void)
+{
+    lc_core_route_t r;
+    lc_core_route_init(&r, 1);
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_route_add(&r, "8831011", 1, 1));    /* NPA first digit not 2-9 */
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_route_add(&r, "8831883", 1, 1));    /* NPA is 883 */
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_route_add(&r, "8831911", 1, 1));    /* NPA is N11 */
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_route_add(&r, "88316061115", 1, 1)); /* not NPA-NXX length */
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_route_add(&r, "8831606111", 1, 1));  /* NXX is N11 */
+    TEST_ASSERT_EQUAL_INT(0, lc_core_route_add(&r, "8831606", 1, 1));      /* legal NPA still accepted */
+    TEST_ASSERT_EQUAL_INT(0, lc_core_route_add(&r, "8831606555", 2, 1));   /* legal NPA-NXX still accepted */
+    /* A full-length (15-digit), non-NANP prefix stays a whole block on its own. */
+    TEST_ASSERT_EQUAL_INT(0, lc_core_route_add(&r, "883442079460000", 3, 1));
 }
 
 static void test_token_ids_carry_the_block(void)
@@ -130,6 +146,7 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_longest_prefix_wins_and_home_is_known);
     RUN_TEST(test_bad_blocks_are_refused);
+    RUN_TEST(test_illegal_nanp_codes_are_refused);
     RUN_TEST(test_token_ids_carry_the_block);
     RUN_TEST(test_reserved_numbers);
     RUN_TEST(test_picked_numbers_are_valid_candidates);

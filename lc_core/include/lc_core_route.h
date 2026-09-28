@@ -27,8 +27,10 @@ typedef struct {
 
 void lc_core_route_init(lc_core_route_t *r, uint16_t self);
 /* 0, or -1: a prefix that is not digits starting 883 (4-15 digits; a NANP
- * prefix is NPA or NPA-NXX: 7 or 10 digits), block index 0, a prefix or
- * index already in the table, or a full table. */
+ * prefix is NPA or NPA-NXX: 7 or 10 digits, with a legal NPA and, for
+ * NPA-NXX, a legal NXX too: 2-9 first digit, not N11, and the NPA not 883 -
+ * the same rules lc_sig applies, numbering-plan.md v0.2), block index 0, a
+ * prefix or index already in the table, or a full table. */
 int lc_core_route_add(lc_core_route_t *r, const char *prefix, uint16_t block_idx, uint16_t home_core);
 /* The block with the longest prefix of number, or NULL (no route). */
 const lc_core_block_t *lc_core_route_find(const lc_core_route_t *r, const uint8_t number[LC_SIG_NUMBER_LEN]);

@@ -10,3 +10,5 @@ function(lc_test name lib)
   target_link_libraries(${name} PRIVATE ${lib} unity)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
+
+lc_test(test_core_msg lc_core)

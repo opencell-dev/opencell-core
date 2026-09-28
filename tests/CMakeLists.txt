@@ -12,3 +12,4 @@ function(lc_test name lib)
 endfunction()
 
 lc_test(test_core_msg lc_core)
+lc_test(test_core_route lc_core)

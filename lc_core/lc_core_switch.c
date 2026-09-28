@@ -16,7 +16,10 @@ static void to_leg(lc_core_t *k, const lc_core_leg_t *leg, uint8_t type, uint8_t
     m.type = type;
     m.u.call.ref = leg->ref;
     m.u.call.cause = cause;
-    lc_core_send(k, leg->cell, &m);
+    if (lc_core_send(k, leg->cell, &m) != 0) {
+        lc_core_logf(k, "cell %u: send of %u (ref %08x, cause %u) failed", (unsigned)leg->cell, (unsigned)type,
+                     (unsigned)leg->ref, (unsigned)cause);
+    }
 }
 
 static void cdr(lc_core_t *k, const lc_core_call_t *c, uint8_t cause)
@@ -31,7 +34,13 @@ static void cdr(lc_core_t *k, const lc_core_call_t *c, uint8_t cause)
     r.answer = c->answer;
     r.end = lc_core_unix(k);
     r.cause = cause;
-    if (k->st.cdr_add(k->st.ctx, &r) != 0) lc_core_logf(k, "CDR write FAILED");
+    if (k->st.cdr_add(k->st.ctx, &r) != 0) {
+        char caller[LC_SIG_NUMBER_TEXT], called[LC_SIG_NUMBER_TEXT];
+        lc_sig_number_to_text(c->caller, caller);
+        lc_sig_number_to_text(c->called, called);
+        lc_core_logf(k, "CDR write FAILED: %s -> %s (%08x/%08x cause %u)", caller, called, (unsigned)c->a.ref,
+                     (unsigned)c->b.ref, cause);
+    }
 }
 
 static void end_call(lc_core_t *k, lc_core_call_t *c, uint8_t cause)
@@ -148,7 +157,10 @@ void lc_core_sw_rx(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m)
     case LC_CORE_CALL_RELEASE:
         if (leg == &c->b && c->state == LC_CORE_CALL_ROUTING && m->u.call.cause == LC_SIG_CAUSE_UNREACHABLE) {
             lc_core_loc_t l; /* §7.4 step 3: no such session there, so the location was stale */
-            if (k->st.loc_get(k->st.ctx, c->called, &l) == 0 && l.cell_id == c->b.cell) k->st.loc_del(k->st.ctx, c->called);
+            if (k->st.loc_get(k->st.ctx, c->called, &l) == 0 && l.cell_id == c->b.cell &&
+                k->st.loc_del(k->st.ctx, c->called) != 0) {
+                lc_core_logf(k, "cell %u: stale location delete failed", (unsigned)c->b.cell);
+            }
         }
         to_leg(k, other, LC_CORE_CALL_RELEASE, m->u.call.cause); /* the same cause on the other leg */
         end_call(k, c, m->u.call.cause);
@@ -158,7 +170,9 @@ void lc_core_sw_rx(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m)
             lc_core_msg_t d = *m;
             const lc_core_leg_t *to = other->cell != 0 ? other : leg; /* the echo service sends it back */
             d.u.media.ref = to->ref;
-            lc_core_send(k, to->cell, &d);
+            if (lc_core_send(k, to->cell, &d) != 0) {
+                lc_core_logf(k, "cell %u: media relay (ref %08x) failed", (unsigned)to->cell, (unsigned)to->ref);
+            }
         }
         break;
     default:

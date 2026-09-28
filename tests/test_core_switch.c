@@ -288,6 +288,145 @@ static void test_repeated_route_is_ignored(void)
     TEST_ASSERT_NULL(sent_since(from, 20, LC_CORE_CALL_OFFER));
 }
 
+/* Follow-up review: a cell that resends HELLO on the SAME link with a new
+ * boot_id (the process restarted, the link itself did not drop) takes a
+ * different branch in lc_core.c's on_hello (old == l) than a reconnect on a
+ * new link, but must still release every call with a leg on that cell. */
+static void test_new_boot_on_same_link_releases_its_calls(void)
+{
+    sw_world();
+    uint32_t ref = offered();
+    int from = NSENT;
+    hello(10, 1, 2); /* same link 10, cell 1, a new boot_id */
+    const lc_core_msg_t *r = sent_since(from, 20, LC_CORE_CALL_RELEASE);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_UINT32(ref, r->u.call.ref);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_CAUSE_NET_FAILURE, r->u.call.cause);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(-1, ST.loc_get(ST.ctx, NA, &l)); /* cell 1's registrations are purged too */
+}
+
+/* Follow-up review: caller and callee both land on the same cell. The core
+ * still runs two legs on that one cell with two different refs, and every
+ * relay must carry the far leg's own ref, not the near one's. */
+static void test_same_cell_both_legs_relay_with_ref_split(void)
+{
+    uint8_t nc[LC_SIG_NUMBER_LEN];
+    sw_world();
+    number("+883160655501236", nc);
+    subscriber(nc, 0xccccu, 1); /* C, also on cell 1 */
+    int from = NSENT;
+    route(10, LEG, NA, nc);
+    const lc_core_msg_t *o = sent_since(from, 10, LC_CORE_CALL_OFFER);
+    TEST_ASSERT_NOT_NULL(o);
+    uint32_t ref = o->u.call_offer.call_ref;
+    TEST_ASSERT_NOT_EQUAL(LEG, ref);
+    call_msg(10, LC_CORE_CALL_ALERT, ref, 0);
+    TEST_ASSERT_EQUAL_UINT32(LEG, sent_since(from, 10, LC_CORE_CALL_ALERT)->u.call.ref);
+    call_msg(10, LC_CORE_CALL_ANSWER, ref, 0);
+    TEST_ASSERT_EQUAL_UINT32(LEG, sent_since(from, 10, LC_CORE_CALL_ANSWER)->u.call.ref);
+    media(10, LEG, "HI"); /* A's leg -> relayed with C's ref */
+    const lc_core_msg_t *d = sent_since(from, 10, LC_CORE_MEDIA);
+    TEST_ASSERT_EQUAL_UINT32(ref, d->u.media.ref);
+    media(10, ref, "YO"); /* C's leg -> relayed with A's ref */
+    d = sent_since(from, 10, LC_CORE_MEDIA);
+    TEST_ASSERT_EQUAL_UINT32(LEG, d->u.media.ref);
+    call_msg(10, LC_CORE_CALL_RELEASE, ref, LC_SIG_CAUSE_NORMAL); /* C hangs up */
+    TEST_ASSERT_EQUAL_UINT32(LEG, sent_since(from, 10, LC_CORE_CALL_RELEASE)->u.call.ref);
+}
+
+/* Follow-up review: the callee's cell may answer without ever alerting
+ * (e.g. auto-answer). The ROUTING -> ACTIVE transition does not require
+ * having passed through ALERTING, and the setup timer must not still fire. */
+static void test_answer_without_prior_alert(void)
+{
+    sw_world();
+    uint32_t ref = offered();
+    int from = NSENT;
+    call_msg(20, LC_CORE_CALL_ANSWER, ref, 0); /* no ALERT first */
+    TEST_ASSERT_EQUAL_UINT32(LEG, sent_since(from, 10, LC_CORE_CALL_ANSWER)->u.call.ref);
+    advance(LC_CORE_SETUP_US);
+    TEST_ASSERT_NULL(sent_since(from, 10, LC_CORE_CALL_RELEASE)); /* answered: the setup timer no longer applies */
+}
+
+/* Follow-up review: ALERT/ANSWER carrying the caller's own leg ref (instead
+ * of the callee's) is not a message this switch accepts from that leg: it
+ * must be ignored, not misrouted or treated as the callee answering. */
+static void test_alert_answer_from_leg_a_ignored(void)
+{
+    sw_world();
+    uint32_t ref = offered();
+    int from = NSENT;
+    call_msg(10, LC_CORE_CALL_ALERT, LEG, 0); /* A is not the callee's leg */
+    TEST_ASSERT_NULL(sent_since(from, 20, LC_CORE_CALL_ALERT));
+    call_msg(10, LC_CORE_CALL_ANSWER, LEG, 0); /* likewise */
+    TEST_ASSERT_NULL(sent_since(from, 20, LC_CORE_CALL_ANSWER));
+    call_msg(20, LC_CORE_CALL_ANSWER, ref, 0); /* the real answer, from B, still works */
+    TEST_ASSERT_EQUAL_UINT32(LEG, sent_since(from, 10, LC_CORE_CALL_ANSWER)->u.call.ref);
+}
+
+/* Follow-up review: the caller gives up while the echo service is still
+ * ringing. The call must end at once, with no late ANSWER from the echo
+ * timer once its due time passes. */
+static void test_caller_hangs_up_while_echo_rings(void)
+{
+    sw_world();
+    int from = NSENT;
+    route(10, LEG, NA, ECHO);
+    TEST_ASSERT_NOT_NULL(sent_since(from, 10, LC_CORE_CALL_ALERT));
+    call_msg(10, LC_CORE_CALL_RELEASE, LEG, LC_SIG_CAUSE_NORMAL);
+    const lc_core_cdr_t *c = last_cdr();
+    TEST_ASSERT_EQUAL_UINT32(0, c->cell_b);
+    TEST_ASSERT_EQUAL_UINT32(0, c->answer); /* never answered */
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_CAUSE_NORMAL, c->cause);
+    from = NSENT;
+    advance(LC_CORE_ECHO_US); /* the call is gone: no late ANSWER from the echo timer */
+    TEST_ASSERT_NULL(sent_since(from, 10, LC_CORE_CALL_ANSWER));
+}
+
+/* Follow-up review: exactly one CDR per ended call, both when a cell going
+ * away ends it and when the setup timer ends it. */
+static void test_cdr_count_delta_is_exactly_one(void)
+{
+    sw_world();
+    uint32_t ref = offered();
+    call_msg(20, LC_CORE_CALL_ANSWER, ref, 0);
+    unsigned n0 = MEM.d.ncdr;
+    lc_core_link_down(&K, 20, NOW);
+    TEST_ASSERT_EQUAL_UINT(n0 + 1u, MEM.d.ncdr); /* the one call with a leg on cell 2 */
+
+    hello(20, 2, 1);
+    offered();
+    n0 = MEM.d.ncdr;
+    advance(LC_CORE_SETUP_US);
+    TEST_ASSERT_EQUAL_UINT(n0 + 1u, MEM.d.ncdr); /* the one call that timed out */
+}
+
+/* Follow-up review: a failed CDR write must not stop the release from
+ * reaching the other leg or leave the call slot stuck as used. */
+static int fail_cdr(void *ctx, const lc_core_cdr_t *c)
+{
+    (void)ctx;
+    (void)c;
+    return -1;
+}
+
+static void test_cdr_add_failure_does_not_break_release(void)
+{
+    sw_world();
+    uint32_t ref = offered();
+    call_msg(20, LC_CORE_CALL_ANSWER, ref, 0);
+    int from = NSENT;
+    int (*real_cdr_add)(void *, const lc_core_cdr_t *) = K.st.cdr_add;
+    K.st.cdr_add = fail_cdr;
+    call_msg(20, LC_CORE_CALL_RELEASE, ref, LC_SIG_CAUSE_NORMAL);
+    K.st.cdr_add = real_cdr_add;
+    TEST_ASSERT_EQUAL_UINT32(LEG, sent_since(from, 10, LC_CORE_CALL_RELEASE)->u.call.ref);
+    unsigned used = 0;
+    for (unsigned i = 0; i < LC_CORE_CALLS; i++) used += K.calls[i].used ? 1u : 0u;
+    TEST_ASSERT_EQUAL_UINT(0, used); /* the slot was freed despite the CDR write failing */
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -299,5 +438,12 @@ int main(void)
     RUN_TEST(test_a_cell_going_releases_its_calls);
     RUN_TEST(test_stale_location_is_dropped);
     RUN_TEST(test_repeated_route_is_ignored);
+    RUN_TEST(test_new_boot_on_same_link_releases_its_calls);
+    RUN_TEST(test_same_cell_both_legs_relay_with_ref_split);
+    RUN_TEST(test_answer_without_prior_alert);
+    RUN_TEST(test_alert_answer_from_leg_a_ignored);
+    RUN_TEST(test_caller_hangs_up_while_echo_rings);
+    RUN_TEST(test_cdr_count_delta_is_exactly_one);
+    RUN_TEST(test_cdr_add_failure_does_not_break_release);
     return UNITY_END();
 }

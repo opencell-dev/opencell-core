@@ -1,0 +1,145 @@
+/* The lc_core_store_t contract (network-core spec §5), as one test any store
+ * must pass: the in-memory store here, plan 8's SQLite store there. The
+ * store must start empty. */
+#ifndef CORE_STORE_CONTRACT_H
+#define CORE_STORE_CONTRACT_H
+
+#include <string.h>
+
+#include "lc_core_store.h"
+#include "unity.h"
+
+static inline void contract_num(const char *text, uint8_t out[LC_SIG_NUMBER_LEN])
+{
+    TEST_ASSERT_EQUAL_INT(0, lc_sig_number_to_bcd(text, strlen(text), out));
+}
+
+static inline void store_contract(const lc_core_store_t *st)
+{
+    void *c = st->ctx;
+    uint8_t n1[LC_SIG_NUMBER_LEN], n2[LC_SIG_NUMBER_LEN];
+    contract_num("+883160655501234", n1);
+    contract_num("+883160655501235", n2);
+
+    /* network keys and cells: get what was put, replace by key */
+    lc_core_netkey_t k = { 1, { 1 }, { 2 }, 1800, 100 }, k2;
+    TEST_ASSERT_EQUAL_INT(-1, st->netkey_get(c, 1, &k2));
+    TEST_ASSERT_EQUAL_INT(0, st->netkey_put(c, &k));
+    TEST_ASSERT_EQUAL_INT(0, st->netkey_get(c, 1, &k2));
+    TEST_ASSERT_EQUAL_MEMORY(&k, &k2, sizeof(k));
+    lc_core_cell_t cell, cell2;
+    memset(&cell, 0, sizeof(cell));
+    cell.cell_id = 7;
+    strcpy(cell.name, "bench A");
+    cell.mode = LC_SIG_MODE_PART15;
+    cell.enabled = 1;
+    TEST_ASSERT_EQUAL_INT(0, st->cell_put(c, &cell));
+    cell.boot_id = 99;
+    TEST_ASSERT_EQUAL_INT(0, st->cell_put(c, &cell));
+    TEST_ASSERT_EQUAL_INT(0, st->cell_get(c, 7, &cell2));
+    TEST_ASSERT_EQUAL_STRING("bench A", cell2.name);
+    TEST_ASSERT_EQUAL_UINT64(99, cell2.boot_id);
+    TEST_ASSERT_EQUAL_UINT8(1, cell2.enabled);
+    TEST_ASSERT_EQUAL_INT(-1, st->cell_get(c, 8, &cell2));
+
+    /* subscribers: by number; by TMID only while activated */
+    lc_core_sub_t s, s2;
+    memset(&s, 0, sizeof(s));
+    memcpy(s.number, n1, LC_SIG_NUMBER_LEN);
+    s.state = LC_CORE_SUB_ACTIVE;
+    s.tmid = 0x1234u;
+    s.sqn = 5;
+    TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
+    TEST_ASSERT_EQUAL_INT(-1, st->sub_by_tmid(c, 0x1234u, &s2)); /* bound but not activated */
+    s.activated = 1;
+    s.sqn = (1ull << 40) + 3u; /* SQN is 48 bits */
+    TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
+    TEST_ASSERT_EQUAL_INT(0, st->sub_by_tmid(c, 0x1234u, &s2));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(n1, s2.number, LC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n1, &s2));
+    TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 3u, s2.sqn);
+    TEST_ASSERT_EQUAL_INT(-1, st->sub_get(c, n2, &s2));
+
+    /* tokens: voiding removes only the number's unused ones */
+    lc_core_token_t t1, t2, t3, tg;
+    memset(&t1, 0, sizeof(t1));
+    memset(t1.token_id, 0x11, 8);
+    memcpy(t1.number, n1, LC_SIG_NUMBER_LEN);
+    t2 = t1;
+    memset(t2.token_id, 0x22, 8);
+    t2.used_at = 50;
+    t3 = t1;
+    memset(t3.token_id, 0x33, 8);
+    memcpy(t3.number, n2, LC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, st->token_put(c, &t1));
+    TEST_ASSERT_EQUAL_INT(0, st->token_put(c, &t2));
+    TEST_ASSERT_EQUAL_INT(0, st->token_put(c, &t3));
+    TEST_ASSERT_EQUAL_INT(0, st->token_void(c, n1));
+    TEST_ASSERT_EQUAL_INT(-1, st->token_get(c, t1.token_id, &tg));
+    TEST_ASSERT_EQUAL_INT(0, st->token_get(c, t2.token_id, &tg)); /* used: kept */
+    TEST_ASSERT_EQUAL_UINT32(50, tg.used_at);
+    TEST_ASSERT_EQUAL_INT(0, st->token_get(c, t3.token_id, &tg)); /* another number: kept */
+
+    /* issued vectors: keyed by (number, rand); drop and prune */
+    lc_core_av_issued_t a1, a2, ag;
+    memset(&a1, 0, sizeof(a1));
+    memcpy(a1.number, n1, LC_SIG_NUMBER_LEN);
+    memset(a1.rand, 0xa1, 16);
+    a1.cell_id = 7;
+    a1.issued = 1000;
+    a2 = a1;
+    memset(a2.rand, 0xa2, 16);
+    a2.issued = 2000;
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a1));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a2));
+    a2.confirmed = 1;
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a2)); /* replaced, not added */
+    TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_UINT8(1, ag.confirmed);
+    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n2, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(0, st->av_drop_cell(c, 7)); /* a1 (unconfirmed) goes, a2 stays */
+    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a1.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(0, st->av_prune(c, 2000)); /* issued at 2000: not before */
+    TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(0, st->av_prune(c, 2001));
+    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a2.rand, &ag));
+
+    /* locations: one per number; delete; purge a cell's */
+    lc_core_loc_t l1 = { { 0 }, 7, 0x1234u, 5000 }, l2 = { { 0 }, 8, 0x5678u, 5000 }, lg;
+    memcpy(l1.number, n1, LC_SIG_NUMBER_LEN);
+    memcpy(l2.number, n2, LC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1));
+    TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l2));
+    l1.cell_id = 8;
+    TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1)); /* moved */
+    TEST_ASSERT_EQUAL_INT(0, st->loc_get(c, n1, &lg));
+    TEST_ASSERT_EQUAL_UINT32(8, lg.cell_id);
+    TEST_ASSERT_EQUAL_INT(0, st->loc_del(c, n1));
+    TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n1, &lg));
+    TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1));
+    TEST_ASSERT_EQUAL_INT(0, st->loc_purge_cell(c, 8));
+    TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n1, &lg));
+    TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n2, &lg));
+
+    /* records are appended */
+    lc_core_cdr_t cdr;
+    lc_core_audit_t au;
+    memset(&cdr, 0, sizeof(cdr));
+    memset(&au, 0, sizeof(au));
+    au.event = LC_CORE_AUDIT_REGISTER;
+    TEST_ASSERT_EQUAL_INT(0, st->cdr_add(c, &cdr));
+    TEST_ASSERT_EQUAL_INT(0, st->audit_add(c, &au));
+
+    /* one transaction commits as a whole */
+    s.sqn = 6;
+    TEST_ASSERT_EQUAL_INT(0, st->begin(c));
+    TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
+    TEST_ASSERT_EQUAL_INT(0, st->token_put(c, &t1));
+    TEST_ASSERT_EQUAL_INT(0, st->commit(c));
+    TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n1, &s2));
+    TEST_ASSERT_EQUAL_UINT64(6, s2.sqn);
+    TEST_ASSERT_EQUAL_INT(0, st->token_get(c, t1.token_id, &tg));
+}
+
+#endif

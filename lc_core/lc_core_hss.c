@@ -85,15 +85,19 @@ int lc_core_token_issue(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
 int lc_core_sub_disable(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint64_t now_us)
 {
     lc_core_sub_t s;
+    lc_core_loc_t l;
+    int had_loc;
     k->now = now_us;
     if (k->st.sub_get(k->st.ctx, number, &s) != 0) return -1;
+    had_loc = k->st.loc_get(k->st.ctx, number, &l) == 0;
     s.state = LC_CORE_SUB_DISABLED;
     s.updated = lc_core_unix(k);
     k->st.begin(k->st.ctx);
     k->st.sub_put(k->st.ctx, &s);
     k->st.token_void(k->st.ctx, number);
+    if (had_loc) k->st.loc_del(k->st.ctx, number); /* atomic with disabling: a failed commit undoes both */
     if (k->st.commit(k->st.ctx) != 0) return -1;
-    lc_core_loc_cancel(k, number, LC_CORE_CANCEL_DISABLED);
+    if (had_loc) lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, LC_CORE_CANCEL_DISABLED);
     lc_core_audit(k, LC_CORE_AUDIT_SUB_DISABLE, number, s.tmid, 0, NULL);
     return 0;
 }

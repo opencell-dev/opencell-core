@@ -19,5 +19,11 @@ void     lc_core_audit(lc_core_t *k, uint8_t event, const uint8_t *number, uint3
 int      lc_core_loc_live(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out);
 /* Tell the number's cell to drop it (LOC_CANCEL) and forget the location. */
 void     lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint8_t cause);
+/* LOC_CANCEL and its audit for a location the caller already deleted from
+ * the store, atomically with whatever else it changed (e.g. disabling): a
+ * failed send is logged but still audited, since the location really is
+ * gone. */
+void     lc_core_loc_send_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t cell_id,
+                                 uint32_t tmid, uint8_t cause);
 
 #endif

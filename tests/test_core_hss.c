@@ -135,6 +135,50 @@ static void test_disable_cancels_the_location_and_voids_tokens(void)
     TEST_ASSERT_EQUAL_INT(-1, lc_core_sub_disable(&K, n, NOW)); /* not a subscriber */
 }
 
+/* A commit that fails leaves everything as it was: no token change, nothing
+ * sent, no audit. */
+static void test_token_issue_commit_failure_changes_nothing(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    uint8_t n[LC_SIG_NUMBER_LEN];
+    number(NUM, n);
+    unsigned ntoken = MEM.d.ntoken;
+    unsigned naudit = MEM.d.naudit;
+    int from = NSENT;
+    MEM.fail_commits = 1;
+    lc_sig_qr_t qr2;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_token_issue(&K, n, 3600, &qr2));
+    TEST_ASSERT_EQUAL_UINT(ntoken, MEM.d.ntoken);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    TEST_ASSERT_EQUAL_INT(from, NSENT);
+    lc_core_token_t t;
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &t)); /* the old token, untouched */
+    TEST_ASSERT_EQUAL_UINT32(0, t.used_at);
+}
+
+/* Same for disabling: a commit that fails leaves the subscriber active, its
+ * location live, nothing sent, no audit. */
+static void test_sub_disable_commit_failure_changes_nothing(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    bind_by_hand(&qr);
+    put_location(1, TMID);
+    uint8_t n[LC_SIG_NUMBER_LEN];
+    number(NUM, n);
+    unsigned naudit = MEM.d.naudit;
+    int from = NSENT;
+    MEM.fail_commits = 1;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_sub_disable(&K, n, NOW));
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    TEST_ASSERT_EQUAL_INT(from, NSENT);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_SUB_ACTIVE, s.state);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, ST.loc_get(ST.ctx, n, &l));
+    TEST_ASSERT_EQUAL_UINT32(1, l.cell_id);
+}
+
 /* An expired location is not live, and is gone once asked about. */
 static void test_expired_location_is_not_live(void)
 {
@@ -156,6 +200,8 @@ int main(void)
     RUN_TEST(test_subscribers_are_added_by_policy);
     RUN_TEST(test_token_issue_fills_the_qr_and_voids_the_old_token);
     RUN_TEST(test_disable_cancels_the_location_and_voids_tokens);
+    RUN_TEST(test_token_issue_commit_failure_changes_nothing);
+    RUN_TEST(test_sub_disable_commit_failure_changes_nothing);
     RUN_TEST(test_expired_location_is_not_live);
     return UNITY_END();
 }

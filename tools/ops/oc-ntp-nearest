@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""oc-ntp-nearest: find the nearest good NTP servers from this host and make chrony use them.
+
+Run it on the host whose clock matters (the cores, their VMs). It sends a few
+SNTP client queries to every address of every candidate server, keeps servers
+that are synchronised (stratum 1-15, leap not 3, no kiss-o'-death), ranks them
+by their best round-trip delay, and prints the table. With --apply (as root) it
+writes the best --count servers to chrony's sources directory, optionally
+disables the distribution's default pool, reloads chrony and waits for it to
+select a source.
+
+Leap-smearing servers (Google, AWS, Facebook) are never candidates: chrony must
+not mix smeared and unsmeared time. Servers known to offer NTS (authenticated
+NTP) are written with `nts` when --nts is on (the default); the others are
+plain NTP, like the pool chrony replaces.
+"""
+import argparse
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+NTP_EPOCH = 2208988800  # seconds from 1900 to 1970
+
+# name: (nts capable, note). Pools resolve to several addresses; each address is
+# measured, and a pool is written by the address that was nearest.
+CANDIDATES = {
+    "ntp.ovh.net": (False, "OVH (the cores' own network)"),
+    "time.cloudflare.com": (True, "Cloudflare anycast, NTS"),
+    "ntppool1.time.nl": (True, "TimeNL, NTS"),
+    "nts.netnod.se": (True, "Netnod, NTS"),
+    "time.nist.gov": (False, "NIST, stratum 1, US"),
+    "time-a-wwv.nist.gov": (False, "NIST Fort Collins, stratum 1"),
+    "time-d-b.nist.gov": (False, "NIST Boulder, stratum 1"),
+    "us.pool.ntp.org": (False, "NTP pool, US"),
+    "north-america.pool.ntp.org": (False, "NTP pool, North America"),
+    "2.debian.pool.ntp.org": (False, "Debian's default pool"),
+}
+POOLS = ("pool.ntp.org",)
+SMEARING = ("time.google.com", "time1.google.com", "time.aws.com", "time.facebook.com")
+
+SOURCES_FILE = "/etc/chrony/sources.d/opencell-nearest.sources"
+CHRONY_CONF = "/etc/chrony/chrony.conf"
+
+
+def query(addr, family, timeout):
+    """One SNTP v4 client query. Returns (delay_s, offset_s, stratum, leap, refid) or raises."""
+    pkt = bytearray(48)
+    pkt[0] = (0 << 6) | (4 << 3) | 3  # LI 0, VN 4, mode 3 (client)
+    with socket.socket(family, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        t1 = time.time()
+        frac, sec = t1 % 1, int(t1) + NTP_EPOCH
+        struct.pack_into("!II", pkt, 40, sec, int(frac * 2**32))  # transmit timestamp
+        s.sendto(pkt, (addr, 123))
+        data, _ = s.recvfrom(512)
+        t4 = time.time()
+    if len(data) < 48:
+        raise ValueError("short reply")
+    li, mode, stratum = data[0] >> 6, data[0] & 7, data[1]
+    if mode != 4:
+        raise ValueError("not a server reply")
+    if stratum == 0:
+        raise ValueError("kiss-o'-death " + data[12:16].decode("ascii", "replace"))
+    if stratum > 15 or li == 3:
+        raise ValueError("unsynchronised")
+    orig = struct.unpack_from("!II", data, 24)
+    if orig != struct.unpack_from("!II", pkt, 40):
+        raise ValueError("origin timestamp mismatch")
+
+    def ts(off):
+        s_, f_ = struct.unpack_from("!II", data, off)
+        return s_ - NTP_EPOCH + f_ / 2**32
+
+    t2, t3 = ts(32), ts(40)
+    delay = (t4 - t1) - (t3 - t2)
+    offset = ((t2 - t1) + (t3 - t4)) / 2
+    refid = data[12:16]
+    refid = refid.decode("ascii", "replace").strip("\x00") if stratum == 1 else socket.inet_ntoa(refid)
+    return delay, offset, stratum, li, refid
+
+
+def measure(name, tries, timeout, want6):
+    fams = (socket.AF_INET, socket.AF_INET6) if want6 else (socket.AF_INET,)
+    out = []
+    for fam in fams:
+        try:
+            infos = socket.getaddrinfo(name, 123, fam, socket.SOCK_DGRAM)
+        except socket.gaierror:
+            continue
+        for addr in sorted({i[4][0] for i in infos}):
+            best, err = None, None
+            for _ in range(tries):
+                try:
+                    r = query(addr, fam, timeout)
+                    if best is None or r[0] < best[0]:
+                        best = r
+                except (OSError, ValueError) as e:
+                    err = str(e)
+                time.sleep(0.2)  # be polite: at most a few packets per server
+            out.append((name, addr, best, err))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--count", type=int, default=4, help="servers to write (default 4)")
+    ap.add_argument("--tries", type=int, default=4, help="queries per address (default 4)")
+    ap.add_argument("--timeout", type=float, default=1.0)
+    ap.add_argument("--ipv6", action="store_true", help="also measure IPv6 addresses")
+    ap.add_argument("--extra", action="append", default=[], help="another candidate host name")
+    ap.add_argument("--no-nts", dest="nts", action="store_false", help="never write `nts`")
+    ap.add_argument("--apply", action="store_true", help="write chrony sources and reload (root)")
+    ap.add_argument("--keep-pool", action="store_true", help="keep the distribution's default pool line")
+    a = ap.parse_args()
+
+    names = dict(CANDIDATES)
+    for e in a.extra:
+        if e in SMEARING:
+            sys.exit(f"{e} smears leap seconds: not usable next to other servers")
+        names.setdefault(e, (False, "extra"))
+
+    rows = []
+    for name in names:
+        rows += measure(name, a.tries, a.timeout, a.ipv6)
+    good = sorted((r for r in rows if r[2]), key=lambda r: r[2][0])
+
+    print(f"{'server':28} {'address':40} {'delay ms':>9} {'offset ms':>10} {'st':>3} refid")
+    for name, addr, best, err in good:
+        d, o, st, _, ref = best
+        print(f"{name:28} {addr:40} {d*1000:9.1f} {o*1000:10.2f} {st:3d} {ref}")
+    for name, addr, best, err in rows:
+        if not best:
+            print(f"{name:28} {addr:40} {'-':>9} {'-':>10} {'-':>3} ({err})")
+
+    # Best address per server name, then the nearest --count names.
+    chosen, seen, seen_addr = [], set(), set()
+    for name, addr, best, _ in good:
+        if name in seen or addr in seen_addr:  # two pools can hand out the same server
+            continue
+        seen.add(name)
+        seen_addr.add(addr)
+        chosen.append((name, addr, best))
+        if len(chosen) == a.count:
+            break
+    if not chosen:
+        sys.exit("no usable NTP server answered")
+
+    lines = [f"# Written by oc-ntp-nearest on {time.strftime('%Y-%m-%d %H:%M:%S %Z')}; rerun it to refresh."]
+    for name, addr, best in chosen:
+        nts, note = names[name]
+        is_pool = any(name.endswith(p) for p in POOLS)
+        target = addr if is_pool else name  # pools: the measured address; others: the name (anycast/NTS need it)
+        opts = "iburst" + (" nts" if nts and a.nts and not is_pool else "")
+        lines.append(f"# {note}, {best[0]*1000:.1f} ms")  # chrony's sources files take no inline comments
+        lines.append(f"server {target} {opts}")
+    text = "\n".join(lines) + "\n"
+    print("\nchrony sources:\n" + text, end="")
+
+    if not a.apply:
+        print("(dry run: --apply as root to write it)")
+        return
+    if os.geteuid() != 0:
+        sys.exit("--apply needs root")
+    os.makedirs(os.path.dirname(SOURCES_FILE), exist_ok=True)
+    with open(SOURCES_FILE, "w") as f:
+        f.write(text)
+    if not a.keep_pool and os.path.exists(CHRONY_CONF):
+        conf = open(CHRONY_CONF).read().splitlines()
+        changed = False
+        for i, l in enumerate(conf):
+            if l.startswith("pool ") and "oc-ntp-nearest" not in l:
+                conf[i] = "#" + l + "  # disabled by oc-ntp-nearest (sources.d/opencell-nearest.sources)"
+                changed = True
+        if changed:
+            open(CHRONY_CONF, "w").write("\n".join(conf) + "\n")
+            subprocess.run(["systemctl", "restart", "chrony"], check=True)
+        else:
+            subprocess.run(["chronyc", "reload", "sources"], check=True)
+    else:
+        subprocess.run(["chronyc", "reload", "sources"], check=True)
+    for _ in range(30):  # wait up to ~60 s for a selected source
+        time.sleep(2)
+        out = subprocess.run(["chronyc", "-n", "sources"], capture_output=True, text=True).stdout
+        if any(l.startswith("^*") for l in out.splitlines()):
+            break
+    print(subprocess.run(["chronyc", "-n", "sources"], capture_output=True, text=True).stdout)
+    print(subprocess.run(["chronyc", "tracking"], capture_output=True, text=True).stdout)
+    if any(nts for n, _, _ in chosen for nts in [names[n][0]]) and a.nts:
+        print(subprocess.run(["chronyc", "-N", "authdata"], capture_output=True, text=True).stdout)
+
+
+if __name__ == "__main__":
+    main()

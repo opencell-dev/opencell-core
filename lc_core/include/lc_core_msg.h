@@ -13,6 +13,7 @@
 #ifndef LC_CORE_MSG_H
 #define LC_CORE_MSG_H
 
+#include "lc_sig_hss.h" /* lc_sig_av_t, lc_sig_av_status_t */
 #include "lc_sig_msg.h" /* lc_sig_msg_t, lc_sig_body_encode/decode */
 
 #define LC_CORE_FRAME_MAX 512u
@@ -31,14 +32,13 @@ typedef enum {
 
 typedef enum { LC_CORE_NAK_UNKNOWN_CELL = 1, LC_CORE_NAK_DISABLED = 2, LC_CORE_NAK_VERSION = 3 } lc_core_nak_t;
 
-/* One authentication vector as AV_RES carries it (TS 33.102 §6.3.2). The
- * layout of lc_sig_av_t (lc_sig_hss.h), which it becomes once lc_sig has it. */
-typedef struct {
-    uint8_t rand[16], autn[16], xres[8], ck[16], ik[16];
-} lc_core_av_t;
+/* One authentication vector as AV_RES carries it (TS 33.102 §6.3.2): the
+ * HSS makes it with lc_sig_av_make, and a cell hands it to
+ * lc_sig_net_av_done as it is. */
+typedef lc_sig_av_t lc_core_av_t;
 
-/* AV_RES status (§6; network-core spec §4.3). The values of lc_sig_hss.h's
- * lc_sig_av_status_t, which lc_sig_net_av_done takes. */
+/* AV_RES status (§6; network-core spec §4.3): the values of lc_sig_hss.h's
+ * lc_sig_av_status_t, which lc_sig_net_av_done takes (checked below). */
 typedef enum {
     LC_CORE_AV_OK = 0,
     LC_CORE_AV_NOT_ACTIVATED = 1,   /* no subscriber bound to the TMID */
@@ -47,6 +47,14 @@ typedef enum {
     LC_CORE_AV_UNAVAILABLE = 4,     /* no answer possible now (store, core link): the terminal retries */
     LC_CORE_AV_AUTH_FAILED = 5      /* resync refused: AUTS did not verify */
 } lc_core_av_status_t;
+
+_Static_assert((int)LC_CORE_AV_OK == (int)LC_SIG_AV_OK &&
+                   (int)LC_CORE_AV_NOT_ACTIVATED == (int)LC_SIG_AV_NOT_ACTIVATED &&
+                   (int)LC_CORE_AV_BOUND_ELSEWHERE == (int)LC_SIG_AV_BOUND_ELSEWHERE &&
+                   (int)LC_CORE_AV_DISABLED == (int)LC_SIG_AV_DISABLED &&
+                   (int)LC_CORE_AV_UNAVAILABLE == (int)LC_SIG_AV_UNAVAILABLE &&
+                   (int)LC_CORE_AV_AUTH_FAILED == (int)LC_SIG_AV_AUTH_FAILED,
+               "AV_RES status values are lc_sig_net_av_done's");
 typedef enum { LC_CORE_CANCEL_MOVED = 1, LC_CORE_CANCEL_REACTIVATED = 2, LC_CORE_CANCEL_DISABLED = 3 } lc_core_cancel_t;
 
 typedef struct {

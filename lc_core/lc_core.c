@@ -210,6 +210,11 @@ void lc_core_rx(lc_core_t *k, uint32_t link, const lc_core_msg_t *m, uint64_t no
     }
     if (l->cell_id == 0) return; /* nothing but HELLO before HELLO */
     switch (m->type) { /* each family goes to its own file: HSS, registry, switch */
+    case LC_CORE_ACT_FWD:
+    case LC_CORE_AV_REQ:
+    case LC_CORE_RESYNC:
+        lc_core_hss_rx(k, l->cell_id, m);
+        break;
     case LC_CORE_CALL_ROUTE:
     case LC_CORE_CALL_ALERT:
     case LC_CORE_CALL_ANSWER:

@@ -49,7 +49,14 @@ typedef struct {
     int      used;
     uint32_t tmid;
     uint8_t  number[LC_SIG_NUMBER_LEN], rand[16], res[8];
+    uint32_t av_seq; /* when its vector arrived (lc_cell_t.av_count) */
 } lc_cell_reg_t;
+
+/* The last vector a TMID was given here, in order of arrival. */
+typedef struct {
+    uint32_t tmid;
+    uint32_t seq; /* 0: free */
+} lc_cell_av_seen_t;
 
 typedef struct {
     lc_cell_io_t  io;
@@ -62,6 +69,8 @@ typedef struct {
     uint8_t       echo_number[LC_SIG_NUMBER_LEN];
     lc_cell_leg_t legs[LC_SIG_NET_TERMS];
     lc_cell_reg_t regs[LC_SIG_NET_TERMS];
+    uint32_t      av_count; /* vectors taken from AV_RES so far (wraps after 2^32: not in a cell's life) */
+    lc_cell_av_seen_t av_seen[LC_SIG_NET_TERMS];
 } lc_cell_t;
 
 void lc_cell_init(lc_cell_t *c, const lc_cell_io_t *io, const lc_cell_cfg_t *cfg);

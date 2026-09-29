@@ -214,6 +214,8 @@ static void test_disable_cancels_the_location_and_voids_tokens(void)
     TEST_ASSERT_NOT_NULL(c);
     TEST_ASSERT_EQUAL_HEX32(TMID, c->u.loc_cancel.tmid);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_DISABLED, c->u.loc_cancel.cause);
+    static const uint8_t zero[16] = { 0 };
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(zero, c->u.loc_cancel.rand, 16); /* whatever it registered with */
     lc_core_loc_t l;
     TEST_ASSERT_EQUAL_INT(-1, ST.loc_get(ST.ctx, n, &l));
     TEST_ASSERT_NOT_NULL(lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL));
@@ -563,6 +565,8 @@ static void test_an_unproven_stale_claim_is_audited_apart(void)
     const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL); /* the re-activation's */
     TEST_ASSERT_NOT_NULL(au);
     TEST_ASSERT_EQUAL_STRING("cause 2", au->detail);
+    static const uint8_t zero[16] = { 0 };
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(zero, sent_since(0, 10, LC_CORE_LOC_CANCEL)->u.loc_cancel.rand, 16);
     unsigned n = MEM.d.naudit;
     uint8_t rand[16], res[8];
     memset(rand, 0x5a, 16); /* never issued: nothing proves it */

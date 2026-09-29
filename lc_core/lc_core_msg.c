@@ -145,6 +145,7 @@ size_t lc_core_encode(const lc_core_msg_t *m, uint8_t *out, size_t cap)
     case LC_CORE_LOC_CANCEL:
         w32(&w, m->u.loc_cancel.tmid);
         w8(&w, m->u.loc_cancel.cause);
+        wb(&w, m->u.loc_cancel.rand, 16);
         break;
     case LC_CORE_CALL_ROUTE:
         w32(&w, m->u.call_route.leg_ref);
@@ -259,6 +260,7 @@ int lc_core_decode(const uint8_t *in, size_t len, lc_core_msg_t *m)
     case LC_CORE_LOC_CANCEL:
         m->u.loc_cancel.tmid = r32(&r);
         m->u.loc_cancel.cause = r8(&r);
+        rb(&r, m->u.loc_cancel.rand, 16);
         break;
     case LC_CORE_CALL_ROUTE:
         m->u.call_route.leg_ref = r32(&r);

@@ -105,7 +105,7 @@ int lc_core_sub_disable(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
         lc_core_logf(k, "sub_disable %08x: location delete failed", (unsigned)l.tmid);
     }
     if (k->st.commit(k->st.ctx) != 0) return -1;
-    if (had_loc) lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, LC_CORE_CANCEL_DISABLED, NULL);
+    if (had_loc) lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, LC_CORE_CANCEL_DISABLED, NULL, NULL);
     lc_core_audit(k, LC_CORE_AUDIT_SUB_DISABLE, number, s.tmid, 0, NULL);
     return 0;
 }
@@ -206,10 +206,11 @@ static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         }
         if (had_loc_other) {
             lc_core_loc_send_cancel(k, other.number, loc_other.cell_id, loc_other.tmid, LC_CORE_CANCEL_REACTIVATED,
-                                    NULL);
+                                    NULL, NULL);
         }
         if (had_loc_self) {
-            lc_core_loc_send_cancel(k, sub.number, loc_self.cell_id, loc_self.tmid, LC_CORE_CANCEL_REACTIVATED, NULL);
+            lc_core_loc_send_cancel(k, sub.number, loc_self.cell_id, loc_self.tmid, LC_CORE_CANCEL_REACTIVATED, NULL,
+                                    NULL);
         }
         lc_core_audit(k, LC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, NULL);
     }

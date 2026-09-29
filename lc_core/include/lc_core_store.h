@@ -72,6 +72,7 @@ typedef struct {
     uint32_t cell_id, tmid;
     uint32_t expires;
     uint64_t sqn;     /* the SQN of the vector that proved it (network-core spec §19.2) */
+    uint8_t  rand[16]; /* ...and its RAND: LOC_CANCEL(moved) names the registration it cancels */
 } lc_core_loc_t;
 
 typedef struct {

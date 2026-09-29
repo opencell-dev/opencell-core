@@ -118,7 +118,11 @@ static void test_golden_bytes(void)
     m.type = LC_CORE_LOC_CANCEL;
     m.u.loc_cancel.tmid = 0x76ad0488u;
     m.u.loc_cancel.cause = LC_CORE_CANCEL_MOVED;
-    static const uint8_t cancel[] = { 0x00, 0x06, 0x1A, 0x88, 0x04, 0xAD, 0x76, 0x01 };
+    memset(m.u.loc_cancel.rand, 0x5c, 16); /* the RAND that proved the location cancelled */
+    uint8_t cancel[2 + 1 + 5 + 16];
+    static const uint8_t cancel_head[] = { 0x00, 0x16, 0x1A, 0x88, 0x04, 0xAD, 0x76, 0x01 };
+    memcpy(cancel, cancel_head, sizeof(cancel_head));
+    memset(cancel + sizeof(cancel_head), 0x5c, 16);
     golden(&m, cancel, sizeof(cancel));
 
     memset(&m, 0, sizeof(m));
@@ -174,7 +178,8 @@ static void test_every_type_round_trips(void)
     ms[k].type = LC_CORE_LOC_PURGE;
     num("+883160655501234", ms[k++].u.loc_purge.number);
     ms[k].type = LC_CORE_LOC_CANCEL;
-    ms[k++].u.loc_cancel.cause = LC_CORE_CANCEL_DISABLED;
+    ms[k].u.loc_cancel.cause = LC_CORE_CANCEL_DISABLED;
+    memset(ms[k++].u.loc_cancel.rand, 0x99, 16);
     ms[k].type = LC_CORE_CALL_ROUTE;
     num("+883160655501234", ms[k].u.call_route.caller);
     num("+883442079460000", ms[k++].u.call_route.called);

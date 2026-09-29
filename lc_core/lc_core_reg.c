@@ -12,13 +12,14 @@
 
 /* A cell without a link purges on its new boot, or claims the number again
  * and is refused. 0, or -1 (lc_core_send: the cell has no link). */
-static int cancel(lc_core_t *k, uint32_t cell, uint32_t tmid, uint8_t cause)
+static int cancel(lc_core_t *k, uint32_t cell, uint32_t tmid, uint8_t cause, const uint8_t *rand)
 {
     lc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = LC_CORE_LOC_CANCEL;
     m.u.loc_cancel.tmid = tmid;
     m.u.loc_cancel.cause = cause;
+    if (rand != NULL) memcpy(m.u.loc_cancel.rand, rand, 16);
     return lc_core_send(k, cell, &m);
 }
 
@@ -31,10 +32,10 @@ int lc_core_loc_live(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], lc_c
 }
 
 void lc_core_loc_send_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t cell_id, uint32_t tmid,
-                             uint8_t cause, const char *why)
+                             uint8_t cause, const uint8_t *rand, const char *why)
 {
     char d[48];
-    if (cancel(k, cell_id, tmid, cause) != 0) {
+    if (cancel(k, cell_id, tmid, cause, rand) != 0) {
         lc_core_logf(k, "cell %u: LOC_CANCEL send failed", (unsigned)cell_id);
     }
     if (why != NULL) {
@@ -53,7 +54,7 @@ void lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
         lc_core_logf(k, "cell %u: LOC_CANCEL: location delete failed", (unsigned)l.cell_id);
         return; /* the location is still there: nothing was actually cancelled */
     }
-    lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, cause, NULL);
+    lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, cause, cause == LC_CORE_CANCEL_MOVED ? l.rand : NULL, NULL);
 }
 
 /* §7.7-7.8, §8, §19. Single exit: every path wipes what it read. */
@@ -82,7 +83,7 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
          * cancel ("unproven stale claim"): a cell cut off through the
          * re-activation sends one, and so does a cell probing TMIDs. */
         int off = known && s.state == LC_CORE_SUB_DISABLED;
-        lc_core_loc_send_cancel(k, num, cell, tmid, off ? LC_CORE_CANCEL_DISABLED : LC_CORE_CANCEL_REACTIVATED,
+        lc_core_loc_send_cancel(k, num, cell, tmid, off ? LC_CORE_CANCEL_DISABLED : LC_CORE_CANCEL_REACTIVATED, NULL,
                                 proven ? NULL : "unproven stale claim");
         goto done;
     }
@@ -103,7 +104,8 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
              * registered elsewhere since, so the claimant drops it */
             lc_core_logf(k, "cell %u: older claim for %08x refused (SQN %llu < %llu)", (unsigned)cell,
                          (unsigned)tmid, (unsigned long long)a.sqn, (unsigned long long)floor);
-            lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED, NULL);
+            /* the claim's own RAND: a newer registration there stays */
+            lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED, m->u.loc_update.rand, NULL);
             goto done;
         }
     }
@@ -115,7 +117,9 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     l.expires = lc_core_unix(k) + 2u * (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) == 0 ? key.period_s : 1800u);
     /* the newest vector that proved it: the same cell re-sending an older
      * claim refreshes the location without lowering it */
-    l.sqn = had && !moved && old.sqn > a.sqn ? old.sqn : a.sqn;
+    int keep = had && !moved && old.sqn > a.sqn;
+    l.sqn = keep ? old.sqn : a.sqn;
+    memcpy(l.rand, keep ? old.rand : m->u.loc_update.rand, 16);
     a.confirmed = 1;
     k->st.begin(k->st.ctx);
     k->st.av_put(k->st.ctx, &a);
@@ -124,7 +128,9 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         lc_core_logf(k, "location of %08x: store FAILED", (unsigned)tmid);
         goto done;
     }
-    if (moved) lc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, LC_CORE_CANCEL_MOVED, NULL); /* §7.8 */
+    /* §7.8, naming the registration it cancels: if the terminal has since
+     * registered there again (a LOC_UPDATE still on its way), that one stays */
+    if (moved) lc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, LC_CORE_CANCEL_MOVED, old.rand, NULL);
     lc_core_audit(k, LC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
 done:
     lc_sig_wipe(a.xres, sizeof(a.xres));

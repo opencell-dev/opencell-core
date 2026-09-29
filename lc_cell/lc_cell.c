@@ -98,11 +98,50 @@ static const lc_sig_net_sess_t *sess_of(const lc_cell_t *c, uint32_t tmid)
 }
 
 /* tmid's registration here is void (lc_sig_net_drop): a call it holds ends
- * with cause, and no LOC_UPDATE is sent for it again. */
+ * with cause, and no LOC_UPDATE is sent for it again. No LOC_PURGE either:
+ * a drop the core asked for (LOC_CANCEL) has its location gone already; so
+ * has one for an activation (the activation deleted the number's location
+ * in its transaction); and one for a newer registration of the same number
+ * (registered()) is followed at once by that one's LOC_UPDATE, which moves
+ * the location - a purge could only race it. */
 static void drop(lc_cell_t *c, uint32_t tmid, uint8_t cause)
 {
     reg_forget(c, tmid);
     lc_sig_net_drop(&c->net, tmid, cause, c->now);
+}
+
+/* The order in which tmid's last vector arrived here (0: none noted). */
+static uint32_t av_seq_of(const lc_cell_t *c, uint32_t tmid)
+{
+    for (unsigned i = 0; i < LC_SIG_NET_TERMS; i++) {
+        if (c->av_seen[i].seq != 0 && c->av_seen[i].tmid == tmid) return c->av_seen[i].seq;
+    }
+    return 0;
+}
+
+static void av_note(lc_cell_t *c, uint32_t tmid)
+{
+    lc_cell_av_seen_t *e = NULL;
+    for (unsigned i = 0; i < LC_SIG_NET_TERMS && e == NULL; i++) {
+        if (c->av_seen[i].seq != 0 && c->av_seen[i].tmid == tmid) e = &c->av_seen[i];
+    }
+    if (e == NULL) { /* a free entry (seq 0), else the oldest */
+        e = &c->av_seen[0];
+        for (unsigned i = 1; i < LC_SIG_NET_TERMS; i++) {
+            if (c->av_seen[i].seq < e->seq) e = &c->av_seen[i];
+        }
+    }
+    e->tmid = tmid;
+    e->seq = ++c->av_count;
+}
+
+/* The registration's record here, if any (read only). */
+static const lc_cell_reg_t *reg_find(const lc_cell_t *c, uint32_t tmid)
+{
+    for (unsigned i = 0; i < LC_SIG_NET_TERMS; i++) {
+        if (c->regs[i].used && c->regs[i].tmid == tmid) return &c->regs[i];
+    }
+    return NULL;
 }
 
 /* Every other session registered here with number: the number is bound to
@@ -117,6 +156,21 @@ static void drop_number(lc_cell_t *c, const uint8_t number[LC_SIG_NUMBER_LEN], u
             drop(c, s->tmid, LC_SIG_CAUSE_NET_FAILURE);
         }
     }
+}
+
+/* Another session registered here with number whose vector came later than
+ * seq, if any: the number's newer binding. */
+static int newer_holder(const lc_cell_t *c, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t except, uint32_t seq)
+{
+    for (unsigned i = 0; i < LC_SIG_NET_TERMS; i++) {
+        const lc_sig_net_sess_t *s = &c->net.s[i];
+        if (!s->used || !s->registered || s->tmid == except || memcmp(s->number, number, LC_SIG_NUMBER_LEN) != 0) {
+            continue;
+        }
+        const lc_cell_reg_t *r = reg_find(c, s->tmid);
+        if (r != NULL && r->av_seq > seq) return 1;
+    }
+    return 0;
 }
 
 /* The registration's proof (§7.7, §19.1): the vector's RAND and the RES the
@@ -199,12 +253,24 @@ static void n_registered(void *ctx, uint32_t tmid, const uint8_t number[LC_SIG_N
                          const uint8_t res[8])
 {
     lc_cell_t *c = ctx;
-    /* the core issued this vector for number's current binding, so another
-     * session here with the same number is stale (re-activated while its
-     * location was unknown to the core: no LOC_CANCEL came for it) */
+    /* The core issued this vector for number's binding at the time, so of
+     * two sessions here with the same number (the number re-activated while
+     * the core knew no location of the old one here, so no LOC_CANCEL came)
+     * the one whose vector arrived later holds the newer binding. That is
+     * usually this one; but a terminal can answer a vector drawn before the
+     * re-activation after the new terminal has registered here - then this
+     * registration is the stale one, and goes (its REG_ACK is out already:
+     * the terminal's calls are refused until it registers again). */
+    uint32_t seq = av_seq_of(c, tmid);
+    if (newer_holder(c, number, tmid, seq)) {
+        logf_(c, "terminal %08x: registered with an older vector than its number's holder, dropped", (unsigned)tmid);
+        drop(c, tmid, LC_SIG_CAUSE_NET_FAILURE);
+        return;
+    }
     drop_number(c, number, tmid);
     lc_cell_reg_t *r = reg_of(c, tmid, 1);
     if (r == NULL) return;
+    r->av_seq = seq;
     /* kept for as long as the registration: a registration made while the
      * core link was down is reported after the next HELLO_ACK (§7.10) */
     memcpy(r->number, number, LC_SIG_NUMBER_LEN);
@@ -400,7 +466,10 @@ void lc_cell_core_rx(lc_cell_t *c, const lc_core_msg_t *m, uint64_t now_us)
         for (unsigned i = 0; i < LC_SIG_NET_TERMS; i++) { /* the core may have lost them (§7.10, §14.6) */
             if (c->regs[i].used && lc_sig_net_registered(&c->net, c->regs[i].tmid)) loc_update(c, &c->regs[i]);
         }
-        for (unsigned i = 0; i < LC_SIG_NET_TERMS; i++) { /* registrations that waited for the core */
+        /* registrations that waited for the core. A RESYNC the link drop
+         * lost is asked again as a plain AV_REQ: its vector fails with
+         * AUTH_FAIL(2) once more and the RESYNC follows, one round later */
+        for (unsigned i = 0; i < LC_SIG_NET_TERMS; i++) {
             const lc_sig_net_sess_t *s = &c->net.s[i];
             if (s->used && s->av_wait && now_us - s->av_at < LC_SIG_NET_ASK_US) ask_av(c, s->tmid);
         }
@@ -429,9 +498,18 @@ void lc_cell_core_rx(lc_cell_t *c, const lc_core_msg_t *m, uint64_t now_us)
          * the number (registered while this cell was cut off). */
         uint32_t tmid = m->u.act_res.tmid;
         const lc_sig_net_sess_t *s = sess_of(c, tmid);
+        const uint8_t *number = m->u.act_res.msg.u.act_ack.number;
         if (m->u.act_res.msg.type == LC_SIG_ACT_ACK && s != NULL && s->act_wait) {
-            if (s->registered) drop(c, tmid, LC_SIG_CAUSE_LINK_LOST);
-            drop_number(c, m->u.act_res.msg.u.act_ack.number, tmid);
+            /* only for another number: an ACK for the number it is
+             * registered with is an ACT_REQ answered again (a replay or a
+             * retransmission: LC_SIG_ACT_AGAIN), which changes nothing. A
+             * real re-activation of the same number the core had no
+             * location of can't be told from one: that registration stays
+             * until the terminal registers with its new keys, at once. */
+            if (s->registered && memcmp(s->number, number, LC_SIG_NUMBER_LEN) != 0) {
+                drop(c, tmid, LC_SIG_CAUSE_LINK_LOST);
+            }
+            drop_number(c, number, tmid);
         }
         lc_sig_net_act_done(&c->net, tmid, &m->u.act_res.msg, now_us);
         break;
@@ -439,13 +517,28 @@ void lc_cell_core_rx(lc_cell_t *c, const lc_core_msg_t *m, uint64_t now_us)
     case LC_CORE_AV_RES: {
         uint8_t st = m->u.av_res.status == LC_SIG_AV_OK && m->u.av_res.count == 0 ? LC_SIG_AV_UNAVAILABLE
                                                                                    : m->u.av_res.status;
-        lc_sig_net_av_done(&c->net, m->u.av_res.tmid, st, m->u.av_res.number, &m->u.av_res.av[0], now_us);
+        if (lc_sig_net_av_done(&c->net, m->u.av_res.tmid, st, m->u.av_res.number, &m->u.av_res.av[0], now_us) == 0 &&
+            st == LC_SIG_AV_OK) {
+            av_note(c, m->u.av_res.tmid);
+        }
         break;
     }
     case LC_CORE_LOC_CANCEL: {
+        /* A RAND names the registration cancelled: if it isn't this TMID's
+         * registration here now, the cancel is late (the terminal came back
+         * and registered again; that LOC_UPDATE is on its way), and it is
+         * ignored. All zero: whatever it registered with. */
+        static const uint8_t any[16] = { 0 };
+        uint32_t tmid = m->u.loc_cancel.tmid;
+        const lc_cell_reg_t *r = reg_find(c, tmid);
+        int named = memcmp(m->u.loc_cancel.rand, any, 16) != 0;
+        if (named && (r == NULL || memcmp(r->rand, m->u.loc_cancel.rand, 16) != 0)) {
+            logf_(c, "core: LOC_CANCEL for an older registration of %08x ignored", (unsigned)tmid);
+            break;
+        }
         /* moved: as a lost link would (no handover); otherwise the network cut it */
         uint8_t cause = m->u.loc_cancel.cause == LC_CORE_CANCEL_MOVED ? LC_SIG_CAUSE_LINK_LOST : LC_SIG_CAUSE_NET_FAILURE;
-        drop(c, m->u.loc_cancel.tmid, cause);
+        drop(c, tmid, cause);
         break;
     }
     case LC_CORE_CALL_OFFER:

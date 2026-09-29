@@ -17,7 +17,7 @@
 #include "lc_sig_msg.h" /* lc_sig_msg_t, lc_sig_body_encode/decode */
 
 #define LC_CORE_FRAME_MAX 512u
-#define LC_CORE_PROTO     2u /* 2: AV_RES carries HXRES, not XRES (network-core spec §19.1) */
+#define LC_CORE_PROTO     2u /* 2: AV_RES carries HXRES, not XRES (§19.1); LOC_CANCEL names its RAND (§19 follow-ups) */
 #define LC_CORE_AV_MAX    4u
 #define LC_CORE_REF_CORE  0x80000000u
 
@@ -84,7 +84,10 @@ typedef struct {
         struct { uint16_t req; uint32_t tmid; uint8_t rand[16], auts[14]; } resync;
         struct { uint32_t tmid; uint8_t number[LC_SIG_NUMBER_LEN], rand[16], res[8]; } loc_update;
         struct { uint32_t tmid; uint8_t number[LC_SIG_NUMBER_LEN]; } loc_purge;
-        struct { uint32_t tmid; uint8_t cause; } loc_cancel; /* lc_core_cancel_t */
+        /* cause: lc_core_cancel_t. rand: the RAND of the vector that proved
+         * the registration cancelled (moved), so a cell keeps a newer one of
+         * the same TMID; all zero (reactivated, disabled): whatever it is */
+        struct { uint32_t tmid; uint8_t cause, rand[16]; } loc_cancel;
         struct { uint32_t leg_ref; uint8_t caller[LC_SIG_NUMBER_LEN], called[LC_SIG_NUMBER_LEN]; } call_route;
         struct { uint32_t call_ref; uint8_t callee[LC_SIG_NUMBER_LEN], caller[LC_SIG_NUMBER_LEN]; } call_offer;
         struct { uint32_t ref; uint8_t cause; } call; /* CALL_ALERT, CALL_ANSWER (no cause), CALL_RELEASE */

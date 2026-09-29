@@ -40,6 +40,10 @@ typedef struct {
     uint8_t        ev[64][16];
     int            nev;
     uint8_t        app[LC_SIG_APP_MAX], app_n; /* the last app data it received */
+    int            ul_lost;                     /* test hook: its UL payloads are not heard */
+    int            rec;                         /* test hook: record its UL payloads (an eavesdropper) */
+    uint8_t        rp[16][LC_SIG_LINK_MAX], rn[16];
+    int            nrp;
 } sim_term_t;
 
 typedef struct {
@@ -71,6 +75,7 @@ static uint64_t        now;
 static uint32_t        next_link;
 static lc_core_msg_t   last_loc_update[SIM_CELLS]; /* what each cell last claimed (the rogue-cell test replays it) */
 static unsigned        to_core[SIM_CELLS][256];    /* what each cell sent the core, by type */
+static lc_core_msg_t   last_loc_cancel[SIM_CELLS]; /* the last LOC_CANCEL the core sent each cell */
 
 static inline int sim_qpush(sim_q_t *q, const uint8_t *p, uint8_t n)
 {
@@ -127,6 +132,7 @@ static int k_send(void *c, uint32_t link, const lc_core_msg_t *m)
     (void)c;
     int i = cell_of_link(link);
     if (i < 0) return -1;
+    if (m->type == LC_CORE_LOC_CANCEL) last_loc_cancel[i] = *m;
     wire_push(0, i, link, m);
     return 0;
 }
@@ -291,7 +297,11 @@ static inline void frame(void)
         sim_term_t *t = &TERM[i];
         if (t->cell < 0 || !CELL[t->cell].up) continue;
         lc_cell_t *c = &CELL[t->cell].c;
-        if (sim_qpop(&t->ul, p, &n) == 0) {
+        if (sim_qpop(&t->ul, p, &n) == 0 && !t->ul_lost) {
+            if (t->rec && t->nrp < 16) {
+                memcpy(t->rp[t->nrp], p, n);
+                t->rn[t->nrp++] = n;
+            }
             lc_cell_ul(c, t->tmid, p, n, now);
         } else {
             lc_cell_ul(c, t->tmid, NULL, 0, now); /* its UL slot was heard, empty */
@@ -319,6 +329,7 @@ static inline void sim_world(void)
     memset(TERM, 0, sizeof(TERM));
     memset(last_loc_update, 0, sizeof(last_loc_update));
     memset(to_core, 0, sizeof(to_core));
+    memset(last_loc_cancel, 0, sizeof(last_loc_cancel));
     NWIRE = 0;
     now = 0;
     next_link = 0;
@@ -370,17 +381,20 @@ static inline void command(int i, const uint8_t *cmd, size_t n)
     TEST_ASSERT_EQUAL_UINT8(0, lc_sig_term_command(&TERM[i].t, cmd, n, now));
 }
 
-/* A fresh QR from the core, scanned on terminal i (attached to cell). */
-static inline void activate_on(int i, int cell)
+/* A fresh QR for number, scanned on terminal i (attached to cell). */
+static inline void activate_number(int i, int cell, const uint8_t number[LC_SIG_NUMBER_LEN])
 {
     lc_sig_qr_t qr;
     uint8_t cmd[1 + LC_SIG_QR_TEXT + 1];
     TERM[i].cell = cell;
-    TEST_ASSERT_EQUAL_INT(0, lc_core_token_issue(&CORE, TERM[i].number, 3600, &qr));
+    TEST_ASSERT_EQUAL_INT(0, lc_core_token_issue(&CORE, number, 3600, &qr));
     cmd[0] = LC_SIG_CMD_ACTIVATE;
     size_t n = lc_sig_qr_format(&qr, (char *)cmd + 1, sizeof(cmd) - 1);
     command(i, cmd, 1 + n);
 }
+
+/* A fresh QR from the core for terminal i's subscriber, scanned on it. */
+static inline void activate_on(int i, int cell) { activate_number(i, cell, TERM[i].number); }
 
 /* Terminal i activated and registered on cell. */
 static inline void registered_on(int i, int cell)
@@ -426,6 +440,24 @@ static inline uint32_t located(int i)
 {
     lc_core_loc_t l;
     return SST.loc_get(SST.ctx, TERM[i].number, &l) == 0 ? l.cell_id : 0;
+}
+
+/* Play back what terminal i's UL carried while it was recorded, as its own. */
+static inline void replay_recorded(int i)
+{
+    for (int k = 0; k < TERM[i].nrp; k++) {
+        TEST_ASSERT_EQUAL_INT(0, sim_qpush(&TERM[i].ul, TERM[i].rp[k], TERM[i].rn[k]));
+    }
+}
+
+/* cell's registration record for terminal i, NULL if none. */
+static inline const lc_cell_reg_t *reg_on(int cell, int i)
+{
+    for (unsigned k = 0; k < LC_SIG_NET_TERMS; k++) {
+        const lc_cell_reg_t *r = &CELL[cell].c.regs[k];
+        if (r->used && r->tmid == TERM[i].tmid) return r;
+    }
+    return NULL;
 }
 
 /* Terminal i's session on cell, NULL if it has none. */

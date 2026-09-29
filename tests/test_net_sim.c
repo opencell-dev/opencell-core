@@ -843,6 +843,9 @@ static void test_rogue_cell_cannot_replay_its_own_older_claim(void)
     TEST_ASSERT_EQUAL_INT(0, SST.av_get(SST.ctx, TERM[0].number, own.u.loc_update.rand, &row));
     TEST_ASSERT_EQUAL_UINT32(3, row.cell_id);
     TEST_ASSERT_EQUAL_UINT8(1, row.confirmed); /* a real, replayable proof */
+    const lc_core_audit_t *a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_EQUAL_UINT32(3, a->cell_id);
+    TEST_ASSERT_EQUAL_STRING("cause 1", a->detail); /* a normal move's cancel */
 
     unsigned cancels = audits(LC_CORE_AUDIT_LOC_CANCEL, 3);
     memset(&last_loc_cancel[2], 0, sizeof(last_loc_cancel[2]));
@@ -852,6 +855,9 @@ static void test_rogue_cell_cannot_replay_its_own_older_claim(void)
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, last_loc_cancel[2].u.loc_cancel.cause);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(own.u.loc_update.rand, last_loc_cancel[2].u.loc_cancel.rand, 16);
     TEST_ASSERT_EQUAL_UINT(cancels + 1u, audits(LC_CORE_AUDIT_LOC_CANCEL, 3));
+    a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_EQUAL_UINT32(3, a->cell_id);
+    TEST_ASSERT_EQUAL_STRING("older claim refused, cause 1", a->detail); /* a replay, told apart */
     TEST_ASSERT_TRUE(lc_sig_net_registered(&CELL[0].c.net, TERM[0].tmid)); /* cell 1 heard nothing */
 
     TERM[0].cell = -1; /* switched off */
@@ -869,9 +875,9 @@ static void test_rogue_cell_cannot_replay_its_own_older_claim(void)
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, last_loc_cancel[2].u.loc_cancel.cause);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(own.u.loc_update.rand, last_loc_cancel[2].u.loc_cancel.rand, 16);
     TEST_ASSERT_EQUAL_UINT(cancels + 2u, audits(LC_CORE_AUDIT_LOC_CANCEL, 3));
-    const lc_core_audit_t *a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_LOC_CANCEL);
+    a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_LOC_CANCEL);
     TEST_ASSERT_EQUAL_UINT32(3, a->cell_id);
-    TEST_ASSERT_EQUAL_STRING("cause 1", a->detail);
+    TEST_ASSERT_EQUAL_STRING("older claim refused, cause 1", a->detail); /* refused by the floor */
     TEST_ASSERT_EQUAL_UINT(1, audits(LC_CORE_AUDIT_REGISTER, 3)); /* only T0's real registration there */
 
     TERM[0].cell = 0; /* back on */

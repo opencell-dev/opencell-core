@@ -260,6 +260,7 @@ static void test_an_older_claim_from_another_cell_is_refused(void)
     const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL);
     TEST_ASSERT_NOT_NULL(au);
     TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+    TEST_ASSERT_EQUAL_STRING("older claim refused, cause 1", au->detail); /* a replay, told apart */
     lc_core_av_issued_t a;
     TEST_ASSERT_EQUAL_INT(0, ST.av_get(ST.ctx, N1, va.rand, &a));
     TEST_ASSERT_EQUAL_UINT8(0, a.confirmed); /* it proved nothing */
@@ -274,6 +275,9 @@ static void test_an_older_claim_from_another_cell_is_refused(void)
     TEST_ASSERT_NOT_NULL(c);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, c->u.loc_cancel.cause);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(vb.rand, c->u.loc_cancel.rand, 16);
+    au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_EQUAL_UINT32(2, au->cell_id);
+    TEST_ASSERT_EQUAL_STRING("cause 1", au->detail); /* a normal move's cancel, as before */
 }
 
 static void purge(uint32_t link)
@@ -316,6 +320,10 @@ static void test_an_older_claim_is_refused_after_the_newer_location_went(void)
     loc_update(10, TMID, &va);
     TEST_ASSERT_EQUAL_INT(-1, where(&l));
     TEST_ASSERT_NOT_NULL(sent_since(from, 10, LC_CORE_LOC_CANCEL));
+    const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(au);
+    TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+    TEST_ASSERT_EQUAL_STRING("older claim refused, cause 1", au->detail); /* refused by the floor */
 
     lc_core_av_t vc = vector_for(10); /* SQN 3: the terminal really is on cell 1 now */
     loc_update(10, TMID, &vc);

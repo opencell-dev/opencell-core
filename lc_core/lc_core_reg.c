@@ -104,8 +104,11 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
              * registered elsewhere since, so the claimant drops it */
             lc_core_logf(k, "cell %u: older claim for %08x refused (SQN %llu < %llu)", (unsigned)cell,
                          (unsigned)tmid, (unsigned long long)a.sqn, (unsigned long long)floor);
-            /* the claim's own RAND: a newer registration there stays */
-            lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED, m->u.loc_update.rand, NULL);
+            /* the claim's own RAND: a newer registration there stays. Its
+             * own audit detail, apart from a normal move's cancel, so an
+             * operator can alert on replays */
+            lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED, m->u.loc_update.rand,
+                                    "older claim refused");
             goto done;
         }
     }

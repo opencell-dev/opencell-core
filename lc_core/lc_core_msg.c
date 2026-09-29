@@ -57,7 +57,7 @@ static void w_av(wr_t *w, const lc_core_av_t *av)
 {
     wb(w, av->rand, 16);
     wb(w, av->autn, 16);
-    wb(w, av->xres, 8);
+    wb(w, av->hxres, 16);
     wb(w, av->ck, 16);
     wb(w, av->ik, 16);
 }
@@ -65,7 +65,7 @@ static void r_av(rd_t *r, lc_core_av_t *av)
 {
     rb(r, av->rand, 16);
     rb(r, av->autn, 16);
-    rb(r, av->xres, 8);
+    rb(r, av->hxres, 16);
     rb(r, av->ck, 16);
     rb(r, av->ik, 16);
 }

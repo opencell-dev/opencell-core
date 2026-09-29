@@ -13,7 +13,7 @@
 #ifndef LC_CORE_MSG_H
 #define LC_CORE_MSG_H
 
-#include "lc_sig_hss.h" /* lc_sig_av_t, lc_sig_av_status_t */
+#include "lc_sig_hss.h" /* lc_sig_cell_av_t, lc_sig_av_status_t */
 #include "lc_sig_msg.h" /* lc_sig_msg_t, lc_sig_body_encode/decode */
 
 #define LC_CORE_FRAME_MAX 512u
@@ -32,10 +32,17 @@ typedef enum {
 
 typedef enum { LC_CORE_NAK_UNKNOWN_CELL = 1, LC_CORE_NAK_DISABLED = 2, LC_CORE_NAK_VERSION = 3 } lc_core_nak_t;
 
-/* One authentication vector as AV_RES carries it (TS 33.102 §6.3.2): the
- * HSS makes it with lc_sig_av_make, and a cell hands it to
- * lc_sig_net_av_done as it is. */
-typedef lc_sig_av_t lc_core_av_t;
+/* One authentication vector as AV_RES carries it (TS 33.102 §6.3.2;
+ * network-core spec §19.1): RAND 16, AUTN 16, HXRES 16, CK 16, IK 16. The
+ * HSS makes it with lc_sig_av_make and lc_sig_av_for_cell, keeping XRES in
+ * av_issued; a cell hands it to lc_sig_net_av_done as it is. */
+typedef lc_sig_cell_av_t lc_core_av_t;
+
+#define LC_CORE_AV_LEN 80u /* one vector on the wire */
+_Static_assert(sizeof(lc_core_av_t) == LC_CORE_AV_LEN, "an AV_RES vector is 80 bytes");
+/* the largest AV_RES: len 2, type 1, req 2, tmid 4, status 1, number 8, count 1, the vectors */
+_Static_assert(2u + 1u + 2u + 4u + 1u + LC_SIG_NUMBER_LEN + 1u + LC_CORE_AV_MAX * LC_CORE_AV_LEN <= LC_CORE_FRAME_MAX,
+               "AV_RES with LC_CORE_AV_MAX vectors fits a frame");
 
 /* AV_RES status (§6; network-core spec §4.3): the values of lc_sig_hss.h's
  * lc_sig_av_status_t, which lc_sig_net_av_done takes (checked below). */

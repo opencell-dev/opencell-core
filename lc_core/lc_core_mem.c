@@ -222,6 +222,18 @@ static int av_drop_cell(void *c, uint32_t cell_id)
     return 0;
 }
 
+/* Like the other bulk deletes: deleting none is not a failure (0). */
+static int av_del_number(void *c, const uint8_t number[LC_SIG_NUMBER_LEN])
+{
+    lc_core_mem_data_t *d = D(c);
+    unsigned k = 0;
+    for (unsigned i = 0; i < d->nav; i++) {
+        if (!num_eq(d->av[i].number, number)) d->av[k++] = d->av[i];
+    }
+    d->nav = k;
+    return 0;
+}
+
 static int av_prune(void *c, uint32_t issued_before)
 {
     lc_core_mem_data_t *d = D(c);
@@ -325,6 +337,7 @@ lc_core_store_t lc_core_mem_store(lc_core_mem_t *m)
         .av_put = av_put,
         .av_get = av_get,
         .av_drop_cell = av_drop_cell,
+        .av_del_number = av_del_number,
         .av_prune = av_prune,
         .loc_get = loc_get,
         .loc_put = loc_put,

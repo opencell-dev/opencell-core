@@ -93,6 +93,27 @@ static void test_golden_bytes(void)
                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     golden(&m, avres, sizeof(avres));
 
+    /* network-core spec §19.1: a vector is RAND 16, AUTN 16, HXRES 16, CK 16,
+     * IK 16 - no XRES on the wire */
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_AV_RES;
+    m.u.av_res.req = 1;
+    m.u.av_res.tmid = 0x76ad0488u;
+    m.u.av_res.status = LC_CORE_AV_OK;
+    num("+883160655501234", m.u.av_res.number);
+    m.u.av_res.count = 1;
+    memset(m.u.av_res.av[0].rand, 0x01, 16);
+    memset(m.u.av_res.av[0].autn, 0x02, 16);
+    memset(m.u.av_res.av[0].hxres, 0x03, 16);
+    memset(m.u.av_res.av[0].ck, 0x04, 16);
+    memset(m.u.av_res.av[0].ik, 0x05, 16);
+    uint8_t avok[2 + 1 + 16 + 80];
+    static const uint8_t avok_head[] = { 0x00, 0x61, 0x13, 0x01, 0x00, 0x88, 0x04, 0xAD, 0x76, 0x00,
+                                         0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23, 0x4F, 0x01 };
+    memcpy(avok, avok_head, sizeof(avok_head));
+    for (int f = 0; f < 5; f++) memset(avok + sizeof(avok_head) + 16 * f, f + 1, 16);
+    golden(&m, avok, sizeof(avok));
+
     memset(&m, 0, sizeof(m));
     m.type = LC_CORE_LOC_CANCEL;
     m.u.loc_cancel.tmid = 0x76ad0488u;
@@ -183,6 +204,23 @@ static void test_every_type_round_trips(void)
     }
 }
 
+/* §6 frames are at most 512 B: AV_RES with LC_CORE_AV_MAX vectors of 80 B
+ * fits (3 + 16 + 4 x 80 = 339). */
+static void test_the_largest_av_res_fits_a_frame(void)
+{
+    lc_core_msg_t m;
+    uint8_t buf[LC_CORE_FRAME_MAX];
+    TEST_ASSERT_EQUAL_UINT(80, LC_CORE_AV_LEN);
+    TEST_ASSERT_EQUAL_UINT(80, sizeof(lc_core_av_t));
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_AV_RES;
+    m.u.av_res.status = LC_CORE_AV_OK;
+    num("+883160655501234", m.u.av_res.number);
+    m.u.av_res.count = LC_CORE_AV_MAX;
+    TEST_ASSERT_EQUAL_size_t(3u + 16u + LC_CORE_AV_MAX * LC_CORE_AV_LEN, lc_core_encode(&m, buf, sizeof(buf)));
+    TEST_ASSERT_TRUE(3u + 16u + LC_CORE_AV_MAX * LC_CORE_AV_LEN <= LC_CORE_FRAME_MAX);
+}
+
 static void test_what_does_not_decode(void)
 {
     lc_core_msg_t m;
@@ -235,6 +273,7 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_golden_bytes);
     RUN_TEST(test_every_type_round_trips);
+    RUN_TEST(test_the_largest_av_res_fits_a_frame);
     RUN_TEST(test_what_does_not_decode);
     return UNITY_END();
 }

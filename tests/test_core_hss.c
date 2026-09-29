@@ -75,8 +75,35 @@ static int64_t terminal_sqn(const term_t *t, const lc_core_av_t *av)
     lc_milenage(t->k, t->opc, av->rand, zero, amf, &o);
     for (int i = 0; i < 6; i++) sqn[i] = (uint8_t)(av->autn[i] ^ o.ak[i]);
     lc_milenage(t->k, t->opc, av->rand, sqn, av->autn + 6, &o);
-    if (!lc_sig_ct_equal(o.mac_a, av->autn + 8, 8) || memcmp(o.res, av->xres, 8) != 0) return -1;
+    uint8_t h[16]; /* the cell checks the terminal's RES against HXRES (network-core spec §19.1) */
+    if (!lc_sig_ct_equal(o.mac_a, av->autn + 8, 8) || lc_sig_hxres(av->rand, o.res, h) != 0 ||
+        memcmp(h, av->hxres, 16) != 0) {
+        return -1;
+    }
     return (int64_t)lc_sig_sqn_get(sqn);
+}
+
+/* The terminal's RES for rand. */
+static void terminal_res(const term_t *t, const uint8_t rand[16], uint8_t res[8])
+{
+    static const uint8_t zero[6] = { 0 }, amf[2] = { 0x80, 0x00 };
+    lc_milenage_t o;
+    lc_milenage(t->k, t->opc, rand, zero, amf, &o);
+    memcpy(res, o.res, 8);
+}
+
+/* LOC_UPDATE from the cell on link. */
+static void loc_claim(uint32_t link, uint32_t tmid, const uint8_t number[LC_SIG_NUMBER_LEN], const uint8_t rand[16],
+                      const uint8_t res[8])
+{
+    lc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_LOC_UPDATE;
+    m.u.loc_update.tmid = tmid;
+    memcpy(m.u.loc_update.number, number, LC_SIG_NUMBER_LEN);
+    memcpy(m.u.loc_update.rand, rand, 16);
+    memcpy(m.u.loc_update.res, res, 8);
+    rx(link, &m);
 }
 
 static lc_sig_qr_t issue(const char *num)
@@ -385,6 +412,39 @@ static void test_reactivation_cancels_the_old_location_first(void)
     TEST_ASSERT_EQUAL_INT(-1, ST.sub_by_tmid(ST.ctx, TMID, &(lc_core_sub_t){ 0 }));
 }
 
+/* Network-core spec §19.3: re-activation deletes the number's issued
+ * vectors, so a vector of the old binding (old K) proves nothing for the new
+ * one - not even claimed under the new terminal's TMID. The new binding's
+ * own vectors do. */
+static void test_reactivation_voids_the_old_bindings_vectors(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t, t2;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    lc_core_av_t old = ask_avs(10, TMID, 1)->u.av_res.av[0];
+    uint8_t res[8];
+    terminal_res(&t, old.rand, res);
+    qr = issue(NUM);
+    term(&t2, TMID2, 0x55, &qr);
+    TEST_ASSERT_EQUAL_HEX8(LC_SIG_ACT_ACK, activate(10, &t2)->u.act_res.msg.type);
+    lc_core_av_issued_t a;
+    TEST_ASSERT_EQUAL_INT(-1, ST.av_get(ST.ctx, qr.number, old.rand, &a));
+    loc_claim(10, TMID2, qr.number, old.rand, res);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(-1, ST.loc_get(ST.ctx, qr.number, &l));
+    const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_AUTH_FAIL);
+    TEST_ASSERT_NOT_NULL(au);
+    TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+
+    lc_core_av_t v = ask_avs(10, TMID2, 1)->u.av_res.av[0];
+    terminal_res(&t2, v.rand, res);
+    loc_claim(10, TMID2, qr.number, v.rand, res);
+    TEST_ASSERT_EQUAL_INT(0, ST.loc_get(ST.ctx, qr.number, &l));
+    TEST_ASSERT_EQUAL_UINT32(1, l.cell_id);
+    TEST_ASSERT_EQUAL_HEX32(TMID2, l.tmid);
+}
+
 /* Review Focus 6: the had_other path — a token activates a TMID some other
  * subscriber is currently bound to: that subscriber is unbound, and since
  * it had a live location, LOC_CANCEL goes to its cell too. */
@@ -464,7 +524,12 @@ static void test_vectors_rise_and_are_committed_first(void)
     lc_core_av_issued_t a;
     TEST_ASSERT_EQUAL_INT(0, ST.av_get(ST.ctx, qr.number, r->u.av_res.av[1].rand, &a));
     TEST_ASSERT_EQUAL_UINT32(1, a.cell_id);
-    TEST_ASSERT_EQUAL_HEX8_ARRAY(r->u.av_res.av[1].xres, a.xres, 8);
+    uint8_t h[16]; /* the core keeps XRES; the cell got its hash */
+    TEST_ASSERT_EQUAL_INT(0, lc_sig_hxres(a.rand, a.xres, h));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(h, r->u.av_res.av[1].hxres, 16);
+    uint8_t res[8];
+    terminal_res(&t, a.rand, res);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(res, a.xres, 8);
 
     unsigned nav = MEM.d.nav; /* Review Focus 6: a failed vector commit leaves no av_issued row */
     MEM.fail_commits = 1; /* the store can't commit: no vector may leave */
@@ -676,6 +741,7 @@ int main(void)
     RUN_TEST(test_failed_activation_commit_leaves_the_token_usable);
     RUN_TEST(test_activation_refusals);
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
+    RUN_TEST(test_reactivation_voids_the_old_bindings_vectors);
     RUN_TEST(test_reactivation_unbinds_the_tmids_other_subscriber_and_cancels_its_location);
     RUN_TEST(test_failed_reactivation_commit_leaves_the_old_location_untouched);
     RUN_TEST(test_vectors_rise_and_are_committed_first);

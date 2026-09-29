@@ -194,6 +194,9 @@ static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         if (had_loc_self && k->st.loc_del(k->st.ctx, sub.number) != 0) {
             lc_core_logf(k, "activation of %08x: location delete failed", (unsigned)tmid);
         }
+        /* §19.3: vectors of the old binding (old K) must not prove a
+         * location for the new one; deleting none is not a failure */
+        k->st.av_del_number(k->st.ctx, sub.number);
         tok.used_at = lc_core_unix(k);
         tok.used_by_tmid = tmid;
         k->st.token_put(k->st.ctx, &tok);
@@ -234,10 +237,12 @@ static uint8_t av_status(lc_core_t *k, uint32_t tmid, lc_core_sub_t *sub)
 
 /* §7.2: count vectors, computed first (so a crypto failure never touches
  * the store) and only then committed together (SQN and every av_issued row)
- * before AV_RES leaves: the store contract now makes a failed put fail the
+ * before AV_RES leaves: the store contract makes a failed put fail the
  * whole commit, so a full AV table answers UNAVAILABLE instead of sending a
- * vector no av_issued row backs. For RESYNC, SQN from AUTS first (TS 33.102
- * §6.3.5): the RAND must be one this core issued to the number, and SQN_HE
+ * vector no av_issued row backs. XRES stays in av_issued; the cell gets its
+ * HXRES (§19.1), so only the terminal's own RES proves a location. For
+ * RESYNC, SQN from AUTS first (TS 33.102 §6.3.5): the RAND must be one this
+ * core issued to the number, and SQN_HE
  * only ever moves forward, never back to a replayed (RAND, AUTS). Single
  * exit: every path wipes the key material it touched. */
 static void answer_av(lc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, unsigned count, const uint8_t *rand,
@@ -246,10 +251,12 @@ static void answer_av(lc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
     lc_core_msg_t r;
     lc_core_sub_t sub;
     lc_core_av_issued_t iss[LC_CORE_AV_MAX];
+    lc_sig_av_t full;
     uint8_t ms[6];
     memset(&r, 0, sizeof(r));
     memset(&sub, 0, sizeof(sub));
     memset(iss, 0, sizeof(iss));
+    memset(&full, 0, sizeof(full));
     memset(ms, 0, sizeof(ms));
     r.type = LC_CORE_AV_RES;
     r.u.av_res.req = req;
@@ -282,13 +289,15 @@ static void answer_av(lc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
             sqn++;
             lc_sig_sqn_put(sqn6, sqn);
             k->io.random(k->io.ctx, rnd, sizeof(rnd));
-            if (lc_sig_av_make(sub.k, sub.opc, sqn6, rnd, &r.u.av_res.av[i]) != 0) {
+            if (lc_sig_av_make(sub.k, sub.opc, sqn6, rnd, &full) != 0 ||
+                lc_sig_av_for_cell(&full, &r.u.av_res.av[i]) != 0) {
                 ok = 0;
                 break;
             }
             memcpy(iss[i].number, sub.number, LC_SIG_NUMBER_LEN);
             memcpy(iss[i].rand, rnd, 16);
-            memcpy(iss[i].xres, r.u.av_res.av[i].xres, 8);
+            memcpy(iss[i].xres, full.xres, 8);
+            lc_sig_wipe(&full, sizeof(full));
             iss[i].sqn = sqn;
             iss[i].cell_id = cell;
             iss[i].issued = lc_core_unix(k);
@@ -319,7 +328,10 @@ static void answer_av(lc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
     lc_sig_wipe(sub.k, sizeof(sub.k));
     lc_sig_wipe(sub.opc, sizeof(sub.opc));
     lc_sig_wipe(ms, sizeof(ms));
+    lc_sig_wipe(&full, sizeof(full)); /* XRES, CK, IK of a vector cut short */
+    lc_sig_wipe(iss, sizeof(iss));    /* XRES */
     for (unsigned i = 0; i < LC_CORE_AV_MAX; i++) {
+        lc_sig_wipe(r.u.av_res.av[i].hxres, sizeof(r.u.av_res.av[i].hxres));
         lc_sig_wipe(r.u.av_res.av[i].ck, sizeof(r.u.av_res.av[i].ck));
         lc_sig_wipe(r.u.av_res.av[i].ik, sizeof(r.u.av_res.av[i].ik));
     }

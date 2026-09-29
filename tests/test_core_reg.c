@@ -6,6 +6,7 @@
 
 #include "core_fixture.h"
 #include "lc_sig_keys.h"
+#include "lc_sig_milenage.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -34,8 +35,8 @@ static void reg_world(void)
     hello(20, 2, 1);
 }
 
-/* A vector for TMID issued to the cell on link; returns it. */
-static lc_core_av_t vector_for(uint32_t link)
+/* The AV_RES answering an AV_REQ for TMID from the cell on link. */
+static const lc_core_msg_t *av_res_for(uint32_t link)
 {
     lc_core_msg_t m;
     memset(&m, 0, sizeof(m));
@@ -47,19 +48,43 @@ static lc_core_av_t vector_for(uint32_t link)
     const lc_core_msg_t *r = sent_since(from, link, LC_CORE_AV_RES);
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_OK, r->u.av_res.status);
-    return r->u.av_res.av[0];
+    return r;
 }
 
-static void loc_update(uint32_t link, uint32_t tmid, const lc_core_av_t *av)
+/* A vector for TMID issued to the cell on link; returns it. */
+static lc_core_av_t vector_for(uint32_t link) { return av_res_for(link)->u.av_res.av[0]; }
+
+/* The RES the terminal (reg_world's K and OPc) answers rand with: only the
+ * terminal can compute it; a cell has HXRES (network-core spec §19.1). */
+static void terminal_res(const uint8_t rand[16], uint8_t res[8])
+{
+    static const uint8_t zero[6] = { 0 }, amf[2] = { 0x80, 0x00 };
+    uint8_t k[16], opc[16];
+    lc_milenage_t o;
+    memset(k, 0x4b, 16);
+    memset(opc, 0x0c, 16);
+    TEST_ASSERT_EQUAL_INT(0, lc_milenage(k, opc, rand, zero, amf, &o));
+    memcpy(res, o.res, 8);
+}
+
+static void loc_update_res(uint32_t link, uint32_t tmid, const uint8_t rand[16], const uint8_t res[8])
 {
     lc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = LC_CORE_LOC_UPDATE;
     m.u.loc_update.tmid = tmid;
     memcpy(m.u.loc_update.number, N1, LC_SIG_NUMBER_LEN);
-    memcpy(m.u.loc_update.rand, av->rand, 16);
-    memcpy(m.u.loc_update.res, av->xres, 8);
+    memcpy(m.u.loc_update.rand, rand, 16);
+    memcpy(m.u.loc_update.res, res, 8);
     rx(link, &m);
+}
+
+/* The terminal answered av's AUTH_REQ on the cell on link, which reports it. */
+static void loc_update(uint32_t link, uint32_t tmid, const lc_core_av_t *av)
+{
+    uint8_t res[8];
+    terminal_res(av->rand, res);
+    loc_update_res(link, tmid, av->rand, res);
 }
 
 static int where(lc_core_loc_t *l) { return ST.loc_get(ST.ctx, N1, l); }
@@ -74,6 +99,7 @@ static void test_proven_update_sets_the_location(void)
     TEST_ASSERT_EQUAL_UINT32(1, l.cell_id);
     TEST_ASSERT_EQUAL_HEX32(TMID, l.tmid);
     TEST_ASSERT_EQUAL_UINT32(UNIX0 + 1u + 3600u, l.expires); /* 2 x period_s */
+    TEST_ASSERT_EQUAL_UINT64(1, l.sqn);                      /* the proving vector's SQN (§19.2) */
     lc_core_av_issued_t a;
     TEST_ASSERT_EQUAL_INT(0, ST.av_get(ST.ctx, N1, av.rand, &a));
     TEST_ASSERT_EQUAL_UINT8(1, a.confirmed);
@@ -114,11 +140,14 @@ static void test_rogue_claims_are_refused_and_audited(void)
     int from = NSENT;
     loc_update(20, TMID, &av); /* cell 1's vector, claimed by cell 2 */
     lc_core_av_t wrong = vector_for(20);
-    wrong.xres[0] ^= 1;
-    loc_update(20, TMID, &wrong);
-    lc_core_av_t never = wrong;
-    memset(never.rand, 0x5a, 16);
-    loc_update(20, TMID, &never);
+    uint8_t res[8];
+    terminal_res(wrong.rand, res);
+    res[0] ^= 1;
+    loc_update_res(20, TMID, wrong.rand, res);
+    uint8_t never[16];
+    memset(never, 0x5a, 16);
+    terminal_res(never, res); /* the right RES, for a RAND never issued */
+    loc_update_res(20, TMID, never, res);
     lc_core_loc_t l;
     TEST_ASSERT_EQUAL_INT(0, where(&l));
     TEST_ASSERT_EQUAL_UINT32(1, l.cell_id); /* unmoved */
@@ -143,6 +172,10 @@ static void test_stale_claims_are_cancelled_back(void)
     const lc_core_msg_t *c = sent_since(from, 10, LC_CORE_LOC_CANCEL);
     TEST_ASSERT_NOT_NULL(c);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_REACTIVATED, c->u.loc_cancel.cause);
+    const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL); /* sent and audited */
+    TEST_ASSERT_NOT_NULL(au);
+    TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+    TEST_ASSERT_EQUAL_HEX32(TMID, au->tmid);
     lc_core_loc_t l;
     TEST_ASSERT_EQUAL_INT(-1, where(&l));
 
@@ -152,6 +185,95 @@ static void test_stale_claims_are_cancelled_back(void)
     from = NSENT;
     loc_update(10, TMID, &av);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_DISABLED, sent_since(from, 10, LC_CORE_LOC_CANCEL)->u.loc_cancel.cause);
+}
+
+/* §19.1: a cell that heard TMID on air and asked for a vector itself gets
+ * HXRES, not XRES; nothing it can compute from the vector proves a
+ * registration that never happened, so the subscriber stays where it is. */
+static void test_a_rogue_cell_cannot_prove_a_registration(void)
+{
+    reg_world();
+    lc_core_av_t av = vector_for(10);
+    loc_update(10, TMID, &av); /* the terminal really is on cell 1 */
+    int from = NSENT;
+    const lc_core_msg_t *r = av_res_for(20); /* cell 2 asks for TMID's vector */
+    lc_core_av_t v = r->u.av_res.av[0];
+    lc_core_av_issued_t row;
+    TEST_ASSERT_EQUAL_INT(0, ST.av_get(ST.ctx, N1, v.rand, &row));
+    uint8_t buf[LC_CORE_FRAME_MAX];
+    size_t n = lc_core_encode(r, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(n > 0);
+    for (size_t i = 0; i + 8u <= n; i++) TEST_ASSERT_FALSE(memcmp(buf + i, row.xres, 8) == 0); /* no XRES on the wire */
+    static const uint8_t zero[8] = { 0 };
+    const uint8_t *guess[] = { v.hxres, v.hxres + 8, v.autn, v.autn + 8, v.ck, v.ck + 8, v.ik, v.ik + 8, v.rand,
+                               v.rand + 8, zero };
+    for (unsigned i = 0; i < sizeof(guess) / sizeof(guess[0]); i++) loc_update_res(20, TMID, v.rand, guess[i]);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(1, l.cell_id); /* unmoved */
+    TEST_ASSERT_NULL(sent_since(from, 10, LC_CORE_LOC_CANCEL));
+    const lc_core_audit_t *a = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_AUTH_FAIL);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_UINT32(2, a->cell_id);
+}
+
+/* §19.2 and §7.10: cell 1 registered the terminal while cut off (SQN 1);
+ * the terminal then moved to cell 2 (SQN 2), which reported at once. When
+ * cell 1 reconnects, its older claim is refused and it is told the terminal
+ * moved; the location stays on cell 2. A newer claim still moves it back. */
+static void test_an_older_claim_from_another_cell_is_refused(void)
+{
+    reg_world();
+    lc_core_av_t va = vector_for(10);
+    lc_core_av_t vb = vector_for(20);
+    loc_update(20, TMID, &vb);
+    int from = NSENT;
+    loc_update(10, TMID, &va); /* the offline registration's LOC_UPDATE, replayed late */
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(2, l.cell_id);
+    TEST_ASSERT_EQUAL_UINT64(2, l.sqn);
+    const lc_core_msg_t *c = sent_since(from, 10, LC_CORE_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_HEX32(TMID, c->u.loc_cancel.tmid);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, c->u.loc_cancel.cause);
+    TEST_ASSERT_NULL(sent_since(from, 20, LC_CORE_LOC_CANCEL));
+    const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(au);
+    TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+    lc_core_av_issued_t a;
+    TEST_ASSERT_EQUAL_INT(0, ST.av_get(ST.ctx, N1, va.rand, &a));
+    TEST_ASSERT_EQUAL_UINT8(0, a.confirmed); /* it proved nothing */
+
+    lc_core_av_t va2 = vector_for(10); /* the terminal really came back: SQN 3 */
+    from = NSENT;
+    loc_update(10, TMID, &va2);
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(1, l.cell_id);
+    TEST_ASSERT_EQUAL_UINT64(3, l.sqn);
+    c = sent_since(from, 20, LC_CORE_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, c->u.loc_cancel.cause);
+}
+
+/* §19.2: the same cell re-sending a claim - even an older one than the
+ * location holds - refreshes it as before; the location keeps its newest
+ * SQN, so a later replay from elsewhere is still judged against that. */
+static void test_the_same_cell_resending_still_refreshes(void)
+{
+    reg_world();
+    lc_core_av_t v1 = vector_for(20);
+    lc_core_av_t v2 = vector_for(20);
+    loc_update(20, TMID, &v2);
+    NOW += 600000000u;
+    int from = NSENT;
+    loc_update(20, TMID, &v1);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(2, l.cell_id);
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 601u + 3600u, l.expires);
+    TEST_ASSERT_EQUAL_UINT64(2, l.sqn);
+    TEST_ASSERT_NULL(sent_since(from, 20, LC_CORE_LOC_CANCEL));
 }
 
 static void test_purge_only_from_the_location_cell(void)
@@ -167,6 +289,10 @@ static void test_purge_only_from_the_location_cell(void)
     rx(20, &m); /* not cell 2's to purge */
     lc_core_loc_t l;
     TEST_ASSERT_EQUAL_INT(0, where(&l));
+    m.u.loc_purge.tmid = TMID2; /* the right cell, but not the terminal registered there */
+    rx(10, &m);
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    m.u.loc_purge.tmid = TMID;
     rx(10, &m);
     TEST_ASSERT_EQUAL_INT(-1, where(&l));
 }
@@ -190,6 +316,9 @@ int main(void)
     RUN_TEST(test_move_cancels_at_the_old_cell);
     RUN_TEST(test_rogue_claims_are_refused_and_audited);
     RUN_TEST(test_stale_claims_are_cancelled_back);
+    RUN_TEST(test_a_rogue_cell_cannot_prove_a_registration);
+    RUN_TEST(test_an_older_claim_from_another_cell_is_refused);
+    RUN_TEST(test_the_same_cell_resending_still_refreshes);
     RUN_TEST(test_purge_only_from_the_location_cell);
     RUN_TEST(test_issued_vectors_are_pruned_after_a_day);
     return UNITY_END();

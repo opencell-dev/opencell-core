@@ -23,7 +23,7 @@ static void subscriber(const uint8_t n[LC_SIG_NUMBER_LEN], uint32_t tmid, uint32
     s.activated = 1;
     s.tmid = tmid;
     TEST_ASSERT_EQUAL_INT(0, ST.sub_put(ST.ctx, &s));
-    lc_core_loc_t l = { { 0 }, cell, tmid, UNIX0 + 3600u };
+    lc_core_loc_t l = { { 0 }, cell, tmid, UNIX0 + 3600u, 0 };
     memcpy(l.number, n, LC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, ST.loc_put(ST.ctx, &l));
 }
@@ -171,7 +171,7 @@ static void test_refusals_and_their_causes(void)
     TEST_ASSERT_EQUAL_UINT8(LC_SIG_CAUSE_UNREACHABLE, refused(NA, n)); /* no route */
     TEST_ASSERT_EQUAL_INT(0, ST.loc_del(ST.ctx, NB));
     TEST_ASSERT_EQUAL_UINT8(LC_SIG_CAUSE_UNREACHABLE, refused(NA, NB)); /* registered nowhere */
-    lc_core_loc_t l = { { 0 }, 2, TB, UNIX0 + 10u };
+    lc_core_loc_t l = { { 0 }, 2, TB, UNIX0 + 10u, 0 };
     memcpy(l.number, NB, LC_SIG_NUMBER_LEN);
     ST.loc_put(ST.ctx, &l);
     NOW += 20000000u;

@@ -105,16 +105,38 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->av_prune(c, 2001));
     TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a2.rand, &ag));
 
+    /* a number's issued vectors go all at once (re-activation, network-core
+     * spec §19.3), confirmed or not, and nobody else's; SQN is kept whole */
+    lc_core_av_issued_t a3 = a1, a4 = a1;
+    a3.confirmed = 1;
+    a3.sqn = (1ull << 40) + 1u;
+    memcpy(a4.number, n2, LC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a1));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a2));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a3));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a4));
+    TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a3.rand, &ag));
+    TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 1u, ag.sqn);
+    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1));
+    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a1.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n2, a4.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1)); /* none left: still 0 */
+    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
+    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n2, a4.rand, &ag));
+
     /* locations: one per number; delete; purge a cell's */
-    lc_core_loc_t l1 = { { 0 }, 7, 0x1234u, 5000 }, l2 = { { 0 }, 8, 0x5678u, 5000 }, lg;
+    lc_core_loc_t l1 = { { 0 }, 7, 0x1234u, 5000, 0 }, l2 = { { 0 }, 8, 0x5678u, 5000, 0 }, lg;
     memcpy(l1.number, n1, LC_SIG_NUMBER_LEN);
     memcpy(l2.number, n2, LC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1));
     TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l2));
     l1.cell_id = 8;
+    l1.sqn = (1ull << 40) + 9u; /* the SQN of the vector that proved it (§19.2), 48 bits */
     TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1)); /* moved */
     TEST_ASSERT_EQUAL_INT(0, st->loc_get(c, n1, &lg));
     TEST_ASSERT_EQUAL_UINT32(8, lg.cell_id);
+    TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 9u, lg.sqn);
     TEST_ASSERT_EQUAL_INT(0, st->loc_del(c, n1));
     TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n1, &lg));
     TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1));
@@ -135,6 +157,7 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->begin(c));
     TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
     TEST_ASSERT_EQUAL_INT(-1, st->loc_del(c, n1)); /* nothing there to delete */
+    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1)); /* nor here */
     TEST_ASSERT_EQUAL_INT(0, st->commit(c)); /* not doomed */
     TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n1, &s2));
     TEST_ASSERT_EQUAL_UINT64(7, s2.sqn);

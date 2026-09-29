@@ -43,7 +43,7 @@ static void test_hello_refusals_close_the_link_and_are_audited(void)
     lc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = LC_CORE_HELLO;
-    m.u.hello.proto = 2; /* a version this core doesn't speak */
+    m.u.hello.proto = LC_CORE_PROTO - 1u; /* proto 1: AV_RES with XRES (network-core spec §19.1), not spoken */
     m.u.hello.cell_id = 1;
     lc_core_link_up(&K, 12, NOW);
     rx(12, &m);

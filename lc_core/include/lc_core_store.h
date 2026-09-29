@@ -114,6 +114,10 @@ typedef struct {
                   lc_core_av_issued_t *out);
     int (*av_drop_cell)(void *ctx, uint32_t cell_id);  /* the cell's unconfirmed vectors */
     int (*av_del_number)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN]); /* all of the number's (§19.3) */
+    /* the highest SQN among the number's confirmed vectors issued to any
+     * cell but not_cell (§19.2's floor for a claim from not_cell); -1: none */
+    int (*av_newest_confirmed)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t not_cell,
+                               uint64_t *sqn);
     int (*av_prune)(void *ctx, uint32_t issued_before);
     int (*loc_get)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out);
     int (*loc_put)(void *ctx, const lc_core_loc_t *l);

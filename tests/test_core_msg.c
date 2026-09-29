@@ -209,7 +209,7 @@ static void test_every_type_round_trips(void)
 static void test_the_largest_av_res_fits_a_frame(void)
 {
     lc_core_msg_t m;
-    uint8_t buf[LC_CORE_FRAME_MAX];
+    uint8_t buf[LC_CORE_FRAME_MAX + 1];
     TEST_ASSERT_EQUAL_UINT(80, LC_CORE_AV_LEN);
     TEST_ASSERT_EQUAL_UINT(80, sizeof(lc_core_av_t));
     memset(&m, 0, sizeof(m));
@@ -219,6 +219,32 @@ static void test_the_largest_av_res_fits_a_frame(void)
     m.u.av_res.count = LC_CORE_AV_MAX;
     TEST_ASSERT_EQUAL_size_t(3u + 16u + LC_CORE_AV_MAX * LC_CORE_AV_LEN, lc_core_encode(&m, buf, sizeof(buf)));
     TEST_ASSERT_TRUE(3u + 16u + LC_CORE_AV_MAX * LC_CORE_AV_LEN <= LC_CORE_FRAME_MAX);
+    size_t n = 3u + 16u + LC_CORE_AV_MAX * LC_CORE_AV_LEN;
+    TEST_ASSERT_EQUAL_INT(0, lc_core_decode(buf, n, &m));
+    buf[0] = (uint8_t)((n - 3u) >> 8); /* one byte short */
+    buf[1] = (uint8_t)(n - 3u);
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_decode(buf, n - 1u, &m));
+    buf[n] = 0; /* one byte over */
+    buf[0] = (uint8_t)((n - 1u) >> 8);
+    buf[1] = (uint8_t)(n - 1u);
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_decode(buf, n + 1u, &m));
+}
+
+/* The AV_RES format changed with HXRES (network-core spec §19.1), so the
+ * protocol version moved to 2 (a proto-1 cell gets HELLO_NAK(version)), and
+ * an old-format AV_RES (a 72-byte vector with XRES 8: 91 bytes for one
+ * vector) does not decode. */
+static void test_proto_2_and_the_old_av_res_does_not_decode(void)
+{
+    TEST_ASSERT_EQUAL_UINT(2, LC_CORE_PROTO);
+    uint8_t old[2 + 1 + 16 + 72];
+    static const uint8_t head[] = { 0x00, 0x59, 0x13, 0x01, 0x00, 0x88, 0x04, 0xAD, 0x76, 0x00,
+                                    0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23, 0x4F, 0x01 };
+    TEST_ASSERT_EQUAL_size_t(91, sizeof(old));
+    memcpy(old, head, sizeof(head));
+    memset(old + sizeof(head), 0x42, sizeof(old) - sizeof(head));
+    lc_core_msg_t m;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_decode(old, sizeof(old), &m));
 }
 
 static void test_what_does_not_decode(void)
@@ -274,6 +300,7 @@ int main(void)
     RUN_TEST(test_golden_bytes);
     RUN_TEST(test_every_type_round_trips);
     RUN_TEST(test_the_largest_av_res_fits_a_frame);
+    RUN_TEST(test_proto_2_and_the_old_av_res_does_not_decode);
     RUN_TEST(test_what_does_not_decode);
     return UNITY_END();
 }

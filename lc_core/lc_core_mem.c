@@ -234,6 +234,19 @@ static int av_del_number(void *c, const uint8_t number[LC_SIG_NUMBER_LEN])
     return 0;
 }
 
+static int av_newest_confirmed(void *c, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t not_cell, uint64_t *sqn)
+{
+    const lc_core_mem_data_t *d = D(c);
+    int found = 0;
+    for (unsigned i = 0; i < d->nav; i++) {
+        const lc_core_av_issued_t *a = &d->av[i];
+        if (!num_eq(a->number, number) || !a->confirmed || a->cell_id == not_cell) continue;
+        if (!found || a->sqn > *sqn) *sqn = a->sqn;
+        found = 1;
+    }
+    return found ? 0 : -1;
+}
+
 static int av_prune(void *c, uint32_t issued_before)
 {
     lc_core_mem_data_t *d = D(c);
@@ -338,6 +351,7 @@ lc_core_store_t lc_core_mem_store(lc_core_mem_t *m)
         .av_get = av_get,
         .av_drop_cell = av_drop_cell,
         .av_del_number = av_del_number,
+        .av_newest_confirmed = av_newest_confirmed,
         .av_prune = av_prune,
         .loc_get = loc_get,
         .loc_put = loc_put,

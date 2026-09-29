@@ -122,8 +122,45 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a2.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n2, a4.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1)); /* none left: still 0 */
+    uint64_t top = 0;
+    TEST_ASSERT_EQUAL_INT(-1, st->av_newest_confirmed(c, n1, 0, &top)); /* none at all */
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
     TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n2, a4.rand, &ag));
+
+    /* the newest confirmed vector of a number issued to any cell but one
+     * (§19.2's floor for a claim from that cell) */
+    lc_core_av_issued_t v1 = a1, v2 = a1, v3 = a1, v4 = a1, v5 = a1;
+    memset(v1.rand, 0xb1, 16); /* cell 7, SQN 2^40 + 5, confirmed */
+    v1.sqn = (1ull << 40) + 5u;
+    v1.confirmed = 1;
+    v2 = v1; /* cell 8, SQN 2^40 + 9, confirmed: the newest elsewhere */
+    memset(v2.rand, 0xb2, 16);
+    v2.cell_id = 8;
+    v2.sqn = (1ull << 40) + 9u;
+    v3 = v2; /* cell 8, higher, but never confirmed */
+    memset(v3.rand, 0xb3, 16);
+    v3.sqn = (1ull << 40) + 20u;
+    v3.confirmed = 0;
+    v4 = v1; /* cell 7, the highest, confirmed: excluded when asking for cell 7 */
+    memset(v4.rand, 0xb4, 16);
+    v4.sqn = (1ull << 40) + 30u;
+    v5 = v4; /* another number */
+    memcpy(v5.number, n2, LC_SIG_NUMBER_LEN);
+    v5.cell_id = 9;
+    v5.sqn = (1ull << 40) + 40u;
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v1));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v2));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v3));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v4));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v5));
+    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 7, &top));
+    TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 9u, top);
+    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 8, &top));
+    TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 30u, top);
+    TEST_ASSERT_EQUAL_INT(-1, st->av_newest_confirmed(c, n2, 9, &top)); /* only cell 9's own */
+    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1));
+    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
+    TEST_ASSERT_EQUAL_INT(-1, st->av_newest_confirmed(c, n1, 7, &top));
 
     /* locations: one per number; delete; purge a cell's */
     lc_core_loc_t l1 = { { 0 }, 7, 0x1234u, 5000, 0 }, l2 = { { 0 }, 8, 0x5678u, 5000, 0 }, lg;

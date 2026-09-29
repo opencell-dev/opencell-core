@@ -492,6 +492,7 @@ static void test_failed_reactivation_commit_leaves_the_old_location_untouched(vo
     term_t t;
     term(&t, TMID, 0x42, &qr);
     activate(10, &t);
+    lc_core_av_t v = ask_avs(10, TMID, 1)->u.av_res.av[0];
     put_location(1, TMID);
     qr = issue(NUM);
     term(&t, TMID2, 0x55, &qr);
@@ -507,6 +508,42 @@ static void test_failed_reactivation_commit_leaves_the_old_location_untouched(vo
     TEST_ASSERT_EQUAL_UINT32(TMID, l.tmid);
     lc_core_sub_t s;
     TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s)); /* still the old binding */
+    lc_core_av_issued_t a;
+    TEST_ASSERT_EQUAL_INT(0, ST.av_get(ST.ctx, n, v.rand, &a)); /* ...and its vectors (§19.3 undone too) */
+}
+
+/* §19.3 with a real re-activation: cell 1 got a vector and the terminal
+ * answered it while cell 1 was cut off; meanwhile the number was re-activated
+ * on TMID2 at cell 2, which deleted that vector. Cell 1's late LOC_UPDATE for
+ * the old TMID no longer proves anything, but cell 1 is still told to drop
+ * the registration (LOC_CANCEL(reactivated)) - a stale claim, not an
+ * AUTH_FAIL. */
+static void test_a_claim_from_before_a_reactivation_is_cancelled_back(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t, t2;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    lc_core_av_t v = ask_avs(10, TMID, 1)->u.av_res.av[0];
+    uint8_t res[8];
+    terminal_res(&t, v.rand, res); /* AUTH_RSP: the registration cell 1 will report late */
+    hello(20, 2, 1);
+    qr = issue(NUM);
+    term(&t2, TMID2, 0x55, &qr);
+    TEST_ASSERT_EQUAL_HEX8(LC_SIG_ACT_ACK, activate(20, &t2)->u.act_res.msg.type);
+    int from = NSENT;
+    loc_claim(10, TMID, qr.number, v.rand, res);
+    const lc_core_msg_t *c = sent_since(from, 10, LC_CORE_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_HEX32(TMID, c->u.loc_cancel.tmid);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_REACTIVATED, c->u.loc_cancel.cause);
+    TEST_ASSERT_NULL(sent_since(from, 20, LC_CORE_LOC_CANCEL));
+    TEST_ASSERT_NULL(lc_core_mem_audit(&MEM, LC_CORE_AUDIT_AUTH_FAIL));
+    const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(au);
+    TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(-1, ST.loc_get(ST.ctx, qr.number, &l));
 }
 
 static void test_vectors_rise_and_are_committed_first(void)
@@ -742,6 +779,7 @@ int main(void)
     RUN_TEST(test_activation_refusals);
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
     RUN_TEST(test_reactivation_voids_the_old_bindings_vectors);
+    RUN_TEST(test_a_claim_from_before_a_reactivation_is_cancelled_back);
     RUN_TEST(test_reactivation_unbinds_the_tmids_other_subscriber_and_cancels_its_location);
     RUN_TEST(test_failed_reactivation_commit_leaves_the_old_location_untouched);
     RUN_TEST(test_vectors_rise_and_are_committed_first);

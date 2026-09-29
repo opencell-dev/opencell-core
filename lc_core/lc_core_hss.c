@@ -279,6 +279,7 @@ static void answer_av(lc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
             if (sqn_ms > sub.sqn) sub.sqn = sqn_ms;
             resynced = 1;
         }
+        lc_sig_wipe(seen.xres, sizeof(seen.xres));
     }
     if (st == LC_CORE_AV_OK) {
         uint64_t sqn = sub.sqn;

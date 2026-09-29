@@ -157,34 +157,46 @@ static void test_rogue_claims_are_refused_and_audited(void)
     TEST_ASSERT_EQUAL_UINT32(2, a->cell_id);
 }
 
-/* A proven claim for a binding the core has since cancelled: the claiming
- * cell is told to drop it. */
+/* A claim for a binding the core has since cancelled: the claiming cell is
+ * told to drop it. Re-activated: the activation also deleted the number's
+ * vectors (§19.3), so the claim no longer proves itself, and it is still
+ * cancelled back (a stale claim, not an AUTH_FAIL). Disabled: the vector
+ * still proves it, and the cell is told why. */
 static void test_stale_claims_are_cancelled_back(void)
 {
     reg_world();
     lc_core_av_t av = vector_for(10);
     lc_core_sub_t s;
     TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, N1, &s));
-    s.tmid = TMID2; /* re-activated on another terminal meanwhile */
+    s.tmid = TMID2; /* re-activated on another terminal meanwhile, as on_act_fwd commits it: */
     TEST_ASSERT_EQUAL_INT(0, ST.sub_put(ST.ctx, &s));
+    TEST_ASSERT_EQUAL_INT(0, ST.av_del_number(ST.ctx, N1));
     int from = NSENT;
     loc_update(10, TMID, &av);
     const lc_core_msg_t *c = sent_since(from, 10, LC_CORE_LOC_CANCEL);
     TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_HEX32(TMID, c->u.loc_cancel.tmid);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_REACTIVATED, c->u.loc_cancel.cause);
     const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL); /* sent and audited */
     TEST_ASSERT_NOT_NULL(au);
     TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
     TEST_ASSERT_EQUAL_HEX32(TMID, au->tmid);
+    TEST_ASSERT_NULL(lc_core_mem_audit(&MEM, LC_CORE_AUDIT_AUTH_FAIL));
     lc_core_loc_t l;
     TEST_ASSERT_EQUAL_INT(-1, where(&l));
 
-    s.tmid = TMID;
-    s.state = LC_CORE_SUB_DISABLED;
+    s.tmid = TMID; /* bound to TMID again, then disabled */
     TEST_ASSERT_EQUAL_INT(0, ST.sub_put(ST.ctx, &s));
+    lc_core_av_t fresh = vector_for(10);
+    TEST_ASSERT_EQUAL_INT(0, lc_core_sub_disable(&K, N1, NOW));
     from = NSENT;
-    loc_update(10, TMID, &av);
+    loc_update(10, TMID, &fresh);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_DISABLED, sent_since(from, 10, LC_CORE_LOC_CANCEL)->u.loc_cancel.cause);
+    from = NSENT;
+    loc_update(10, TMID, &av); /* the deleted vector, for a disabled number: told too */
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_DISABLED, sent_since(from, 10, LC_CORE_LOC_CANCEL)->u.loc_cancel.cause);
+    TEST_ASSERT_EQUAL_INT(-1, where(&l));
+    TEST_ASSERT_NULL(lc_core_mem_audit(&MEM, LC_CORE_AUDIT_AUTH_FAIL));
 }
 
 /* §19.1: a cell that heard TMID on air and asked for a vector itself gets
@@ -256,6 +268,58 @@ static void test_an_older_claim_from_another_cell_is_refused(void)
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, c->u.loc_cancel.cause);
 }
 
+static void purge(uint32_t link)
+{
+    lc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_LOC_PURGE;
+    m.u.loc_purge.tmid = TMID;
+    memcpy(m.u.loc_purge.number, N1, LC_SIG_NUMBER_LEN);
+    rx(link, &m);
+}
+
+/* §19.2: the floor outlives the location. Cell 1 proved SQN 1, then cell 2
+ * SQN 2; cell 2's location goes (a purge; later its new boot) and cell 1
+ * replays SQN 1: refused (moved) on cell 2's confirmed vector. A newer
+ * claim from cell 1 still proceeds. */
+static void test_an_older_claim_is_refused_after_the_newer_location_went(void)
+{
+    reg_world();
+    lc_core_av_t va = vector_for(10);
+    loc_update(10, TMID, &va);
+    lc_core_av_t vb = vector_for(20);
+    loc_update(20, TMID, &vb);
+    purge(20);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(-1, where(&l));
+    int from = NSENT;
+    loc_update(10, TMID, &va);
+    TEST_ASSERT_EQUAL_INT(-1, where(&l));
+    const lc_core_msg_t *c = sent_since(from, 10, LC_CORE_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, c->u.loc_cancel.cause);
+
+    loc_update(20, TMID, &vb); /* cell 2 again (nothing newer elsewhere), then it reboots */
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(2, l.cell_id);
+    hello(21, 2, 2);
+    TEST_ASSERT_EQUAL_INT(-1, where(&l));
+    from = NSENT;
+    loc_update(10, TMID, &va);
+    TEST_ASSERT_EQUAL_INT(-1, where(&l));
+    TEST_ASSERT_NOT_NULL(sent_since(from, 10, LC_CORE_LOC_CANCEL));
+
+    lc_core_av_t vc = vector_for(10); /* SQN 3: the terminal really is on cell 1 now */
+    loc_update(10, TMID, &vc);
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(1, l.cell_id);
+    TEST_ASSERT_EQUAL_UINT64(3, l.sqn);
+    loc_update(10, TMID, &va); /* and cell 1 re-sending its old claim refreshes, as before */
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(1, l.cell_id);
+    TEST_ASSERT_EQUAL_UINT64(3, l.sqn);
+}
+
 /* §19.2: the same cell re-sending a claim - even an older one than the
  * location holds - refreshes it as before; the location keeps its newest
  * SQN, so a later replay from elsewhere is still judged against that. */
@@ -319,6 +383,7 @@ int main(void)
     RUN_TEST(test_a_rogue_cell_cannot_prove_a_registration);
     RUN_TEST(test_an_older_claim_from_another_cell_is_refused);
     RUN_TEST(test_the_same_cell_resending_still_refreshes);
+    RUN_TEST(test_an_older_claim_is_refused_after_the_newer_location_went);
     RUN_TEST(test_purge_only_from_the_location_cell);
     RUN_TEST(test_issued_vectors_are_pruned_after_a_day);
     return UNITY_END();

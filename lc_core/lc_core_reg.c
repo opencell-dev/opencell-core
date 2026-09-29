@@ -52,6 +52,7 @@ void lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
     lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, cause);
 }
 
+/* §7.7-7.8, §8, §19. Single exit: every path wipes what it read. */
 static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
 {
     const uint8_t *num = m->u.loc_update.number;
@@ -60,34 +61,43 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     lc_core_sub_t s;
     lc_core_loc_t old, l;
     lc_core_netkey_t key;
-    if (k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a) != 0 || a.cell_id != cell ||
-        !lc_sig_ct_equal(m->u.loc_update.res, a.xres, 8)) {
-        lc_core_audit(k, LC_CORE_AUDIT_AUTH_FAIL, num, tmid, cell, "LOC_UPDATE: no vector of this cell's matches");
-        lc_core_logf(k, "cell %u: location claim for %08x refused", (unsigned)cell, (unsigned)tmid);
-        lc_sig_wipe(a.xres, sizeof(a.xres)); /* another claim's XRES, maybe: not the claimant's to learn */
-        return;
-    }
+    uint64_t floor = 0, top;
+    memset(&a, 0, sizeof(a));
+    memset(&s, 0, sizeof(s));
+    memset(&key, 0, sizeof(key));
+    int proven = k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a) == 0 && a.cell_id == cell &&
+                 lc_sig_ct_equal(m->u.loc_update.res, a.xres, 8);
     int known = k->st.sub_get(k->st.ctx, num, &s) == 0;
-    lc_sig_wipe(s.k, sizeof(s.k));
-    lc_sig_wipe(s.opc, sizeof(s.opc));
-    if (!known || !s.activated || s.tmid != tmid || s.state != LC_CORE_SUB_ACTIVE) {
-        /* a proven registration the core has since cancelled (disabled
-         * while the cell was cut off): the cell drops it now. s.tmid != tmid
-         * catches a claim for a terminal the number is no longer bound to
-         * (re-activation also deletes the old binding's vectors, §19.3). */
+    if ((known && (!s.activated || s.tmid != tmid || s.state != LC_CORE_SUB_ACTIVE)) || (proven && !known)) {
+        /* a claim for a binding the core has since cancelled (re-activated
+         * or disabled while the cell was cut off): the cell drops it now.
+         * Proven or not - re-activation deleted the old binding's vectors
+         * (§19.3) - since the cancel only reaches the claimant, about its
+         * own TMID. A stale claim, audited as the LOC_CANCEL, not AUTH_FAIL. */
         int off = known && s.state == LC_CORE_SUB_DISABLED;
         lc_core_loc_send_cancel(k, num, cell, tmid, off ? LC_CORE_CANCEL_DISABLED : LC_CORE_CANCEL_REACTIVATED);
-        return;
+        goto done;
+    }
+    if (!proven) {
+        lc_core_audit(k, LC_CORE_AUDIT_AUTH_FAIL, num, tmid, cell, "LOC_UPDATE: no vector of this cell's matches");
+        lc_core_logf(k, "cell %u: location claim for %08x refused", (unsigned)cell, (unsigned)tmid);
+        goto done;
     }
     int had = k->st.loc_get(k->st.ctx, num, &old) == 0;
-    if (had && old.cell_id != cell && a.sqn < old.sqn) {
-        /* §19.2: an older claim than the location's, from another cell (a
-         * late §7.10 offline LOC_UPDATE, or a replay): the terminal has
-         * registered elsewhere since, so the claimant drops it */
-        lc_core_logf(k, "cell %u: older claim for %08x refused (SQN %llu < %llu)", (unsigned)cell, (unsigned)tmid,
-                     (unsigned long long)a.sqn, (unsigned long long)old.sqn);
-        lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED);
-        return;
+    if (!had || old.cell_id != cell) {
+        /* §19.2: not older than the location, nor than any vector another
+         * cell has proved (those rows outlive a purged or expired location
+         * as long as this claim's vector can be replayed) */
+        if (had) floor = old.sqn;
+        if (k->st.av_newest_confirmed(k->st.ctx, num, cell, &top) == 0 && top > floor) floor = top;
+        if (a.sqn < floor) {
+            /* a late §7.10 offline LOC_UPDATE, or a replay: the terminal has
+             * registered elsewhere since, so the claimant drops it */
+            lc_core_logf(k, "cell %u: older claim for %08x refused (SQN %llu < %llu)", (unsigned)cell,
+                         (unsigned)tmid, (unsigned long long)a.sqn, (unsigned long long)floor);
+            lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED);
+            goto done;
+        }
     }
     int moved = had && (old.cell_id != cell || old.tmid != tmid);
     memset(&l, 0, sizeof(l));
@@ -95,7 +105,6 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     l.cell_id = cell;
     l.tmid = tmid;
     l.expires = lc_core_unix(k) + 2u * (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) == 0 ? key.period_s : 1800u);
-    lc_sig_wipe(key.sk, sizeof(key.sk));
     /* the newest vector that proved it: the same cell re-sending an older
      * claim refreshes the location without lowering it */
     l.sqn = had && !moved && old.sqn > a.sqn ? old.sqn : a.sqn;
@@ -105,10 +114,15 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     k->st.loc_put(k->st.ctx, &l);
     if (k->st.commit(k->st.ctx) != 0) {
         lc_core_logf(k, "location of %08x: store FAILED", (unsigned)tmid);
-        return;
+        goto done;
     }
     if (moved) lc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, LC_CORE_CANCEL_MOVED); /* §7.8 */
     lc_core_audit(k, LC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
+done:
+    lc_sig_wipe(a.xres, sizeof(a.xres));
+    lc_sig_wipe(s.k, sizeof(s.k));
+    lc_sig_wipe(s.opc, sizeof(s.opc));
+    lc_sig_wipe(key.sk, sizeof(key.sk));
 }
 
 /* Not wrapped in begin/commit: one write, already durable on its own

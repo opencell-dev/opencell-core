@@ -17,7 +17,7 @@
 #include "lc_sig_msg.h" /* lc_sig_msg_t, lc_sig_body_encode/decode */
 
 #define LC_CORE_FRAME_MAX 512u
-#define LC_CORE_PROTO     1u
+#define LC_CORE_PROTO     2u /* 2: AV_RES carries HXRES, not XRES (network-core spec §19.1) */
 #define LC_CORE_AV_MAX    4u
 #define LC_CORE_REF_CORE  0x80000000u
 

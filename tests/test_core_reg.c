@@ -290,6 +290,44 @@ static void purge(uint32_t link)
     rx(link, &m);
 }
 
+/* Final review I2(c): the §19.2 floor fails closed. Cell 2 holds the
+ * location with SQN 2; cell 1 replays its SQN 1 claim while the store can't
+ * read the location, or the confirmed vectors, or the subscriber: each time
+ * the claim is refused with nothing written and nothing sent (no LOC_CANCEL
+ * either way: the core does not know which one is due), and the location
+ * stays on cell 2. */
+static void test_the_location_floor_fails_closed(void)
+{
+    static const unsigned fails[] = { LC_CORE_MEM_FAIL_LOC_GET, LC_CORE_MEM_FAIL_AV_NEWEST,
+                                      LC_CORE_MEM_FAIL_LOC_GET | LC_CORE_MEM_FAIL_AV_NEWEST,
+                                      LC_CORE_MEM_FAIL_SUB_GET };
+    for (unsigned i = 0; i < sizeof(fails) / sizeof(fails[0]); i++) {
+        reg_world();
+        lc_core_av_t va = vector_for(10);
+        lc_core_av_t vb = vector_for(20);
+        loc_update(20, TMID, &vb);
+        if (fails[i] == LC_CORE_MEM_FAIL_AV_NEWEST) purge(20); /* only the confirmed vector's floor is left */
+        int from = NSENT;
+        unsigned commits = MEM.commits;
+        MEM.fail_reads = fails[i];
+        loc_update(10, TMID, &va);
+        MEM.fail_reads = 0;
+        TEST_ASSERT_EQUAL_INT_MESSAGE(from, NSENT, "nothing sent");
+        TEST_ASSERT_EQUAL_UINT(commits, MEM.commits);
+        lc_core_loc_t l;
+        if (fails[i] == LC_CORE_MEM_FAIL_AV_NEWEST) {
+            TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, where(&l));
+        } else {
+            TEST_ASSERT_EQUAL_INT(0, where(&l));
+            TEST_ASSERT_EQUAL_UINT32(2, l.cell_id);
+        }
+        lc_core_av_issued_t a;
+        TEST_ASSERT_EQUAL_INT(0, ST.av_get(ST.ctx, N1, va.rand, &a));
+        TEST_ASSERT_EQUAL_UINT8(0, a.confirmed);
+    }
+}
+
+
 /* §19.2: the floor outlives the location. Cell 1 proved SQN 1, then cell 2
  * SQN 2; cell 2's location goes (a purge; later its new boot) and cell 1
  * replays SQN 1: refused (moved) on cell 2's confirmed vector. A newer
@@ -402,6 +440,7 @@ int main(void)
     RUN_TEST(test_the_same_cell_resending_still_refreshes);
     RUN_TEST(test_an_older_claim_is_refused_after_the_newer_location_went);
     RUN_TEST(test_purge_only_from_the_location_cell);
+    RUN_TEST(test_the_location_floor_fails_closed);
     RUN_TEST(test_issued_vectors_are_pruned_after_a_day);
     return UNITY_END();
 }

@@ -281,8 +281,9 @@ static void test_begin_twice_is_refused(void)
     TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
     TEST_ASSERT_EQUAL_INT(-1, st.begin(st.ctx)); /* already inside a transaction: refused */
     s.sqn = 3;
-    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s)); /* still the one open transaction */
-    mem.fail_commits = 1;
+    /* a failed begin dooms the transaction (lc_core_store.h): the write is
+     * refused and commit undoes everything */
+    TEST_ASSERT_EQUAL_INT(-1, st.sub_put(st.ctx, &s));
     TEST_ASSERT_EQUAL_INT(-1, st.commit(st.ctx));
     /* the failed nested begin() must not have moved the undo point: undo
      * restores all the way back to before the *first* begin (sqn 1), not to
@@ -290,6 +291,94 @@ static void test_begin_twice_is_refused(void)
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, s.number, &got));
     TEST_ASSERT_EQUAL_UINT64(1, got.sqn);
     TEST_ASSERT_EQUAL_UINT(0, mem.commits);
+}
+
+/* Final review I2(a): a begin that fails dooms its transaction. Every write
+ * until commit is refused - puts, deletes, bulk deletes and records alike -
+ * commit returns -1, and the next begin starts afresh. */
+static void test_failed_begin_dooms_the_transaction(void)
+{
+    lc_core_mem_init(&mem);
+    lc_core_store_t st = lc_core_mem_store(&mem);
+    lc_core_sub_t s, got;
+    lc_core_loc_t l, lg;
+    memset(&s, 0, sizeof(s));
+    memset(&l, 0, sizeof(l));
+    contract_num("+883200000000001", s.number);
+    memcpy(l.number, s.number, LC_SIG_NUMBER_LEN);
+    s.sqn = 1;
+    l.cell_id = 7;
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
+    TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
+    unsigned ncdr = mem.d.ncdr;
+    mem.fail_begins = 1;
+    TEST_ASSERT_EQUAL_INT(-1, st.begin(st.ctx));
+    s.sqn = 2;
+    TEST_ASSERT_EQUAL_INT(-1, st.sub_put(st.ctx, &s));
+    TEST_ASSERT_EQUAL_INT(-1, st.loc_del(st.ctx, s.number));
+    TEST_ASSERT_EQUAL_INT(-1, st.loc_purge_cell(st.ctx, 7));
+    TEST_ASSERT_EQUAL_INT(-1, st.av_del_number(st.ctx, s.number));
+    lc_core_cdr_t cdr;
+    memset(&cdr, 0, sizeof(cdr));
+    TEST_ASSERT_EQUAL_INT(-1, st.cdr_add(st.ctx, &cdr));
+    TEST_ASSERT_EQUAL_UINT(5, mem.refused);
+    TEST_ASSERT_EQUAL_INT(-1, st.commit(st.ctx));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, s.number, &got));
+    TEST_ASSERT_EQUAL_UINT64(1, got.sqn);
+    TEST_ASSERT_EQUAL_INT(0, st.loc_get(st.ctx, s.number, &lg));
+    TEST_ASSERT_EQUAL_UINT(ncdr, mem.d.ncdr);
+    TEST_ASSERT_EQUAL_UINT(0, mem.commits);
+
+    TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx)); /* afresh: only the one begin failed */
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
+    TEST_ASSERT_EQUAL_INT(0, st.commit(st.ctx));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, s.number, &got));
+    TEST_ASSERT_EQUAL_UINT64(2, got.sqn);
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s)); /* and outside one, writes land */
+}
+
+/* Final review I2(c): sub_get, loc_get and av_newest_confirmed tell "none"
+ * (LC_CORE_STORE_NONE) from "failed" (LC_CORE_STORE_FAILED): the test hook
+ * fail_reads makes the chosen lookups fail, found or not. */
+static void test_failed_lookups_are_told_from_none(void)
+{
+    lc_core_mem_init(&mem);
+    lc_core_store_t st = lc_core_mem_store(&mem);
+    uint8_t n1[LC_SIG_NUMBER_LEN], n2[LC_SIG_NUMBER_LEN];
+    contract_num("+883200000000001", n1);
+    contract_num("+883200000000002", n2);
+    lc_core_sub_t s;
+    lc_core_loc_t l;
+    lc_core_av_issued_t a;
+    uint64_t top;
+    memset(&s, 0, sizeof(s));
+    memset(&l, 0, sizeof(l));
+    memset(&a, 0, sizeof(a));
+    memcpy(s.number, n1, LC_SIG_NUMBER_LEN);
+    memcpy(l.number, n1, LC_SIG_NUMBER_LEN);
+    memcpy(a.number, n1, LC_SIG_NUMBER_LEN);
+    a.cell_id = 7;
+    a.confirmed = 1;
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
+    TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
+    TEST_ASSERT_EQUAL_INT(0, st.av_put(st.ctx, &a));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st.sub_get(st.ctx, n2, &s));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st.loc_get(st.ctx, n2, &l));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st.av_newest_confirmed(st.ctx, n2, 0, &top));
+
+    mem.fail_reads = LC_CORE_MEM_FAIL_SUB_GET;
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.sub_get(st.ctx, n1, &s));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.sub_get(st.ctx, n2, &s));
+    TEST_ASSERT_EQUAL_INT(0, st.loc_get(st.ctx, n1, &l)); /* only the chosen lookup fails */
+    mem.fail_reads = LC_CORE_MEM_FAIL_LOC_GET;
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.loc_get(st.ctx, n1, &l));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.loc_get(st.ctx, n2, &l));
+    mem.fail_reads = LC_CORE_MEM_FAIL_AV_NEWEST;
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n1, 0, &top));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n2, 0, &top));
+    mem.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, n1, &s));
+    TEST_ASSERT_EQUAL_INT(0, st.av_newest_confirmed(st.ctx, n1, 0, &top));
 }
 
 static void test_commit_without_begin_is_refused(void)
@@ -331,5 +420,7 @@ int main(void)
     RUN_TEST(test_loc_table_fills_then_refuses);
     RUN_TEST(test_begin_twice_is_refused);
     RUN_TEST(test_commit_without_begin_is_refused);
+    RUN_TEST(test_failed_begin_dooms_the_transaction);
+    RUN_TEST(test_failed_lookups_are_told_from_none);
     return UNITY_END();
 }

@@ -25,10 +25,11 @@ static int cancel(lc_core_t *k, uint32_t cell, uint32_t tmid, uint8_t cause, con
 
 int lc_core_loc_live(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out)
 {
-    if (k->st.loc_get(k->st.ctx, number, out) != 0) return -1;
+    int r = k->st.loc_get(k->st.ctx, number, out);
+    if (r != 0) return r; /* none, or the store failed: not live either way */
     if (out->expires > lc_core_unix(k)) return 0;
     k->st.loc_del(k->st.ctx, number);
-    return -1;
+    return LC_CORE_STORE_NONE;
 }
 
 void lc_core_loc_send_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t cell_id, uint32_t tmid,
@@ -72,7 +73,12 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     memset(&key, 0, sizeof(key));
     int proven = k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a) == 0 && a.cell_id == cell &&
                  lc_sig_ct_equal(m->u.loc_update.res, a.xres, 8);
-    int known = k->st.sub_get(k->st.ctx, num, &s) == 0;
+    int got = k->st.sub_get(k->st.ctx, num, &s);
+    if (got == LC_CORE_STORE_FAILED) { /* fail closed (lc_core_store.h): no cancel, no location */
+        lc_core_logf(k, "cell %u: location claim for %08x: subscriber read FAILED", (unsigned)cell, (unsigned)tmid);
+        goto done;
+    }
+    int known = got == 0;
     if ((known && (!s.activated || s.tmid != tmid || s.state != LC_CORE_SUB_ACTIVE)) || (proven && !known)) {
         /* a claim for a binding the core has since cancelled (re-activated
          * or disabled while the cell was cut off): the cell drops it now.
@@ -92,7 +98,12 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         lc_core_logf(k, "cell %u: location claim for %08x refused", (unsigned)cell, (unsigned)tmid);
         goto done;
     }
-    int had = k->st.loc_get(k->st.ctx, num, &old) == 0;
+    got = k->st.loc_get(k->st.ctx, num, &old);
+    if (got == LC_CORE_STORE_FAILED) { /* the floor below can't be skipped for it: refused */
+        lc_core_logf(k, "cell %u: location claim for %08x: location read FAILED", (unsigned)cell, (unsigned)tmid);
+        goto done;
+    }
+    int had = got == 0;
     if (!had || old.cell_id != cell) {
         /* §19.2: not older than the location, nor than any vector another
          * cell has proved (those rows outlive a purged or expired location
@@ -102,7 +113,13 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
          * stale replay the other floor alone might miss (e.g. no confirmed
          * row survives a purge) - do not "simplify" this away. */
         if (had) floor = old.sqn;
-        if (k->st.av_newest_confirmed(k->st.ctx, num, cell, &top) == 0 && top > floor) floor = top;
+        got = k->st.av_newest_confirmed(k->st.ctx, num, cell, &top);
+        if (got == LC_CORE_STORE_FAILED) { /* no floor known: refused, not waved through */
+            lc_core_logf(k, "cell %u: location claim for %08x: vector read FAILED", (unsigned)cell,
+                         (unsigned)tmid);
+            goto done;
+        }
+        if (got == 0 && top > floor) floor = top;
         if (a.sqn < floor) {
             /* a late §7.10 offline LOC_UPDATE, or a replay: the terminal has
              * registered elsewhere since, so the claimant drops it */
@@ -128,7 +145,7 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     l.sqn = keep ? old.sqn : a.sqn;
     memcpy(l.rand, keep ? old.rand : m->u.loc_update.rand, 16);
     a.confirmed = 1;
-    k->st.begin(k->st.ctx);
+    if (lc_core_begin(k) != 0) goto done;
     k->st.av_put(k->st.ctx, &a);
     k->st.loc_put(k->st.ctx, &l);
     if (k->st.commit(k->st.ctx) != 0) {

@@ -16,10 +16,35 @@ static void fail_txn(void *c)
     if (m->in_txn) m->txn_failed = 1;
 }
 
+/* A write after a failed begin (lc_core_store.h): refused, nothing written. */
+static int refuse(void *c)
+{
+    lc_core_mem_t *m = M(c);
+    if (!m->refusing) return 0;
+    m->refused++;
+    return 1;
+}
+
+/* The begin failed: a transaction is open all the same, doomed, and every
+ * write until its commit is refused. Inside an open transaction that is
+ * the one doomed (its undo point stays where its own begin put it). */
+static int begin_failed(lc_core_mem_t *m)
+{
+    if (!m->in_txn) m->undo = m->d;
+    m->in_txn = 1;
+    m->txn_failed = 1;
+    m->refusing = 1;
+    return -1;
+}
+
 static int begin(void *c)
 {
     lc_core_mem_t *m = M(c);
-    if (m->in_txn) return -1; /* already inside a transaction: leave it be */
+    if (m->in_txn) return begin_failed(m); /* already inside a transaction */
+    if (m->fail_begins > 0) {
+        m->fail_begins--;
+        return begin_failed(m);
+    }
     m->undo = m->d;
     m->in_txn = 1;
     m->txn_failed = 0;
@@ -31,6 +56,7 @@ static int commit(void *c)
     lc_core_mem_t *m = M(c);
     if (!m->in_txn) return -1; /* no matching begin(): nothing to commit */
     m->in_txn = 0;
+    m->refusing = 0;
     int failed = m->txn_failed;
     m->txn_failed = 0;
     if (m->fail_commits > 0) {
@@ -58,6 +84,7 @@ static int netkey_get(void *c, uint16_t key_id, lc_core_netkey_t *out)
 
 static int netkey_put(void *c, const lc_core_netkey_t *k)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     for (unsigned i = 0; i < d->nkey; i++) {
         if (d->key[i].key_id == k->key_id) {
@@ -86,6 +113,7 @@ static int cell_get(void *c, uint32_t cell_id, lc_core_cell_t *out)
 
 static int cell_put(void *c, const lc_core_cell_t *x)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     for (unsigned i = 0; i < d->ncell; i++) {
         if (d->cell[i].cell_id == x->cell_id) {
@@ -114,6 +142,7 @@ static int list_get(void *c, uint16_t list_id, lc_sig_chan_list_t *out)
 
 static int list_put(void *c, uint16_t list_id, const lc_sig_chan_list_t *l)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     for (unsigned i = 0; i < d->nlist; i++) {
         if (d->list_id[i] == list_id) {
@@ -132,13 +161,14 @@ static int list_put(void *c, uint16_t list_id, const lc_sig_chan_list_t *l)
 
 static int sub_get(void *c, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_sub_t *out)
 {
+    if (M(c)->fail_reads & LC_CORE_MEM_FAIL_SUB_GET) return LC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < D(c)->nsub; i++) {
         if (num_eq(D(c)->sub[i].number, number)) {
             *out = D(c)->sub[i];
             return 0;
         }
     }
-    return -1;
+    return LC_CORE_STORE_NONE;
 }
 
 static int sub_by_tmid(void *c, uint32_t tmid, lc_core_sub_t *out)
@@ -154,6 +184,7 @@ static int sub_by_tmid(void *c, uint32_t tmid, lc_core_sub_t *out)
 
 static int sub_put(void *c, const lc_core_sub_t *s)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     for (unsigned i = 0; i < d->nsub; i++) {
         if (num_eq(d->sub[i].number, s->number)) {
@@ -182,6 +213,7 @@ static int token_get(void *c, const uint8_t token_id[8], lc_core_token_t *out)
 
 static int token_put(void *c, const lc_core_token_t *t)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     for (unsigned i = 0; i < d->ntoken; i++) {
         if (memcmp(d->token[i].token_id, t->token_id, 8) == 0) {
@@ -199,6 +231,7 @@ static int token_put(void *c, const lc_core_token_t *t)
 
 static int token_void(void *c, const uint8_t number[LC_SIG_NUMBER_LEN])
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     unsigned k = 0;
     for (unsigned i = 0; i < d->ntoken; i++) {
@@ -218,6 +251,7 @@ static int av_find(lc_core_mem_data_t *d, const uint8_t number[LC_SIG_NUMBER_LEN
 
 static int av_put(void *c, const lc_core_av_issued_t *a)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     int i = av_find(d, a->number, a->rand);
     if (i >= 0) {
@@ -242,6 +276,7 @@ static int av_get(void *c, const uint8_t number[LC_SIG_NUMBER_LEN], const uint8_
 
 static int av_drop_cell(void *c, uint32_t cell_id)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     unsigned k = 0;
     for (unsigned i = 0; i < d->nav; i++) {
@@ -254,6 +289,7 @@ static int av_drop_cell(void *c, uint32_t cell_id)
 /* Like the other bulk deletes: deleting none is not a failure (0). */
 static int av_del_number(void *c, const uint8_t number[LC_SIG_NUMBER_LEN])
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     unsigned k = 0;
     for (unsigned i = 0; i < d->nav; i++) {
@@ -267,17 +303,19 @@ static int av_newest_confirmed(void *c, const uint8_t number[LC_SIG_NUMBER_LEN],
 {
     const lc_core_mem_data_t *d = D(c);
     int found = 0;
+    if (M(c)->fail_reads & LC_CORE_MEM_FAIL_AV_NEWEST) return LC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < d->nav; i++) {
         const lc_core_av_issued_t *a = &d->av[i];
         if (!num_eq(a->number, number) || !a->confirmed || a->cell_id == not_cell) continue;
         if (!found || a->sqn > *sqn) *sqn = a->sqn;
         found = 1;
     }
-    return found ? 0 : -1;
+    return found ? 0 : LC_CORE_STORE_NONE;
 }
 
 static int av_prune(void *c, uint32_t issued_before)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     unsigned k = 0;
     for (unsigned i = 0; i < d->nav; i++) {
@@ -289,17 +327,19 @@ static int av_prune(void *c, uint32_t issued_before)
 
 static int loc_get(void *c, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out)
 {
+    if (M(c)->fail_reads & LC_CORE_MEM_FAIL_LOC_GET) return LC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < D(c)->nloc; i++) {
         if (num_eq(D(c)->loc[i].number, number)) {
             *out = D(c)->loc[i];
             return 0;
         }
     }
-    return -1;
+    return LC_CORE_STORE_NONE;
 }
 
 static int loc_put(void *c, const lc_core_loc_t *l)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     for (unsigned i = 0; i < d->nloc; i++) {
         if (num_eq(d->loc[i].number, l->number)) {
@@ -317,6 +357,7 @@ static int loc_put(void *c, const lc_core_loc_t *l)
 
 static int loc_del(void *c, const uint8_t number[LC_SIG_NUMBER_LEN])
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     for (unsigned i = 0; i < d->nloc; i++) {
         if (num_eq(d->loc[i].number, number)) {
@@ -332,6 +373,7 @@ static int loc_del(void *c, const uint8_t number[LC_SIG_NUMBER_LEN])
 
 static int loc_purge_cell(void *c, uint32_t cell_id)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     unsigned k = 0;
     for (unsigned i = 0; i < d->nloc; i++) {
@@ -343,6 +385,7 @@ static int loc_purge_cell(void *c, uint32_t cell_id)
 
 static int cdr_add(void *c, const lc_core_cdr_t *x)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     d->cdr[d->ncdr++ % LC_CORE_MEM_LOG] = *x;
     return 0;
@@ -350,6 +393,7 @@ static int cdr_add(void *c, const lc_core_cdr_t *x)
 
 static int audit_add(void *c, const lc_core_audit_t *a)
 {
+    if (refuse(c)) return -1;
     lc_core_mem_data_t *d = D(c);
     d->audit[d->naudit++ % LC_CORE_MEM_LOG] = *a;
     return 0;

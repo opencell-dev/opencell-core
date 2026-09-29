@@ -73,7 +73,7 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_HEX8_ARRAY(n1, s2.number, LC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n1, &s2));
     TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 3u, s2.sqn);
-    TEST_ASSERT_EQUAL_INT(-1, st->sub_get(c, n2, &s2));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st->sub_get(c, n2, &s2)); /* none, not failed */
 
     /* tokens: voiding removes only the number's unused ones */
     lc_core_token_t t1, t2, t3, tg;
@@ -136,9 +136,9 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a1.rand, &ag));
     TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a2.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n2, a4.rand, &ag));
-    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1)); /* none left: still 0 */
+    TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1)); /* none left: still 0, unlike loc_del's -1 */
     uint64_t top = 0;
-    TEST_ASSERT_EQUAL_INT(-1, st->av_newest_confirmed(c, n1, 0, &top)); /* none at all */
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st->av_newest_confirmed(c, n1, 0, &top)); /* none at all */
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
     TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n2, a4.rand, &ag));
 
@@ -172,10 +172,10 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 9u, top);
     TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 8, &top));
     TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 30u, top);
-    TEST_ASSERT_EQUAL_INT(-1, st->av_newest_confirmed(c, n2, 9, &top)); /* only cell 9's own */
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st->av_newest_confirmed(c, n2, 9, &top)); /* only cell 9's own */
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1));
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
-    TEST_ASSERT_EQUAL_INT(-1, st->av_newest_confirmed(c, n1, 7, &top));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st->av_newest_confirmed(c, n1, 7, &top));
 
     /* locations: one per number; delete; purge a cell's */
     lc_core_loc_t l1 = { { 0 }, 7, 0x1234u, 5000, 0, { 0 } }, l2 = { { 0 }, 8, 0x5678u, 5000, 0, { 0 } }, lg;
@@ -192,11 +192,13 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 9u, lg.sqn);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(l1.rand, lg.rand, 16);
     TEST_ASSERT_EQUAL_INT(0, st->loc_del(c, n1));
-    TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n1, &lg));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st->loc_get(c, n1, &lg)); /* none, not failed */
+    TEST_ASSERT_EQUAL_INT(-1, st->loc_del(c, n1)); /* nothing to delete: -1 (lc_core_store.h) */
     TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1));
     TEST_ASSERT_EQUAL_INT(0, st->loc_purge_cell(c, 8));
-    TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n1, &lg));
-    TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n2, &lg));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st->loc_get(c, n1, &lg));
+    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st->loc_get(c, n2, &lg));
+    TEST_ASSERT_EQUAL_INT(0, st->loc_purge_cell(c, 8)); /* a bulk delete finding nothing: 0 */
 
     /* the store contract (lc_core_store.h): a write that fails inside a
      * transaction dooms it, except a delete that finds nothing to delete,

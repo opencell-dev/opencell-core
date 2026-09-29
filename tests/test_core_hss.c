@@ -339,6 +339,111 @@ static void test_failed_activation_commit_leaves_the_token_usable(void)
     TEST_ASSERT_EQUAL_HEX8(LC_SIG_ACT_ACK, r->u.act_res.msg.type);
 }
 
+/* Final review I2(a): begin fails at each of the HSS's transactions. Each
+ * checks it, closes the doomed transaction and refuses with nothing written
+ * (not even a refused write: MEM.refused stays put) and nothing sent - an
+ * activation has no half-written binding and no LOC_CANCEL, and an AV_REQ
+ * is answered UNAVAILABLE. The next attempt works. */
+static void test_failed_begin_refuses_with_nothing_written_or_sent(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    uint8_t n[LC_SIG_NUMBER_LEN];
+    number(NUM, n);
+    put_location(1, TMID2); /* the number's previous terminal, registered on cell 1 */
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    unsigned naudit = MEM.d.naudit, ntoken = MEM.d.ntoken;
+    int from = NSENT;
+    MEM.fail_begins = 1;
+    TEST_ASSERT_NULL(activate(10, &t));
+    TEST_ASSERT_EQUAL_INT(from, NSENT); /* no ACT_RES, no LOC_CANCEL */
+    TEST_ASSERT_EQUAL_UINT(0, MEM.refused);
+    TEST_ASSERT_FALSE(MEM.in_txn);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_UINT8(0, s.activated); /* no binding, not even half of one */
+    TEST_ASSERT_EQUAL_UINT32(0, s.tmid);
+    lc_core_token_t tok;
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &tok));
+    TEST_ASSERT_EQUAL_UINT32(0, tok.used_at);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, ST.loc_get(ST.ctx, n, &l));
+    TEST_ASSERT_EQUAL_HEX32(TMID2, l.tmid);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+
+    MEM.fail_begins = 1; /* a token */
+    lc_sig_qr_t qr2;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_token_issue(&K, n, 3600, &qr2));
+    TEST_ASSERT_EQUAL_UINT(ntoken, MEM.d.ntoken);
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &tok)); /* the old one, not voided */
+    MEM.fail_begins = 1; /* disabling */
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_sub_disable(&K, n, NOW));
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_SUB_ACTIVE, s.state);
+    TEST_ASSERT_EQUAL_INT(0, ST.loc_get(ST.ctx, n, &l));
+    TEST_ASSERT_EQUAL_INT(from, NSENT);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    TEST_ASSERT_EQUAL_UINT(0, MEM.refused);
+
+    const lc_core_msg_t *r = activate(10, &t); /* the same QR works now */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_HEX8(LC_SIG_ACT_ACK, r->u.act_res.msg.type);
+    unsigned nav = MEM.d.nav;
+    MEM.fail_begins = 1; /* vectors */
+    r = ask_avs(10, TMID, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_UNAVAILABLE, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_UINT8(0, r->u.av_res.count);
+    TEST_ASSERT_EQUAL_UINT(nav, MEM.d.nav);
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s));
+    TEST_ASSERT_EQUAL_UINT64(0, s.sqn);
+    TEST_ASSERT_EQUAL_UINT(0, MEM.refused);
+    r = ask_avs(10, TMID, 1);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_OK, r->u.av_res.status);
+}
+
+/* Final review I2(c): a lookup that fails is not "none". A subscriber whose
+ * record could not be read is not added again over it; disabling, and an
+ * activation, whose location could not be read are refused (nothing
+ * written, nothing sent) rather than leaving that location behind. */
+static void test_failed_lookups_fail_closed_in_the_hss(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    uint8_t n[LC_SIG_NUMBER_LEN], got[LC_SIG_NUMBER_LEN];
+    number(NUM, n);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    s.sqn = 77; /* something to lose */
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_put(ST.ctx, &s));
+    unsigned nsub = MEM.d.nsub;
+    MEM.fail_reads = LC_CORE_MEM_FAIL_SUB_GET;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_sub_add(&K, n, got));
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_sub_add(&K, NULL, got)); /* can't tell a free number either */
+    MEM.fail_reads = 0;
+    TEST_ASSERT_EQUAL_UINT(nsub, MEM.d.nsub);
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_UINT64(77, s.sqn);
+
+    put_location(1, TMID2);
+    int from = NSENT;
+    MEM.fail_reads = LC_CORE_MEM_FAIL_LOC_GET;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_sub_disable(&K, n, NOW));
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    TEST_ASSERT_NULL(activate(10, &t));
+    MEM.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(from, NSENT);
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_SUB_ACTIVE, s.state);
+    TEST_ASSERT_EQUAL_UINT8(0, s.activated);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, ST.loc_get(ST.ctx, n, &l));
+    TEST_ASSERT_EQUAL_HEX32(TMID2, l.tmid);
+    lc_core_token_t tok;
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &tok));
+    TEST_ASSERT_EQUAL_UINT32(0, tok.used_at);
+}
+
 static uint8_t nak(uint32_t link, const term_t *t)
 {
     const lc_core_msg_t *r = activate(link, t);
@@ -813,6 +918,8 @@ int main(void)
     RUN_TEST(test_activation_binds_and_confirms);
     RUN_TEST(test_failed_activation_commit_leaves_the_token_usable);
     RUN_TEST(test_activation_refusals);
+    RUN_TEST(test_failed_begin_refuses_with_nothing_written_or_sent);
+    RUN_TEST(test_failed_lookups_fail_closed_in_the_hss);
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
     RUN_TEST(test_reactivation_voids_the_old_bindings_vectors);
     RUN_TEST(test_a_claim_from_before_a_reactivation_is_cancelled_back);

@@ -42,13 +42,22 @@ typedef struct {
     unsigned            naudit; /* likewise */
 } lc_core_mem_data_t;
 
+/* fail_reads: which lookups fail (LC_CORE_STORE_FAILED) while it is set */
+#define LC_CORE_MEM_FAIL_SUB_GET   1u
+#define LC_CORE_MEM_FAIL_LOC_GET   2u
+#define LC_CORE_MEM_FAIL_AV_NEWEST 4u
+
 typedef struct {
     lc_core_mem_data_t d;
     lc_core_mem_data_t undo;        /* d as it was at begin */
     int                in_txn;
-    int                txn_failed;   /* a put inside this transaction returned -1: commit must undo it */
+    int                txn_failed;   /* a write inside this transaction failed: commit must undo it */
+    int                refusing;     /* its begin failed: every write until commit is refused */
     int                fail_commits; /* test hook: the next n commits fail (and undo) */
+    int                fail_begins;  /* test hook: the next n begins fail (and doom their transaction) */
+    unsigned           fail_reads;   /* test hook: LC_CORE_MEM_FAIL_* */
     unsigned           commits;      /* successful commits */
+    unsigned           refused;      /* writes refused after a failed begin */
 } lc_core_mem_t;
 
 void            lc_core_mem_init(lc_core_mem_t *m);

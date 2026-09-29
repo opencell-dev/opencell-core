@@ -36,6 +36,14 @@ void lc_core_audit(lc_core_t *k, uint8_t event, const uint8_t *number, uint32_t 
     if (k->st.audit_add(k->st.ctx, &a) != 0) lc_core_logf(k, "audit write FAILED (event %u)", event);
 }
 
+int lc_core_begin(lc_core_t *k)
+{
+    if (k->st.begin(k->st.ctx) == 0) return 0;
+    k->st.commit(k->st.ctx); /* -1 by contract: it only closes the doomed transaction */
+    lc_core_logf(k, "store: begin FAILED");
+    return -1;
+}
+
 static lc_core_link_t *link_of(lc_core_t *k, uint32_t link)
 {
     for (unsigned i = 0; i < LC_CORE_LINKS; i++) {

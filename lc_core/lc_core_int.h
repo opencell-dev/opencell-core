@@ -13,12 +13,16 @@ int      lc_core_send(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m);
 int      lc_core_linked(const lc_core_t *k, uint32_t cell_id);
 void     lc_core_audit(lc_core_t *k, uint8_t event, const uint8_t *number, uint32_t tmid, uint32_t cell_id,
                        const char *detail);
+/* The store's begin, checked (lc_core_store.h): 0, or -1 when it failed -
+ * logged, and the doomed transaction already closed with commit. The
+ * caller then refuses whatever it was doing, with nothing sent. */
+int      lc_core_begin(lc_core_t *k);
 
 /* lc_core_hss.c: ACT_FWD, AV_REQ, RESYNC from a cell */
 void     lc_core_hss_rx(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m);
 
 /* lc_core_reg.c: the number's location if it is live (an expired one is
- * deleted): 0 or -1. */
+ * deleted): 0, LC_CORE_STORE_NONE (none live), or LC_CORE_STORE_FAILED. */
 int      lc_core_loc_live(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out);
 /* Tell the number's cell to drop it (LOC_CANCEL) and forget the location. */
 void     lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint8_t cause);

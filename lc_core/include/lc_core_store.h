@@ -3,22 +3,57 @@
  * lc_core_mem.h is the in-memory store (tests, simulation); plan 8's SQLite
  * store seals k, opc, sk and token secrets at rest behind the same calls.
  *
- * Every function returns 0, or -1 (not found, full, or failed). A write
- * (put or delete) outside begin/commit is durable when it returns; between
- * begin and commit the writes are one change that commit makes durable or,
- * failing, undoes. A write (put or delete) that fails between begin and
- * commit, other than a delete that finds nothing to delete, still dooms the
- * whole transaction: commit must then return -1 and undo everything done
- * since begin, even if the caller who saw that write's own -1 pressed on
- * regardless (a store full of authentication vectors must never let a cell
- * walk away with a vector whose av_issued row never made it to disk).
- * Deleting nothing is not itself a failure worth dooming a transaction over:
- * a delete of a key that was never there, or is already gone, returns -1
- * but leaves the transaction it happened in undoomed. */
+ * Every function returns 0, or -1 (not found, full, or failed), except the
+ * lookups below that must tell "none" from "failed".
+ *
+ * One writer. lc_core is the store's only writer: it reads a record before
+ * begin and writes the whole record back, so any other writer - an admin
+ * process on the same SQLite file, say - would have its change silently
+ * overwritten (a lost update). Administration goes through the core
+ * (lc_core_sub_add, lc_core_token_issue, lc_core_sub_disable, ...), never
+ * straight to the store.
+ *
+ * Transactions. A write (put or delete) outside begin/commit is durable when
+ * it returns; between begin and commit the writes are one change that
+ * commit makes durable or, failing, undoes. A write (put or delete) that
+ * fails between begin and commit, other than a delete that finds nothing to
+ * delete, still dooms the whole transaction: commit must then return -1 and
+ * undo everything done since begin, even if the caller who saw that write's
+ * own -1 pressed on regardless (a store full of authentication vectors must
+ * never let a cell walk away with a vector whose av_issued row never made it
+ * to disk). Deleting nothing is not itself a failure worth dooming a
+ * transaction over: a delete of a key that was never there, or is already
+ * gone, returns -1 but leaves the transaction it happened in undoomed.
+ *
+ * A begin that fails (-1) dooms the transaction it was to open, the same
+ * way: every write from then until the next commit is refused (-1, nothing
+ * written), and that commit returns -1 and ends it, so the begin after it
+ * starts afresh. A caller that ignores begin's -1 therefore still changes
+ * nothing; lc_core checks it anyway, closes the doomed transaction with
+ * commit, and refuses whatever it was doing with nothing sent (an AV_REQ is
+ * answered UNAVAILABLE). A begin inside an open transaction is such a
+ * failure too.
+ *
+ * Deleting nothing, by function: loc_del returns -1 when the number has no
+ * location (and, as above, does not doom a transaction for it); the bulk
+ * deletes - token_void, av_drop_cell, av_del_number, av_prune,
+ * loc_purge_cell - return 0 when they find nothing to delete. The contract
+ * test (tests/core_store_contract.h) pins both.
+ *
+ * Lookups that tell "none" from "failed": sub_get, loc_get and
+ * av_newest_confirmed return 0 (found), LC_CORE_STORE_NONE (-1: there is no
+ * such record) or LC_CORE_STORE_FAILED (-2: the store could not say). A
+ * caller must never read "failed" as "none": lc_core fails closed on it -
+ * the location floor of network-core spec §19.2 is not skipped because a
+ * read failed, a number whose record could not be read is not assigned
+ * again, and so on. */
 #ifndef LC_CORE_STORE_H
 #define LC_CORE_STORE_H
 
 #include "lc_sig.h"
+
+#define LC_CORE_STORE_NONE   (-1) /* sub_get, loc_get, av_newest_confirmed: no such record */
+#define LC_CORE_STORE_FAILED (-2) /* ...: the store failed to answer (fail closed) */
 
 typedef struct {
     uint16_t key_id;
@@ -107,7 +142,7 @@ typedef struct {
     /* channel lists, one per list group (channel-list spec §8; list_id 1-65535) */
     int (*list_get)(void *ctx, uint16_t list_id, lc_sig_chan_list_t *out);
     int (*list_put)(void *ctx, uint16_t list_id, const lc_sig_chan_list_t *l); /* insert or replace */
-    int (*sub_get)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_sub_t *out);
+    int (*sub_get)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_sub_t *out); /* 0, NONE or FAILED */
     int (*sub_by_tmid)(void *ctx, uint32_t tmid, lc_core_sub_t *out); /* activated and bound to tmid */
     int (*sub_put)(void *ctx, const lc_core_sub_t *s);                /* insert or replace */
     int (*token_get)(void *ctx, const uint8_t token_id[8], lc_core_token_t *out);
@@ -119,13 +154,14 @@ typedef struct {
     int (*av_drop_cell)(void *ctx, uint32_t cell_id);  /* the cell's unconfirmed vectors */
     int (*av_del_number)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN]); /* all of the number's (§19.3) */
     /* the highest SQN among the number's confirmed vectors issued to any
-     * cell but not_cell (§19.2's floor for a claim from not_cell); -1: none */
+     * cell but not_cell (§19.2's floor for a claim from not_cell): 0, NONE
+     * (no such vector) or FAILED */
     int (*av_newest_confirmed)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t not_cell,
                                uint64_t *sqn);
     int (*av_prune)(void *ctx, uint32_t issued_before);
-    int (*loc_get)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out);
+    int (*loc_get)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_loc_t *out); /* 0, NONE or FAILED */
     int (*loc_put)(void *ctx, const lc_core_loc_t *l);
-    int (*loc_del)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN]);
+    int (*loc_del)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN]); /* -1 if there was none */
     int (*loc_purge_cell)(void *ctx, uint32_t cell_id);
     int (*cdr_add)(void *ctx, const lc_core_cdr_t *c);
     int (*audit_add)(void *ctx, const lc_core_audit_t *a);

@@ -19,6 +19,7 @@ add_subdirectory(${OC_FW}/firmware/components/lc_phy lc_phy)
 add_subdirectory(${OC_FW}/firmware/components/lc_link lc_link)
 add_subdirectory(${OC_FW}/firmware/components/lc_sig lc_sig)
 add_subdirectory(lc_core)
+add_subdirectory(lc_cell)
 
 enable_testing()
 add_subdirectory(tests)

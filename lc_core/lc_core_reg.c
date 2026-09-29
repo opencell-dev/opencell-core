@@ -31,13 +31,17 @@ int lc_core_loc_live(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], lc_c
 }
 
 void lc_core_loc_send_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t cell_id, uint32_t tmid,
-                             uint8_t cause)
+                             uint8_t cause, const char *why)
 {
     char d[48];
     if (cancel(k, cell_id, tmid, cause) != 0) {
         lc_core_logf(k, "cell %u: LOC_CANCEL send failed", (unsigned)cell_id);
     }
-    snprintf(d, sizeof(d), "cause %u", cause);
+    if (why != NULL) {
+        snprintf(d, sizeof(d), "%s, cause %u", why, cause);
+    } else {
+        snprintf(d, sizeof(d), "cause %u", cause);
+    }
     lc_core_audit(k, LC_CORE_AUDIT_LOC_CANCEL, number, tmid, cell_id, d);
 }
 
@@ -49,7 +53,7 @@ void lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
         lc_core_logf(k, "cell %u: LOC_CANCEL: location delete failed", (unsigned)l.cell_id);
         return; /* the location is still there: nothing was actually cancelled */
     }
-    lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, cause);
+    lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, cause, NULL);
 }
 
 /* §7.7-7.8, §8, §19. Single exit: every path wipes what it read. */
@@ -73,9 +77,13 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
          * or disabled while the cell was cut off): the cell drops it now.
          * Proven or not - re-activation deleted the old binding's vectors
          * (§19.3) - since the cancel only reaches the claimant, about its
-         * own TMID. A stale claim, audited as the LOC_CANCEL, not AUTH_FAIL. */
+         * own TMID. A stale claim, audited as the LOC_CANCEL, not AUTH_FAIL;
+         * an unproven one apart from a real re-activation's or disabling's
+         * cancel ("unproven stale claim"): a cell cut off through the
+         * re-activation sends one, and so does a cell probing TMIDs. */
         int off = known && s.state == LC_CORE_SUB_DISABLED;
-        lc_core_loc_send_cancel(k, num, cell, tmid, off ? LC_CORE_CANCEL_DISABLED : LC_CORE_CANCEL_REACTIVATED);
+        lc_core_loc_send_cancel(k, num, cell, tmid, off ? LC_CORE_CANCEL_DISABLED : LC_CORE_CANCEL_REACTIVATED,
+                                proven ? NULL : "unproven stale claim");
         goto done;
     }
     if (!proven) {
@@ -95,7 +103,7 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
              * registered elsewhere since, so the claimant drops it */
             lc_core_logf(k, "cell %u: older claim for %08x refused (SQN %llu < %llu)", (unsigned)cell,
                          (unsigned)tmid, (unsigned long long)a.sqn, (unsigned long long)floor);
-            lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED);
+            lc_core_loc_send_cancel(k, num, cell, tmid, LC_CORE_CANCEL_MOVED, NULL);
             goto done;
         }
     }
@@ -116,7 +124,7 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         lc_core_logf(k, "location of %08x: store FAILED", (unsigned)tmid);
         goto done;
     }
-    if (moved) lc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, LC_CORE_CANCEL_MOVED); /* §7.8 */
+    if (moved) lc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, LC_CORE_CANCEL_MOVED, NULL); /* §7.8 */
     lc_core_audit(k, LC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
 done:
     lc_sig_wipe(a.xres, sizeof(a.xres));

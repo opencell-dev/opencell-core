@@ -546,6 +546,38 @@ static void test_a_claim_from_before_a_reactivation_is_cancelled_back(void)
     TEST_ASSERT_EQUAL_INT(-1, ST.loc_get(ST.ctx, qr.number, &l));
 }
 
+/* Task 12b carry: the audit log tells an unproven stale claim (a cell cut
+ * off through a re-activation, or a cell probing TMIDs it heard on air)
+ * apart from the real re-activation's own cancel. */
+static void test_an_unproven_stale_claim_is_audited_apart(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t, t2;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    put_location(1, TMID);
+    hello(20, 2, 1);
+    qr = issue(NUM);
+    term(&t2, TMID2, 0x55, &qr);
+    TEST_ASSERT_EQUAL_HEX8(LC_SIG_ACT_ACK, activate(20, &t2)->u.act_res.msg.type);
+    const lc_core_audit_t *au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL); /* the re-activation's */
+    TEST_ASSERT_NOT_NULL(au);
+    TEST_ASSERT_EQUAL_STRING("cause 2", au->detail);
+    unsigned n = MEM.d.naudit;
+    uint8_t rand[16], res[8];
+    memset(rand, 0x5a, 16); /* never issued: nothing proves it */
+    memset(res, 0x17, 8);
+    int from = NSENT;
+    loc_claim(10, TMID, qr.number, rand, res);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_REACTIVATED, sent_since(from, 10, LC_CORE_LOC_CANCEL)->u.loc_cancel.cause);
+    TEST_ASSERT_EQUAL_UINT(n + 1u, MEM.d.naudit);
+    au = lc_core_mem_audit(&MEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_EQUAL_STRING("unproven stale claim, cause 2", au->detail);
+    TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+    TEST_ASSERT_EQUAL_HEX32(TMID, au->tmid);
+    TEST_ASSERT_NULL(lc_core_mem_audit(&MEM, LC_CORE_AUDIT_AUTH_FAIL));
+}
+
 static void test_vectors_rise_and_are_committed_first(void)
 {
     lc_sig_qr_t qr = sub_world();
@@ -780,6 +812,7 @@ int main(void)
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
     RUN_TEST(test_reactivation_voids_the_old_bindings_vectors);
     RUN_TEST(test_a_claim_from_before_a_reactivation_is_cancelled_back);
+    RUN_TEST(test_an_unproven_stale_claim_is_audited_apart);
     RUN_TEST(test_reactivation_unbinds_the_tmids_other_subscriber_and_cancels_its_location);
     RUN_TEST(test_failed_reactivation_commit_leaves_the_old_location_untouched);
     RUN_TEST(test_vectors_rise_and_are_committed_first);

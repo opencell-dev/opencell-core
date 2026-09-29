@@ -444,6 +444,102 @@ static void test_failed_lookups_fail_closed_in_the_hss(void)
     TEST_ASSERT_EQUAL_UINT32(0, tok.used_at);
 }
 
+/* Plan 8 amendment 3: a TMID lookup that fails during activation is not
+ * "no one holds this TMID". The activation is abandoned - nothing written,
+ * no answer, as for the other store failures here (the terminal retries) -
+ * or the TMID would end up bound to two subscribers at once. */
+static void test_a_failed_tmid_lookup_abandons_the_activation(void)
+{
+    oc_sig_qr_t qr = sub_world();
+    term_t ta, tb;
+    term(&ta, TMID, 0x42, &qr);
+    TEST_ASSERT_NOT_NULL(activate(10, &ta));
+    uint8_t n1[OC_SIG_NUMBER_LEN], n2[OC_SIG_NUMBER_LEN], got[OC_SIG_NUMBER_LEN];
+    number(NUM, n1);
+    number("+883160655501235", n2);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_add(&K, n2, got));
+    oc_sig_qr_t qr2 = issue("+883160655501235");
+    term(&tb, TMID, 0x88, &qr2); /* the same TMID, another subscriber's QR */
+
+    int from = NSENT;
+    unsigned commits = MEM.commits, naudit = MEM.d.naudit;
+    MEM.fail_reads = OC_CORE_MEM_FAIL_SUB_BY_TMID;
+    TEST_ASSERT_NULL(activate(10, &tb));
+    MEM.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(from, NSENT); /* no answer, no LOC_CANCEL */
+    TEST_ASSERT_EQUAL_UINT(commits, MEM.commits);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    oc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n2, &s));
+    TEST_ASSERT_EQUAL_UINT8(0, s.activated);
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s)); /* still n1's */
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(n1, s.number, OC_SIG_NUMBER_LEN);
+    oc_core_token_t tok;
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr2.token_id, &tok));
+    TEST_ASSERT_EQUAL_UINT32(0, tok.used_at);
+
+    const oc_core_msg_t *r = activate(10, &tb); /* once the store answers: the usual re-activation */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, r->u.act_res.msg.type);
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(n2, s.number, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n1, &s));
+    TEST_ASSERT_EQUAL_UINT8(0, s.activated);
+}
+
+/* A subscriber read that fails during activation is not "unknown token": no
+ * ACT_NAK (the terminal would give the code up), no ACT_FAIL audit; no
+ * answer, and the terminal retries. */
+static void test_a_failed_subscriber_read_gets_no_activation_answer(void)
+{
+    oc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    int from = NSENT;
+    unsigned naudit = MEM.d.naudit;
+    MEM.fail_reads = OC_CORE_MEM_FAIL_SUB_GET;
+    TEST_ASSERT_NULL(activate(10, &t));
+    MEM.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(from, NSENT);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    oc_core_token_t tok;
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &tok));
+    TEST_ASSERT_EQUAL_UINT32(0, tok.used_at);
+    const oc_core_msg_t *r = activate(10, &t);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, r->u.act_res.msg.type);
+}
+
+/* A TMID lookup that fails when a cell asks for vectors (or a resync) is a
+ * store failure, UNAVAILABLE, not NOT_ACTIVATED: that would tell the
+ * terminal to activate again. */
+static void test_a_failed_tmid_lookup_answers_vectors_unavailable(void)
+{
+    oc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    TEST_ASSERT_NOT_NULL(activate(10, &t));
+    MEM.fail_reads = OC_CORE_MEM_FAIL_SUB_BY_TMID;
+    const oc_core_msg_t *r = ask_avs(10, TMID, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_UNAVAILABLE, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_UINT8(0, r->u.av_res.count);
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_RESYNC;
+    m.u.resync.tmid = TMID;
+    int from = NSENT;
+    rx(10, &m);
+    r = sent_since(from, 10, OC_CORE_AV_RES);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_UNAVAILABLE, r->u.av_res.status);
+    MEM.fail_reads = 0;
+    r = ask_avs(10, TMID + 1u, 1); /* a TMID nobody holds: still NOT_ACTIVATED */
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_NOT_ACTIVATED, r->u.av_res.status);
+    r = ask_avs(10, TMID, 1);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_OK, r->u.av_res.status);
+}
+
 static uint8_t nak(uint32_t link, const term_t *t)
 {
     const oc_core_msg_t *r = activate(link, t);
@@ -920,6 +1016,9 @@ int main(void)
     RUN_TEST(test_activation_refusals);
     RUN_TEST(test_failed_begin_refuses_with_nothing_written_or_sent);
     RUN_TEST(test_failed_lookups_fail_closed_in_the_hss);
+    RUN_TEST(test_a_failed_tmid_lookup_abandons_the_activation);
+    RUN_TEST(test_a_failed_subscriber_read_gets_no_activation_answer);
+    RUN_TEST(test_a_failed_tmid_lookup_answers_vectors_unavailable);
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
     RUN_TEST(test_reactivation_voids_the_old_bindings_vectors);
     RUN_TEST(test_a_claim_from_before_a_reactivation_is_cancelled_back);

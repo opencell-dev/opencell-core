@@ -65,7 +65,7 @@ static inline void store_contract(const oc_core_store_t *st)
     s.tmid = 0x1234u;
     s.sqn = 5;
     TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
-    TEST_ASSERT_EQUAL_INT(-1, st->sub_by_tmid(c, 0x1234u, &s2)); /* bound but not activated */
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->sub_by_tmid(c, 0x1234u, &s2)); /* bound but not activated */
     s.activated = 1;
     s.sqn = (1ull << 40) + 3u; /* SQN is 48 bits */
     TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));

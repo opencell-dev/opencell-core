@@ -79,6 +79,7 @@ static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     oc_core_call_t *c = NULL;
     oc_core_loc_t la, lb;
     oc_core_sub_t s;
+    int got;
     if ((m->u.call_route.leg_ref & OC_CORE_REF_CORE) != 0 || find(k, cell, m->u.call_route.leg_ref, &leg, &other)) {
         return; /* not a cell's ref, or a leg already routed */
     }
@@ -108,10 +109,18 @@ static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         c->due = k->now + OC_CORE_ECHO_US;
         to_leg(k, &c->a, OC_CORE_CALL_ALERT, 0);
         return;
-    } else if (!oc_core_route_home(&k->route, oc_core_route_find(&k->route, called)) ||
-               k->st.sub_get(k->st.ctx, called, &s) != 0 || s.state != OC_CORE_SUB_ACTIVE || !s.activated ||
-               oc_core_loc_live(k, called, &lb) != 0) {
-        why = OC_SIG_CAUSE_UNREACHABLE; /* unknown, not ours, disabled, or registered nowhere */
+    } else if (!oc_core_route_home(&k->route, oc_core_route_find(&k->route, called))) {
+        why = OC_SIG_CAUSE_UNREACHABLE; /* not ours */
+    } else if ((got = k->st.sub_get(k->st.ctx, called, &s)) == OC_CORE_STORE_FAILED) {
+        oc_core_logf(k, "cell %u: CALL_ROUTE: callee read FAILED", (unsigned)cell);
+        why = OC_SIG_CAUSE_NET_FAILURE; /* a failed read is not "unknown" (oc_core_store.h) */
+    } else if (got != 0 || s.state != OC_CORE_SUB_ACTIVE || !s.activated) {
+        why = OC_SIG_CAUSE_UNREACHABLE; /* unknown, disabled, or not activated */
+    } else if ((got = oc_core_loc_live(k, called, &lb)) == OC_CORE_STORE_FAILED) {
+        oc_core_logf(k, "cell %u: CALL_ROUTE: callee location read FAILED", (unsigned)cell);
+        why = OC_SIG_CAUSE_NET_FAILURE;
+    } else if (got != 0) {
+        why = OC_SIG_CAUSE_UNREACHABLE; /* registered nowhere */
     } else if (!oc_core_linked(k, lb.cell_id)) {
         why = OC_SIG_CAUSE_NET_FAILURE; /* the callee's cell is cut off */
     }

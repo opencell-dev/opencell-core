@@ -173,13 +173,14 @@ static int sub_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_sub
 
 static int sub_by_tmid(void *c, uint32_t tmid, oc_core_sub_t *out)
 {
+    if (M(c)->fail_reads & OC_CORE_MEM_FAIL_SUB_BY_TMID) return OC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < D(c)->nsub; i++) {
         if (D(c)->sub[i].activated && D(c)->sub[i].tmid == tmid) {
             *out = D(c)->sub[i];
             return 0;
         }
     }
-    return -1;
+    return OC_CORE_STORE_NONE;
 }
 
 static int sub_put(void *c, const oc_core_sub_t *s)

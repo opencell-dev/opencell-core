@@ -187,8 +187,15 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     /* the token id's block says which core holds it (§14.3): one core, so
      * a token of a block this core isn't home for is unknown here */
     int known = oc_core_route_home(&k->route, oc_core_route_block(&k->route, oc_core_token_block(tid))) &&
-                k->st.token_get(k->st.ctx, tid, &tok) == 0 && k->st.sub_get(k->st.ctx, tok.number, &sub) == 0 &&
-                sub.state == OC_CORE_SUB_ACTIVE;
+                k->st.token_get(k->st.ctx, tid, &tok) == 0;
+    if (known) {
+        int got = k->st.sub_get(k->st.ctx, tok.number, &sub);
+        if (got == OC_CORE_STORE_FAILED) { /* not "unknown token" (oc_core_store.h): no answer, it retries */
+            oc_core_logf(k, "activation of %08x: subscriber read FAILED, no answer", (unsigned)tmid);
+            goto done;
+        }
+        known = got == 0 && sub.state == OC_CORE_SUB_ACTIVE;
+    }
     if (known) {
         t.known = 1;
         t.used = tok.used_at != 0;
@@ -207,7 +214,14 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         snprintf(d, sizeof(d), "reason %u", r.u.act_res.msg.u.act_nak.reason);
         oc_core_audit(k, OC_CORE_AUDIT_ACT_FAIL, known ? sub.number : NULL, tmid, cell, d);
     } else if (res == OC_SIG_ACT_FRESH) {
-        int had_other = k->st.sub_by_tmid(k->st.ctx, tmid, &other) == 0 && !num_eq(other.number, sub.number);
+        int got_tmid = k->st.sub_by_tmid(k->st.ctx, tmid, &other);
+        if (got_tmid == OC_CORE_STORE_FAILED) {
+            /* fail closed (plan 8 amendment 3): the TMID may be bound to
+             * another subscriber, which would keep it too */
+            oc_core_logf(k, "activation of %08x: TMID read FAILED, no answer", (unsigned)tmid);
+            goto done;
+        }
+        int had_other = got_tmid == 0 && !num_eq(other.number, sub.number);
         int got_self = k->st.loc_get(k->st.ctx, sub.number, &loc_self);
         int got_other = had_other ? k->st.loc_get(k->st.ctx, other.number, &loc_other) : OC_CORE_STORE_NONE;
         if (got_self == OC_CORE_STORE_FAILED || got_other == OC_CORE_STORE_FAILED) {
@@ -278,7 +292,12 @@ done:
 /* 0 (and the subscriber) when tmid may have vectors, else the status. */
 static uint8_t av_status(oc_core_t *k, uint32_t tmid, oc_core_sub_t *sub)
 {
-    if (k->st.sub_by_tmid(k->st.ctx, tmid, sub) != 0) return OC_CORE_AV_NOT_ACTIVATED;
+    int got = k->st.sub_by_tmid(k->st.ctx, tmid, sub);
+    if (got == OC_CORE_STORE_FAILED) {
+        oc_core_logf(k, "vectors for %08x: subscriber read FAILED", (unsigned)tmid);
+        return OC_CORE_AV_UNAVAILABLE; /* a store failure, not "never activated" */
+    }
+    if (got != 0) return OC_CORE_AV_NOT_ACTIVATED;
     if (sub->state != OC_CORE_SUB_ACTIVE) return OC_CORE_AV_DISABLED;
     if (!home_number(k, sub->number)) return OC_CORE_AV_UNAVAILABLE;
     return OC_CORE_AV_OK;

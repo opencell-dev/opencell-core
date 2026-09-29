@@ -43,9 +43,10 @@ typedef struct {
 } oc_core_mem_data_t;
 
 /* fail_reads: which lookups fail (OC_CORE_STORE_FAILED) while it is set */
-#define OC_CORE_MEM_FAIL_SUB_GET   1u
-#define OC_CORE_MEM_FAIL_LOC_GET   2u
-#define OC_CORE_MEM_FAIL_AV_NEWEST 4u
+#define OC_CORE_MEM_FAIL_SUB_GET     1u
+#define OC_CORE_MEM_FAIL_LOC_GET     2u
+#define OC_CORE_MEM_FAIL_AV_NEWEST   4u
+#define OC_CORE_MEM_FAIL_SUB_BY_TMID 8u
 
 typedef struct {
     oc_core_mem_data_t d;

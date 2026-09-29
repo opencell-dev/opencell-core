@@ -40,7 +40,7 @@
  * loc_purge_cell - return 0 when they find nothing to delete. The contract
  * test (tests/core_store_contract.h) pins both.
  *
- * Lookups that tell "none" from "failed": sub_get, loc_get and
+ * Lookups that tell "none" from "failed": sub_get, sub_by_tmid, loc_get and
  * av_newest_confirmed return 0 (found), OC_CORE_STORE_NONE (-1: there is no
  * such record) or OC_CORE_STORE_FAILED (-2: the store could not say). A
  * caller must never read "failed" as "none": oc_core fails closed on it -
@@ -143,7 +143,7 @@ typedef struct {
     int (*list_get)(void *ctx, uint16_t list_id, oc_sig_chan_list_t *out);
     int (*list_put)(void *ctx, uint16_t list_id, const oc_sig_chan_list_t *l); /* insert or replace */
     int (*sub_get)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_sub_t *out); /* 0, NONE or FAILED */
-    int (*sub_by_tmid)(void *ctx, uint32_t tmid, oc_core_sub_t *out); /* activated and bound to tmid */
+    int (*sub_by_tmid)(void *ctx, uint32_t tmid, oc_core_sub_t *out); /* activated, bound to tmid: 0, NONE or FAILED */
     int (*sub_put)(void *ctx, const oc_core_sub_t *s);                /* insert or replace */
     int (*token_get)(void *ctx, const uint8_t token_id[8], oc_core_token_t *out);
     int (*token_put)(void *ctx, const oc_core_token_t *t);

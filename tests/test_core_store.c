@@ -337,7 +337,7 @@ static void test_failed_begin_dooms_the_transaction(void)
     TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s)); /* and outside one, writes land */
 }
 
-/* Final review I2(c): sub_get, loc_get and av_newest_confirmed tell "none"
+/* Final review I2(c): sub_get, sub_by_tmid, loc_get and av_newest_confirmed tell "none"
  * (OC_CORE_STORE_NONE) from "failed" (OC_CORE_STORE_FAILED): the test hook
  * fail_reads makes the chosen lookups fail, found or not. */
 static void test_failed_lookups_are_told_from_none(void)
@@ -376,7 +376,11 @@ static void test_failed_lookups_are_told_from_none(void)
     mem.fail_reads = OC_CORE_MEM_FAIL_AV_NEWEST;
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n1, 0, &top));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n2, 0, &top));
+    mem.fail_reads = OC_CORE_MEM_FAIL_SUB_BY_TMID;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.sub_by_tmid(st.ctx, 0x1234u, &s));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, n1, &s)); /* only the chosen lookup fails */
     mem.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.sub_by_tmid(st.ctx, 0x1234u, &s));
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, n1, &s));
     TEST_ASSERT_EQUAL_INT(0, st.av_newest_confirmed(st.ctx, n1, 0, &top));
 }

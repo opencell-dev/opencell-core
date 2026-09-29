@@ -510,6 +510,398 @@ static void test_echo_service(void)
     TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
 }
 
+/* T0 and T1 in a call across cells 1 and 2. */
+static void in_a_cross_cell_call(void)
+{
+    registered_on(0, 0);
+    registered_on(1, 1);
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    press(1, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(1));
+}
+
+/* §7.8: T0 leaves cell 1 while idle and attaches to cell 2; it registers
+ * there by itself, cell 1 is told to drop it, and a call to T0 rings on
+ * cell 2. */
+static void test_idle_move_between_cells(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(2, 2);
+    TERM[0].cell = -1; /* out of cell 1's coverage */
+    run_ms(2000);
+    TERM[0].cell = 1;  /* cell 2's beacon */
+    forget_events();
+    run_ms(8000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[0], LC_SIG_EV_REGISTERED));
+    TEST_ASSERT_EQUAL_UINT32(2, located(0));
+    TEST_ASSERT_FALSE(lc_sig_net_registered(&CELL[0].c.net, TERM[0].tmid)); /* LOC_CANCEL(moved) */
+    TEST_ASSERT_TRUE(lc_sig_net_registered(&CELL[1].c.net, TERM[0].tmid));
+    dial(2, "606-555-01230");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[0], LC_SIG_EV_INCOMING));
+}
+
+/* §7.1 step 4: the operator re-issues T0's number and another terminal
+ * (T3, on cell 2) activates it while T0 is registered on cell 1: cell 1
+ * drops T0, T0 can no longer call, and calls to the number reach T3. */
+static void test_reactivation_on_a_new_terminal_elsewhere(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 2);
+    memcpy(TERM[3].number, TERM[0].number, LC_SIG_NUMBER_LEN); /* T3 scans a new code for T0's number */
+    registered_on(3, 1);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(TERM[0].number, TERM[3].id.number, LC_SIG_NUMBER_LEN);
+    TEST_ASSERT_FALSE(lc_sig_net_registered(&CELL[0].c.net, TERM[0].tmid));
+    TEST_ASSERT_EQUAL_UINT32(2, located(0));
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_UNREACHABLE, ended(0)); /* refused by its own cell */
+    TEST_ASSERT_NULL(event(&TERM[1], LC_SIG_EV_INCOMING));
+    dial(1, "606-555-01230");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[3], LC_SIG_EV_INCOMING));
+    TEST_ASSERT_NULL(event(&TERM[0], LC_SIG_EV_INCOMING));
+}
+
+/* §7.9 and "Done means": cell 2's process dies mid-call. The core sees its
+ * link close and releases T0's leg at once (cause 5). When cell 2 is back
+ * (a new boot), T1 registers again on re-attach and calls work again. */
+static void test_cell_restart_mid_call(void)
+{
+    sim_world();
+    in_a_cross_cell_call();
+    sim_disconnect(1);
+    CELL[1].up = 0; /* its beacon stops */
+    run_ms(2000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
+    TEST_ASSERT_EQUAL_UINT32(2, located(1)); /* the core keeps it until the cell's new boot */
+    run_ms(8000);
+    sim_cell_start(1);
+    sim_connect(1);
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(0, located(1)); /* HELLO with a new boot id purged cell 2 */
+    run_ms(10000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(1));
+    TEST_ASSERT_EQUAL_UINT32(2, located(1));
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[1], LC_SIG_EV_INCOMING));
+}
+
+/* §7.10: the core restarts mid-call. Both cells lose their link and release
+ * their legs (cause 5); the core comes back on its store, the cells
+ * reconnect with their boot ids, and a new call connects without anyone
+ * registering again. */
+static void test_core_restart_mid_call(void)
+{
+    sim_world();
+    in_a_cross_cell_call();
+    for (int i = 0; i < SIM_CELLS; i++) sim_disconnect(i);
+    run_ms(2000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(0));
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(1));
+    sim_core_start(); /* the same store: SQN, bindings, locations */
+    for (int i = 0; i < SIM_CELLS; i++) sim_connect(i);
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(1, located(0));
+    TEST_ASSERT_EQUAL_UINT32(2, located(1));
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[1], LC_SIG_EV_INCOMING));
+    TEST_ASSERT_NULL(event(&TERM[0], LC_SIG_EV_REGISTERED));
+    press(1, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(0));
+}
+
+/* §7.10: cell 2's backhaul is down. Its registered terminals still call
+ * each other; calls into or out of the cell get cause 5; activation there
+ * fails. Once the link is back, cross-cell calls work again.
+ * "With the AV cache" (§9.2): plan 1 has none (plan 9), so what a cell holds
+ * at the drop is the vector it was just given. T4, moving from cell 1 to
+ * cell 2, has its vector there when the link drops: it registers offline,
+ * and cell 2 reports it (LOC_UPDATE) when the link is back, which moves T4
+ * from cell 1. (A terminal arriving with no vector held waits for the link:
+ * test_registration_while_the_core_link_comes_up.) */
+static void test_backhaul_outage_at_a_cell(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    registered_on(2, 1);
+    registered_on(4, 0);
+    TERM[4].cell = -1;
+    run_ms(2000);
+    TERM[4].cell = 1; /* to cell 2 */
+    for (int k = 0; k < 100 && (sess_on(1, 4) == NULL || !sess_on(1, 4)->auth_pending); k++) frame();
+    TEST_ASSERT_TRUE_MESSAGE(sess_on(1, 4)->auth_pending, "AUTH_REQ on its way");
+    sim_disconnect(1);
+    run_ms(3000);
+    TEST_ASSERT_TRUE(lc_sig_net_registered(&CELL[1].c.net, TERM[4].tmid)); /* with the vector it held */
+    TEST_ASSERT_EQUAL_UINT32(1, located(4));
+    forget_events();
+    dial(1, "606-555-01232");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[2], LC_SIG_EV_INCOMING)); /* local: no core needed */
+    press(2, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(1));
+    press(1, LC_SIG_CMD_HANGUP);
+    run_ms(3000);
+    forget_events();
+    dial(1, "606-555-01230");
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(1));
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(0));
+    activate_on(3, 1);
+    run_ms(8000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[3], LC_SIG_EV_ACT_FAILED));
+    sim_connect(1);
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_UINT32(2, located(4)); /* reported on HELLO_ACK */
+    TEST_ASSERT_FALSE(lc_sig_net_registered(&CELL[0].c.net, TERM[4].tmid)); /* LOC_CANCEL(moved) */
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[1], LC_SIG_EV_INCOMING));
+}
+
+/* The HSS is behind the terminal (a vector it already used, or a core
+ * restored from an old copy): AUTH_FAIL(2) goes through the core as RESYNC
+ * and the terminal registers without help. */
+static void test_resync_through_the_core(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, SST.sub_get(SST.ctx, TERM[0].number, &s));
+    s.sqn = 0;
+    TEST_ASSERT_EQUAL_INT(0, SST.sub_put(SST.ctx, &s));
+    lc_sig_sqn_put(TERM[0].id.sqn, 5000);
+    const lc_sig_term_io_t io = TERM[0].t.io;
+    lc_sig_term_init(&TERM[0].t, &io, &TERM[0].id, TERM[0].tmid, now); /* reboot: it registers again */
+    forget_events();
+    run_ms(10000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[0], LC_SIG_EV_REGISTERED));
+    TEST_ASSERT_EQUAL_INT(0, SST.sub_get(SST.ctx, TERM[0].number, &s));
+    TEST_ASSERT_EQUAL_UINT64(5001, s.sqn);
+    TEST_ASSERT_EQUAL_UINT64(5001, lc_sig_sqn_get(TERM[0].id.sqn));
+    TEST_ASSERT_NOT_NULL(lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_RESYNC));
+    TEST_ASSERT_EQUAL_UINT(1, to_core[0][LC_CORE_RESYNC]); /* cell 1 passed the AUTS on */
+}
+
+/* Audit records of event from cell_id, among those kept. */
+static unsigned audits(uint8_t ev, uint32_t cell_id)
+{
+    unsigned n = 0, have = SMEM.d.naudit < LC_CORE_MEM_LOG ? SMEM.d.naudit : LC_CORE_MEM_LOG;
+    for (unsigned k = 0; k < have; k++) {
+        if (SMEM.d.audit[k].event == ev && SMEM.d.audit[k].cell_id == cell_id) n++;
+    }
+    return n;
+}
+
+/* A LOC_UPDATE as cell 3 (the rogue) sends it, straight to the core. */
+static void rogue_claim(uint32_t tmid, const uint8_t number[LC_SIG_NUMBER_LEN], const uint8_t rand[16],
+                        const uint8_t res[8])
+{
+    lc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_LOC_UPDATE;
+    m.u.loc_update.tmid = tmid;
+    memcpy(m.u.loc_update.number, number, LC_SIG_NUMBER_LEN);
+    memcpy(m.u.loc_update.rand, rand, 16);
+    memcpy(m.u.loc_update.res, res, 8);
+    wire_push(1, 2, CELL[2].link, &m);
+    run_ms(500);
+}
+
+/* §8, §9.2 "a rogue cell claiming a location", §19: cell 3 tries to pull
+ * T0 (registered on cell 1) to itself with everything it can get.
+ * (1) It replays cell 1's claim (RAND and RES heard on the way): a vector
+ * issued to another cell proves nothing from this one (AUTH_FAIL).
+ * (2) It asks for a vector of its own for T0's TMID, heard on air: AV_REQ
+ * answers it - the number, RAND, AUTN, HXRES, CK, IK, never XRES - and moves
+ * nobody (§7.7); a LOC_UPDATE with anything it can compute from that
+ * vector is refused (AUTH_FAIL): only the terminal can answer RAND. The same
+ * claim under another terminal's TMID is refused as an "unproven stale
+ * claim" (the number is not bound to it). Every attempt is audited against
+ * cell 3; T0 stays on cell 1, and its calls ring there. */
+static void test_rogue_cell_cannot_pull_a_subscriber(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_LOC_UPDATE, last_loc_update[0].type);
+    wire_push(1, 2, CELL[2].link, &last_loc_update[0]);
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(1, located(0));
+    const lc_core_audit_t *a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_AUTH_FAIL);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_UINT32(3, a->cell_id);
+    TEST_ASSERT_EQUAL_UINT(1, audits(LC_CORE_AUDIT_AUTH_FAIL, 3));
+
+    /* (2) a vector of its own for the TMID it heard */
+    lc_core_msg_t q, r;
+    memset(&q, 0, sizeof(q));
+    q.type = LC_CORE_AV_REQ;
+    q.u.av_req.req = 0x7777;
+    q.u.av_req.tmid = TERM[0].tmid;
+    q.u.av_req.count = 1;
+    int from = NWIRE;
+    lc_core_rx(&CORE, CELL[2].link, &q, now);
+    const sim_frame_t *w = NULL;
+    for (int k = from; k < NWIRE; k++) {
+        if (!WIRE[k].to_core && WIRE[k].cell == 2) w = &WIRE[k];
+    }
+    TEST_ASSERT_NOT_NULL_MESSAGE(w, "AV_RES to cell 3");
+    TEST_ASSERT_EQUAL_INT(0, lc_core_decode(w->f, w->n, &r));
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_RES, r.type);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_OK, r.u.av_res.status);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(TERM[0].number, r.u.av_res.number, LC_SIG_NUMBER_LEN);
+    const lc_core_av_t *v = &r.u.av_res.av[0];
+    lc_core_av_issued_t row;
+    TEST_ASSERT_EQUAL_INT(0, SST.av_get(SST.ctx, TERM[0].number, v->rand, &row));
+    TEST_ASSERT_EQUAL_UINT32(3, row.cell_id);
+    for (size_t k = 0; k + 8 <= w->n; k++) { /* no XRES on the wire */
+        TEST_ASSERT_FALSE(memcmp(w->f + k, row.xres, 8) == 0);
+    }
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(1, located(0)); /* AV_REQ moves nobody */
+
+    static const uint8_t zero[8] = { 0 };
+    const uint8_t *guess[] = { v->hxres, v->hxres + 8, v->ck, v->ik, v->autn, v->rand, zero };
+    const unsigned nguess = sizeof(guess) / sizeof(guess[0]);
+    for (unsigned k = 0; k < nguess; k++) {
+        rogue_claim(TERM[0].tmid, TERM[0].number, v->rand, guess[k]);
+        TEST_ASSERT_EQUAL_UINT32(1, located(0));
+    }
+    TEST_ASSERT_EQUAL_UINT(1u + nguess, audits(LC_CORE_AUDIT_AUTH_FAIL, 3));
+    a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_AUTH_FAIL);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(TERM[0].number, a->number, LC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_HEX32(TERM[0].tmid, a->tmid);
+    TEST_ASSERT_EQUAL_INT(0, SST.av_get(SST.ctx, TERM[0].number, v->rand, &row));
+    TEST_ASSERT_EQUAL_UINT8(0, row.confirmed);
+
+    /* the number under T1's TMID: not the terminal it is bound to */
+    unsigned cancels = audits(LC_CORE_AUDIT_LOC_CANCEL, 3);
+    rogue_claim(TERM[1].tmid, TERM[0].number, v->rand, v->hxres);
+    TEST_ASSERT_EQUAL_UINT32(1, located(0));
+    TEST_ASSERT_EQUAL_UINT32(2, located(1));
+    TEST_ASSERT_EQUAL_UINT(cancels + 1u, audits(LC_CORE_AUDIT_LOC_CANCEL, 3));
+    a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_EQUAL_UINT32(3, a->cell_id);
+    TEST_ASSERT_NOT_NULL(strstr(a->detail, "unproven stale claim"));
+    /* sent to the claimant only */
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_REACTIVATED, last_loc_cancel[2].u.loc_cancel.cause);
+    TEST_ASSERT_EQUAL_UINT8(0, last_loc_cancel[0].type);
+    TEST_ASSERT_EQUAL_UINT8(0, last_loc_cancel[1].type);
+    TEST_ASSERT_TRUE(lc_sig_net_registered(&CELL[0].c.net, TERM[0].tmid));
+    TEST_ASSERT_TRUE(lc_sig_net_registered(&CELL[1].c.net, TERM[1].tmid));
+
+    forget_events();
+    dial(1, "606-555-01230");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[0], LC_SIG_EV_INCOMING));
+}
+
+/* §19's floor: cell 3 once held T0 for real (a proven claim, RAND and RES
+ * from the terminal). T0 moves to cell 1; cell 3 replays its own claim:
+ * older than the location (SQN), refused, and cancelled back with its own
+ * RAND. Then cell 1 restarts while T0 is switched off, and its new boot
+ * purges T0's location. Replayed again, the claim is still refused: another
+ * cell has proved a newer vector (a confirmed av_issued row), so the floor
+ * outlives the location. The core audits each refusal as the LOC_CANCEL(moved)
+ * it sends cell 3 (a proven claim, so not AUTH_FAIL); T0 is never located on
+ * cell 3, and when it is back it registers on cell 1, where its calls ring. */
+static void test_rogue_cell_cannot_replay_its_own_older_claim(void)
+{
+    sim_world();
+    registered_on(1, 1);
+    registered_on(0, 2);
+    TEST_ASSERT_EQUAL_UINT32(3, located(0));
+    const lc_core_msg_t own = last_loc_update[2];
+    TEST_ASSERT_EQUAL_HEX32(TERM[0].tmid, own.u.loc_update.tmid);
+    TERM[0].cell = -1;
+    run_ms(2000);
+    TERM[0].cell = 0; /* to cell 1 */
+    run_ms(8000);
+    TEST_ASSERT_EQUAL_UINT32(1, located(0));
+    TEST_ASSERT_FALSE(lc_sig_net_registered(&CELL[2].c.net, TERM[0].tmid)); /* LOC_CANCEL(moved) */
+    lc_core_av_issued_t row;
+    TEST_ASSERT_EQUAL_INT(0, SST.av_get(SST.ctx, TERM[0].number, own.u.loc_update.rand, &row));
+    TEST_ASSERT_EQUAL_UINT32(3, row.cell_id);
+    TEST_ASSERT_EQUAL_UINT8(1, row.confirmed); /* a real, replayable proof */
+
+    unsigned cancels = audits(LC_CORE_AUDIT_LOC_CANCEL, 3);
+    memset(&last_loc_cancel[2], 0, sizeof(last_loc_cancel[2]));
+    wire_push(1, 2, CELL[2].link, &own); /* while the location stands */
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(1, located(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, last_loc_cancel[2].u.loc_cancel.cause);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(own.u.loc_update.rand, last_loc_cancel[2].u.loc_cancel.rand, 16);
+    TEST_ASSERT_EQUAL_UINT(cancels + 1u, audits(LC_CORE_AUDIT_LOC_CANCEL, 3));
+    TEST_ASSERT_TRUE(lc_sig_net_registered(&CELL[0].c.net, TERM[0].tmid)); /* cell 1 heard nothing */
+
+    TERM[0].cell = -1; /* switched off */
+    sim_disconnect(0);
+    CELL[0].up = 0; /* cell 1's process dies */
+    run_ms(2000);
+    sim_cell_start(0); /* a new boot: the core purges cell 1's locations */
+    sim_connect(0);
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(0, located(0));
+    memset(&last_loc_cancel[2], 0, sizeof(last_loc_cancel[2]));
+    wire_push(1, 2, CELL[2].link, &own); /* with no location to be older than */
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(0, located(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_MOVED, last_loc_cancel[2].u.loc_cancel.cause);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(own.u.loc_update.rand, last_loc_cancel[2].u.loc_cancel.rand, 16);
+    TEST_ASSERT_EQUAL_UINT(cancels + 2u, audits(LC_CORE_AUDIT_LOC_CANCEL, 3));
+    const lc_core_audit_t *a = lc_core_mem_audit(&SMEM, LC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_EQUAL_UINT32(3, a->cell_id);
+    TEST_ASSERT_EQUAL_STRING("cause 1", a->detail);
+    TEST_ASSERT_EQUAL_UINT(1, audits(LC_CORE_AUDIT_REGISTER, 3)); /* only T0's real registration there */
+
+    TERM[0].cell = 0; /* back on */
+    forget_events();
+    TEST_ASSERT_TRUE(run_until_event(0, LC_SIG_EV_REGISTERED, 10000));
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT32(1, located(0));
+    forget_events();
+    dial(1, "606-555-01230");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[0], LC_SIG_EV_INCOMING));
+}
+
+/* §7.4 timers: the callee's cell never answers the offer (its frames to the
+ * core are lost): the core gives up after 10 s, cause 5, on both legs. */
+static void test_silent_callee_cell_times_out(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    CELL[1].mute = 1;
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(9000);
+    TEST_ASSERT_EQUAL_INT(-1, ended(0));
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(0));
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(1)); /* its ringing leg released too */
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -528,5 +920,14 @@ int main(void)
     RUN_TEST(test_reject_busy_unreachable_no_answer);
     RUN_TEST(test_both_dial_each_other_at_once);
     RUN_TEST(test_echo_service);
+    RUN_TEST(test_idle_move_between_cells);
+    RUN_TEST(test_reactivation_on_a_new_terminal_elsewhere);
+    RUN_TEST(test_cell_restart_mid_call);
+    RUN_TEST(test_core_restart_mid_call);
+    RUN_TEST(test_backhaul_outage_at_a_cell);
+    RUN_TEST(test_resync_through_the_core);
+    RUN_TEST(test_rogue_cell_cannot_pull_a_subscriber);
+    RUN_TEST(test_rogue_cell_cannot_replay_its_own_older_claim);
+    RUN_TEST(test_silent_callee_cell_times_out);
     return UNITY_END();
 }

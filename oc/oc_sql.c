@@ -123,11 +123,15 @@ static int num_col(sqlite3_stmt *st, int col, uint8_t out[OC_SIG_NUMBER_LEN])
     return t != NULL && oc_sig_number_to_bcd(t, strlen(t), out) == 0 ? 0 : -1;
 }
 
-static void blob_col(sqlite3_stmt *st, int col, uint8_t *out, size_t n)
+/* A fixed-size blob: 0, or -1 (out zeroed) when the column is not exactly
+ * n bytes - a row oc_sql never wrote, read as failed rather than as zeros. */
+static int blob_col(sqlite3_stmt *st, int col, uint8_t *out, size_t n)
 {
     const void *b = sqlite3_column_blob(st, col);
     memset(out, 0, n);
-    if (b != NULL && (size_t)sqlite3_column_bytes(st, col) == n) memcpy(out, b, n);
+    if (b == NULL || (size_t)sqlite3_column_bytes(st, col) != n) return -1;
+    memcpy(out, b, n);
+    return 0;
 }
 
 static int seal_bind(oc_sql_t *s, sqlite3_stmt *st, int idx, const char *table, const char *column,
@@ -162,6 +166,11 @@ static int begin(void *c)
         s->failed = 1;
         return -1;
     }
+    /* a transaction the store did not open, left on the connection (both
+     * ROLLBACKs in commit failed, say): nothing of it is the store's to
+     * keep, so it is rolled back here and the store recovers without a
+     * restart; if it won't go, BEGIN below fails and dooms this one */
+    if (!sqlite3_get_autocommit(s->db)) sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
     s->in_txn = 1;
     s->began = sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;
     s->failed = !s->began; /* puts until commit write nothing, and commit fails */
@@ -204,11 +213,12 @@ static int netkey_get(void *c, uint16_t key_id, oc_core_netkey_t *out)
     key_pk(key_id, pk);
     memset(out, 0, sizeof(*out));
     if (rc == 0) {
-        if (unseal_col(s, st, 0, "network", "sk", pk, 2, out->sk, sizeof(out->sk)) != 0) {
+        if (unseal_col(s, st, 0, "network", "sk", pk, 2, out->sk, sizeof(out->sk)) != 0 ||
+            blob_col(st, 1, out->pk, sizeof(out->pk)) != 0) {
+            oc_sig_wipe(out, sizeof(*out));
             rc = OC_CORE_STORE_FAILED;
         } else {
             out->key_id = key_id;
-            blob_col(st, 1, out->pk, sizeof(out->pk));
             out->period_s = (uint16_t)sqlite3_column_int(st, 2);
             out->created = (uint32_t)sqlite3_column_int64(st, 3);
         }
@@ -515,10 +525,10 @@ static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_
     }
     int rc = get_step(st, b);
     memset(out, 0, sizeof(*out));
+    if (rc == 0 && blob_col(st, 0, out->xres, 8) != 0) rc = OC_CORE_STORE_FAILED;
     if (rc == 0) {
         memcpy(out->number, number, OC_SIG_NUMBER_LEN);
         memcpy(out->rand, rand, 16);
-        blob_col(st, 0, out->xres, 8);
         out->sqn = (uint64_t)sqlite3_column_int64(st, 1);
         out->cell_id = (uint32_t)sqlite3_column_int64(st, 2);
         out->issued = (uint32_t)sqlite3_column_int64(st, 3);
@@ -583,7 +593,10 @@ static int loc_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc
         out->tmid = (uint32_t)sqlite3_column_int64(st, 1);
         out->expires = (uint32_t)sqlite3_column_int64(st, 2);
         out->sqn = (uint64_t)sqlite3_column_int64(st, 3);
-        blob_col(st, 4, out->rand, sizeof(out->rand));
+        if (blob_col(st, 4, out->rand, sizeof(out->rand)) != 0) {
+            memset(out, 0, sizeof(*out));
+            rc = OC_CORE_STORE_FAILED;
+        }
     }
     sqlite3_finalize(st);
     return rc;

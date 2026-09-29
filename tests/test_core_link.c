@@ -226,7 +226,7 @@ static void test_a_failed_cell_read_adds_nothing(void)
 {
     core_world();
     MEM.fail_reads = OC_CORE_MEM_FAIL_CELL_GET;
-    TEST_ASSERT_EQUAL_INT(-1, oc_core_cell_add(&K, 1, "again", OC_SIG_MODE_PART97, 3));
+    TEST_ASSERT_EQUAL_INT(-2, oc_core_cell_add(&K, 1, "again", OC_SIG_MODE_PART97, 3)); /* not "exists" */
     MEM.fail_reads = 0;
     oc_core_cell_t c;
     TEST_ASSERT_EQUAL_INT(0, ST.cell_get(ST.ctx, 1, &c));
@@ -256,6 +256,56 @@ static void test_a_failed_list_read_changes_no_list(void)
     TEST_ASSERT_EQUAL_INT(3, oc_core_chan_list_set(&K, 5, &l, NOW));
 }
 
+/* A channel list or cell record that can't be read while CELL_CFG is due
+ * to a linked cell: that cell's link is dropped, so it re-HELLOs and gets
+ * its configuration then, instead of running on without it. */
+static int list_reads, list_fail_from;
+static int (*mem_list_get)(void *ctx, uint16_t list_id, oc_sig_chan_list_t *out);
+static int list_get_failing(void *ctx, uint16_t list_id, oc_sig_chan_list_t *out)
+{
+    if (++list_reads >= list_fail_from) return OC_CORE_STORE_FAILED;
+    return mem_list_get(ctx, list_id, out);
+}
+
+static void test_a_failed_read_while_pushing_the_list_drops_the_link(void)
+{
+    core_world();
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&K, 3, "C", OC_SIG_MODE_PART15, 5));
+    oc_sig_chan_list_t l;
+    memset(&l, 0, sizeof(l));
+    l.count = 1;
+    l.freq_hz[0] = 917250000u;
+    TEST_ASSERT_EQUAL_INT(1, oc_core_chan_list_set(&K, 5, &l, NOW));
+
+    MEM.fail_reads = OC_CORE_MEM_FAIL_LIST_GET; /* at HELLO */
+    hello(30, 3, 1);
+    MEM.fail_reads = 0;
+    TEST_ASSERT_NULL(sent(30, OC_CORE_CELL_CFG));
+    TEST_ASSERT_EQUAL_INT(1, NCLOSED);
+    TEST_ASSERT_EQUAL_UINT32(30, CLOSED[0]);
+
+    hello(31, 3, 1); /* the cell reconnects: its list with the ACK */
+    TEST_ASSERT_NOT_NULL(sent(31, OC_CORE_CELL_CFG));
+    MEM.fail_reads = OC_CORE_MEM_FAIL_CELL_GET; /* a change: the cell's own record can't be read */
+    TEST_ASSERT_EQUAL_INT(-2, oc_core_chan_list_set(&K, 5, &l, NOW)); /* stored, not pushed everywhere */
+    MEM.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(2, NCLOSED);
+    TEST_ASSERT_EQUAL_UINT32(31, CLOSED[1]);
+    oc_sig_chan_list_t got;
+    TEST_ASSERT_EQUAL_INT(0, ST.list_get(ST.ctx, 5, &got));
+    TEST_ASSERT_EQUAL_UINT8(2, got.ver);
+
+    hello(32, 3, 1);
+    mem_list_get = K.st.list_get; /* a change: the list read for the push fails */
+    list_reads = 0;
+    list_fail_from = 2;
+    K.st.list_get = list_get_failing;
+    TEST_ASSERT_EQUAL_INT(-2, oc_core_chan_list_set(&K, 5, &l, NOW));
+    K.st.list_get = mem_list_get;
+    TEST_ASSERT_EQUAL_INT(3, NCLOSED);
+    TEST_ASSERT_EQUAL_UINT32(32, CLOSED[2]);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -270,5 +320,6 @@ int main(void)
     RUN_TEST(test_a_failed_read_refuses_hello_without_a_nak);
     RUN_TEST(test_a_failed_cell_read_adds_nothing);
     RUN_TEST(test_a_failed_list_read_changes_no_list);
+    RUN_TEST(test_a_failed_read_while_pushing_the_list_drops_the_link);
     return UNITY_END();
 }

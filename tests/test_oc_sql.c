@@ -546,6 +546,55 @@ static void test_every_get_tells_failed_from_none(void)
     oc_sql_close(s);
 }
 
+/* A fixed-size blob of the wrong size (a row oc_sql never wrote) is a
+ * failed read, not zeros: a zero XRES or RAND would pass for a value. */
+static void test_a_wrong_sized_blob_is_a_failed_read(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_netkey_t k = { 1, { 1 }, { 2 }, 1800, 100 }, kg;
+    oc_core_sub_t x = a_sub();
+    oc_core_av_issued_t a, ag;
+    oc_core_loc_t l = { { 0 }, 1, x.tmid, 5000, 7, { 9 } }, lg;
+    memset(&a, 0, sizeof(a));
+    memcpy(a.number, x.number, OC_SIG_NUMBER_LEN);
+    memcpy(l.number, x.number, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, st.netkey_put(st.ctx, &k));
+    TEST_ASSERT_EQUAL_INT(0, st.av_put(st.ctx, &a));
+    TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), "UPDATE network SET pk = zeroblob(31);"
+                                                                "UPDATE av_issued SET xres = zeroblob(7);"
+                                                                "UPDATE location SET rand = zeroblob(15)",
+                                                  NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.netkey_get(st.ctx, 1, &kg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_get(st.ctx, a.number, a.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, x.number, &lg));
+    oc_sql_close(s);
+}
+
+/* A transaction left open on the connection (both ROLLBACKs failed, say)
+ * is rolled back by the next begin, so the store recovers without a
+ * restart: nothing of the leftover lands. */
+static void test_begin_clears_a_leftover_transaction(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_sub_t x = a_sub(), y;
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), "BEGIN; INSERT INTO cell(cell_id, name, mode, enabled)"
+                                                                " VALUES(9, 'left', 0, 1)", NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
+    TEST_ASSERT_EQUAL_INT(0, st.commit(st.ctx));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, x.number, &y));
+    oc_core_cell_t c;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.cell_get(st.ctx, 9, &c));
+    oc_sql_close(s);
+}
+
 /* The database fills up in the middle of a transaction (SQLITE_FULL, here
  * by a page limit): that put fails, every later write is refused, and none
  * of the transaction is left. */
@@ -685,6 +734,8 @@ int main(void)
     RUN_TEST(test_a_failed_begin_dooms_the_transaction);
     RUN_TEST(test_a_lookup_that_fails_is_not_none);
     RUN_TEST(test_every_get_tells_failed_from_none);
+    RUN_TEST(test_a_wrong_sized_blob_is_a_failed_read);
+    RUN_TEST(test_begin_clears_a_leftover_transaction);
     RUN_TEST(test_sqn_rises_across_a_core_restart);
     return UNITY_END();
 }

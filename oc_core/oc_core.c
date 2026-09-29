@@ -152,19 +152,25 @@ void oc_core_link_down(oc_core_t *k, uint32_t link, uint64_t now_us)
     if (cell != 0) cell_gone(k, cell, now_us);
 }
 
-/* CELL_CFG with list group list_id's channel list, if the group has one. */
-static void send_list(oc_core_t *k, oc_core_link_t *l, uint16_t list_id)
+/* CELL_CFG with list group list_id's channel list, if the group has one:
+ * 0 (sent, or no list), or -1 when the list could not be read - then the
+ * cell's link is dropped, so it re-HELLOs and gets its list then, rather
+ * than running on without it. */
+static int send_list(oc_core_t *k, oc_core_link_t *l, uint16_t list_id, uint64_t now)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = OC_CORE_CELL_CFG;
-    if (list_id == 0) return;
+    if (list_id == 0) return 0;
     int got = k->st.list_get(k->st.ctx, list_id, &m.u.cell_cfg.list);
     if (got == OC_CORE_STORE_FAILED) {
-        oc_core_logf(k, "cell %u: channel list %u read FAILED, not sent", (unsigned)l->cell_id, (unsigned)list_id);
+        oc_core_logf(k, "cell %u: channel list %u read FAILED, link dropped", (unsigned)l->cell_id,
+                     (unsigned)list_id);
+        drop(k, l, now);
+        return -1;
     }
-    if (got != 0) return;
-    send_link(k, l, &m);
+    if (got == 0) send_link(k, l, &m);
+    return 0;
 }
 
 static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, uint64_t now)
@@ -227,7 +233,7 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     r.u.hello_ack.key_id = k->cfg.key_id;
     memcpy(r.u.hello_ack.echo_number, k->cfg.echo_number, OC_SIG_NUMBER_LEN);
     send_link(k, l, &r);
-    send_list(k, l, c.list_id);
+    send_list(k, l, c.list_id, now);
 }
 
 void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us)
@@ -298,14 +304,17 @@ int oc_core_cell_add(oc_core_t *k, uint32_t cell_id, const char *name, uint8_t m
     oc_core_cell_t c;
     /* only a cell known not to exist: one whose record could not be read
      * is not written over (oc_core_store.h) */
-    if (cell_id == 0 || k->st.cell_get(k->st.ctx, cell_id, &c) != OC_CORE_STORE_NONE) return -1;
+    if (cell_id == 0) return -1;
+    int got = k->st.cell_get(k->st.ctx, cell_id, &c);
+    if (got == 0) return -1;
+    if (got != OC_CORE_STORE_NONE) return -2;
     memset(&c, 0, sizeof(c));
     c.cell_id = cell_id;
     snprintf(c.name, sizeof(c.name), "%s", name);
     c.mode = mode;
     c.enabled = 1;
     c.list_id = list_id;
-    return k->st.cell_put(k->st.ctx, &c);
+    return k->st.cell_put(k->st.ctx, &c) == 0 ? 0 : -2;
 }
 
 int oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us)
@@ -333,18 +342,22 @@ int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list
     if (got == OC_CORE_STORE_FAILED) return -1; /* a version that could go backwards: nothing changed */
     l.ver = got == 0 && old.ver != 255u ? (uint8_t)(old.ver + 1u) : 1u;
     if (k->st.list_put(k->st.ctx, list_id, &l) != 0) return -1;
+    int pushed = 1;
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
         oc_core_link_t *ln = &k->links[i];
         oc_core_cell_t c;
         if (!ln->used || ln->cell_id == 0) continue;
         int got_c = k->st.cell_get(k->st.ctx, ln->cell_id, &c);
-        if (got_c == OC_CORE_STORE_FAILED) { /* stored all the same: the cell gets it at its next HELLO */
-            oc_core_logf(k, "cell %u: cell read FAILED, channel list %u not sent", (unsigned)ln->cell_id,
-                         (unsigned)list_id);
-        } else if (got_c == 0 && c.list_id == list_id) {
-            send_list(k, ln, list_id);
+        if (got_c == OC_CORE_STORE_FAILED) { /* maybe in the group: it gets its list at its re-HELLO */
+            oc_core_logf(k, "cell %u: cell read FAILED, channel list %u not sent, link dropped",
+                         (unsigned)ln->cell_id, (unsigned)list_id);
+            drop(k, ln, now_us);
+            pushed = 0;
+        } else if (got_c == 0 && c.list_id == list_id && send_list(k, ln, list_id, now_us) != 0) {
+            pushed = 0;
         }
     }
-    oc_core_logf(k, "channel list %u: version %u, %u entries", (unsigned)list_id, (unsigned)l.ver, (unsigned)l.count);
-    return l.ver;
+    oc_core_logf(k, "channel list %u: version %u, %u entries%s", (unsigned)list_id, (unsigned)l.ver,
+                 (unsigned)l.count, pushed ? "" : " (not pushed to every cell)");
+    return pushed ? l.ver : -2;
 }

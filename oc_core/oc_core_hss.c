@@ -182,8 +182,11 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     memset(&loc_other, 0, sizeof(loc_other));
     memset(kk, 0, sizeof(kk));
     memset(opc, 0, sizeof(opc));
-    if (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
-        oc_core_logf(k, "activation: no network key %u", k->cfg.key_id);
+    int got_key = k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key);
+    if (got_key != 0) {
+        oc_core_logf(k, got_key == OC_CORE_STORE_FAILED ? "activation: network key %u read FAILED"
+                                                        : "activation: no network key %u",
+                     k->cfg.key_id);
         goto done;
     }
     /* the token id's block says which core holds it (§14.3): one core, so

@@ -593,6 +593,38 @@ static void test_a_failed_rand_read_answers_the_resync_unavailable(void)
     TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
 }
 
+/* §19: a claim for a binding since cancelled is cancelled back whatever
+ * the vector read gave - it does not need the proof - so a vector read
+ * that fails does not leave the old terminal registered; the audit marks
+ * the proof unknown. */
+static void test_a_stale_claim_is_cancelled_even_if_its_vector_cant_be_read(void)
+{
+    oc_sig_qr_t qr = sub_world();
+    term_t t, t2;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    oc_core_av_t v = ask_avs(10, TMID, 1)->u.av_res.av[0];
+    uint8_t res[8];
+    terminal_res(&t, v.rand, res);
+    hello(20, 2, 1);
+    qr = issue(NUM);
+    term(&t2, TMID2, 0x55, &qr);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, activate(20, &t2)->u.act_res.msg.type);
+    int from = NSENT;
+    MEM.fail_reads = OC_CORE_MEM_FAIL_AV_GET;
+    loc_claim(10, TMID, qr.number, v.rand, res);
+    MEM.fail_reads = 0;
+    const oc_core_msg_t *c = sent_since(from, 10, OC_CORE_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_HEX32(TMID, c->u.loc_cancel.tmid);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_CANCEL_REACTIVATED, c->u.loc_cancel.cause);
+    TEST_ASSERT_NULL(oc_core_mem_audit(&MEM, OC_CORE_AUDIT_AUTH_FAIL));
+    const oc_core_audit_t *au = oc_core_mem_audit(&MEM, OC_CORE_AUDIT_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(au);
+    TEST_ASSERT_EQUAL_UINT32(1, au->cell_id);
+    TEST_ASSERT_NOT_NULL(strstr(au->detail, "proof unknown"));
+}
+
 static uint8_t nak(uint32_t link, const term_t *t)
 {
     const oc_core_msg_t *r = activate(link, t);
@@ -1074,6 +1106,7 @@ int main(void)
     RUN_TEST(test_a_failed_tmid_lookup_answers_vectors_unavailable);
     RUN_TEST(test_a_failed_token_read_fails_closed);
     RUN_TEST(test_a_failed_rand_read_answers_the_resync_unavailable);
+    RUN_TEST(test_a_stale_claim_is_cancelled_even_if_its_vector_cant_be_read);
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
     RUN_TEST(test_reactivation_voids_the_old_bindings_vectors);
     RUN_TEST(test_a_claim_from_before_a_reactivation_is_cancelled_back);

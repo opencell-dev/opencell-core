@@ -93,16 +93,20 @@ void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t no
 void oc_core_tick(oc_core_t *k, uint64_t now_us);
 
 /* Admin (plan 8's CLI drives these). A new cell is enabled, in channel-list
- * group list_id (0: none); 0, or -1 if it exists. Revoking disables it and
- * drops its link. */
+ * group list_id (0: none); 0, -1 if it exists (or cell_id is 0), or -2 if the
+ * store failed (reading whether it exists, or writing it). Revoking disables
+ * it and drops its link. */
 int  oc_core_cell_add(oc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id);
 int  oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us);
 /* The channel list of list group list_id (channel-list spec §8): stored, and
  * sent in CELL_CFG to every linked cell of the group now and to each after
  * its HELLO_ACK. The core numbers the versions (list->ver is ignored): 1, 2,
  * ... 255, then 1 again. The new version, or -1: list_id 0, more than
- * OC_SIG_CHAN_MAX entries, or the store failed. The operator's anchors and
- * the unique-anchor check per group come with network core 2. */
+ * OC_SIG_CHAN_MAX entries, or the store failed (nothing changed); or -2:
+ * stored, but a read failed while pushing it to a linked cell of the group,
+ * whose link was dropped - it gets the list when it says HELLO again. The
+ * operator's anchors and the unique-anchor check per group come with
+ * network core 2. */
 int  oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us);
 
 /* Subscribers (admin). number NULL: a random free number in the first NANP

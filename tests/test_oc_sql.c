@@ -59,13 +59,14 @@ static void test_sql_store_keeps_the_contract(void)
     oc_sql_close(s);
 }
 
-/* True if the file holds these bytes anywhere (a missing file holds none).
- * Searched in-process: `grep -P '\xC1{16}'` under a UTF-8 locale never
- * matches a raw byte, so a shell search would pass whatever the file held. */
+/* True if the file holds these bytes anywhere; the file must exist (a
+ * search of a missing file would pass whatever was on disk). Searched
+ * in-process: `grep -P '\xC1{16}'` under a UTF-8 locale never matches a
+ * raw byte, so a shell search would pass whatever the file held. */
 static int file_has(const char *path, const uint8_t *pat, size_t n)
 {
     FILE *f = fopen(path, "rb");
-    if (f == NULL) return 0;
+    TEST_ASSERT_NOT_NULL_MESSAGE(f, path);
     static uint8_t buf[1 << 20];
     size_t len = fread(buf, 1, sizeof(buf), f);
     TEST_ASSERT_TRUE_MESSAGE(feof(f), "test file larger than the search buffer");
@@ -104,16 +105,22 @@ static void test_keys_are_sealed_on_disk_and_survive_a_restart(void)
     TEST_ASSERT_EQUAL_INT(16 + 29, sqlite3_column_bytes(q, 0));
     TEST_ASSERT_TRUE(memcmp((const uint8_t *)sqlite3_column_blob(q, 0) + 13, x.k, 16) != 0);
     sqlite3_finalize(q);
+
+    /* while the store is open the row is in the WAL (closing checkpoints
+     * it into the database and deletes the WAL) */
+    char wal[128];
+    struct stat sb;
+    snprintf(wal, sizeof(wal), "%s-wal", db);
+    TEST_ASSERT_EQUAL_INT(0, stat(wal, &sb));
+    TEST_ASSERT_EQUAL_UINT(0600, sb.st_mode & 0777);
+    TEST_ASSERT_TRUE(file_has(wal, (const uint8_t *)"+883160655501234", 16)); /* numbers in the clear: the search works */
+    TEST_ASSERT_FALSE(file_has(wal, x.k, 16));
+    TEST_ASSERT_FALSE(file_has(wal, x.opc, 16));
     oc_sql_close(s);
 
-    char side[128];
-    TEST_ASSERT_TRUE(file_has(db, (const uint8_t *)"+883160655501234", 16)); /* numbers in the clear: the search works */
+    TEST_ASSERT_TRUE(file_has(db, (const uint8_t *)"+883160655501234", 16));
     TEST_ASSERT_FALSE(file_has(db, x.k, 16));
     TEST_ASSERT_FALSE(file_has(db, x.opc, 16));
-    snprintf(side, sizeof(side), "%s-wal", db);
-    TEST_ASSERT_FALSE(file_has(side, x.k, 16));
-    TEST_ASSERT_FALSE(file_has(side, x.opc, 16));
-    struct stat sb;
     TEST_ASSERT_EQUAL_INT(0, stat(db, &sb));
     TEST_ASSERT_EQUAL_UINT(0600, sb.st_mode & 0777);
 
@@ -140,6 +147,71 @@ static void test_a_wrong_master_key_is_refused_at_open(void)
     oc_sql_close(s);
     TEST_ASSERT_NULL(open_db(db, other, NULL, 0, err));
     TEST_ASSERT_NOT_NULL(strstr(err, "the master key does not open this database"));
+    rm_dir();
+}
+
+/* Nothing is tried under a wrong key: a database that needs a migration is
+ * neither backed up nor migrated before the key is checked. */
+static void test_a_wrong_key_migrates_nothing(void)
+{
+    char err[256];
+    uint8_t other[32];
+    memcpy(other, KEY, 32);
+    other[0] ^= 1;
+    const char *v1[] = { oc_sql_migration(0) };
+    const char *v2[] = { oc_sql_migration(0), "ALTER TABLE cell ADD COLUMN note TEXT" };
+    fresh_dir();
+    oc_sql_t *s = open_db(db, KEY, v1, 1, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_sql_close(s);
+    TEST_ASSERT_NULL(open_db(db, other, v2, 2, err));
+    TEST_ASSERT_NOT_NULL(strstr(err, "the master key does not open this database"));
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "ls %s | grep -q 'core.db.v1.'", dir);
+    TEST_ASSERT_NOT_EQUAL_INT(0, system(cmd)); /* no backup taken */
+    s = open_db(db, KEY, v1, 1, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    TEST_ASSERT_EQUAL_INT(1, oc_sql_version(s)); /* not migrated */
+    oc_sql_close(s);
+    rm_dir();
+}
+
+/* A database past v0 without its key check is refused, not given a new one
+ * under whatever key opened it. */
+static void test_a_missing_key_check_is_refused(void)
+{
+    char err[256];
+    fresh_dir();
+    oc_sql_t *s = open_db(db, KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), "DELETE FROM meta WHERE k = 'key_check'", NULL, NULL,
+                                                  NULL));
+    oc_sql_close(s);
+    TEST_ASSERT_NULL(open_db(db, KEY, NULL, 0, err));
+    TEST_ASSERT_NOT_NULL(strstr(err, "missing key check: refusing to open"));
+    rm_dir();
+}
+
+/* The key check is written in migration 0's transaction: if it can't be
+ * written, the database stays at v0 (and is set up afresh next time). */
+static void test_the_key_check_is_written_with_the_first_migration(void)
+{
+    char err[256];
+    const char *bad[] = { "CREATE TABLE meta(k TEXT PRIMARY KEY, v BLOB NOT NULL CHECK (length(v) < 10))" };
+    fresh_dir();
+    TEST_ASSERT_NULL(open_db(db, KEY, bad, 1, err));
+    sqlite3 *raw;
+    sqlite3_stmt *q;
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_open(db, &raw));
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(raw, "PRAGMA user_version", -1, &q, NULL));
+    TEST_ASSERT_EQUAL_INT(SQLITE_ROW, sqlite3_step(q));
+    TEST_ASSERT_EQUAL_INT(0, sqlite3_column_int(q, 0));
+    sqlite3_finalize(q);
+    sqlite3_close(raw);
+    oc_sql_t *s = open_db(db, KEY, NULL, 0, err); /* the real schema, from v0 */
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    TEST_ASSERT_EQUAL_INT(1, oc_sql_version(s));
+    oc_sql_close(s);
     rm_dir();
 }
 
@@ -181,6 +253,9 @@ static void test_migration_backs_up_first(void)
     char backup[600];
     snprintf(backup, sizeof(backup), "%s", oc_sql_backup(s));
     TEST_ASSERT_NOT_NULL(strstr(backup, "core.db.v1."));
+    struct stat sb;
+    TEST_ASSERT_EQUAL_INT(0, stat(backup, &sb));
+    TEST_ASSERT_EQUAL_UINT(0600, sb.st_mode & 0777);
     oc_sql_close(s);
 
     s = open_db(backup, KEY, v1, 1, err);
@@ -347,6 +422,66 @@ static void test_a_lookup_that_fails_is_not_none(void)
     oc_sql_close(s);
 }
 
+/* A write outside begin/commit is durable when it returns (oc_core_store.h):
+ * if the connection is inside a transaction the store did not open (one a
+ * failed ROLLBACK left behind, say), the write is refused, since it would
+ * only land if someone committed that transaction. */
+static void test_a_write_outside_a_transaction_must_be_durable(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_sub_t x = a_sub();
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), "BEGIN", NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(-1, st.sub_put(st.ctx, &x));
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), "ROLLBACK", NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
+    oc_sql_close(s);
+}
+
+/* A channel list too long to store is a failed write: it dooms the
+ * transaction like any other. */
+static void test_an_oversized_list_dooms_the_transaction(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_sub_t x = a_sub(), y;
+    oc_sig_chan_list_t l;
+    memset(&l, 0, sizeof(l));
+    l.count = OC_SIG_CHAN_MAX + 1u;
+    TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
+    TEST_ASSERT_EQUAL_INT(-1, st.list_put(st.ctx, 1, &l));
+    TEST_ASSERT_EQUAL_INT(-1, st.commit(st.ctx));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.sub_get(st.ctx, x.number, &y));
+    oc_sql_close(s);
+}
+
+/* A value that can't be bound is a failed write, not a NULL in its column
+ * (audit.number is nullable: an unbound number would pass as "none"). */
+static void test_a_failed_bind_fails_the_write(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_audit_t au;
+    memset(&au, 0, sizeof(au));
+    contract_num("+883160655501234", au.number);
+    sqlite3_limit(oc_sql_db(s), SQLITE_LIMIT_LENGTH, 15); /* the number's 16 characters no longer fit */
+    TEST_ASSERT_EQUAL_INT(-1, st.audit_add(st.ctx, &au));
+    sqlite3_limit(oc_sql_db(s), SQLITE_LIMIT_LENGTH, 1000000);
+    sqlite3_stmt *q;
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(oc_sql_db(s), "SELECT count(*) FROM audit", -1, &q, NULL));
+    TEST_ASSERT_EQUAL_INT(SQLITE_ROW, sqlite3_step(q));
+    TEST_ASSERT_EQUAL_INT(0, sqlite3_column_int(q, 0));
+    sqlite3_finalize(q);
+    oc_sql_close(s);
+}
+
 /* The database fills up in the middle of a transaction (SQLITE_FULL, here
  * by a page limit): that put fails, every later write is refused, and none
  * of the transaction is left. */
@@ -471,12 +606,18 @@ int main(void)
     RUN_TEST(test_sql_store_keeps_the_contract);
     RUN_TEST(test_keys_are_sealed_on_disk_and_survive_a_restart);
     RUN_TEST(test_a_wrong_master_key_is_refused_at_open);
+    RUN_TEST(test_a_wrong_key_migrates_nothing);
+    RUN_TEST(test_a_missing_key_check_is_refused);
+    RUN_TEST(test_the_key_check_is_written_with_the_first_migration);
     RUN_TEST(test_the_lock_keeps_a_second_process_out);
     RUN_TEST(test_migration_backs_up_first);
     RUN_TEST(test_a_failed_migration_changes_nothing);
     RUN_TEST(test_a_failed_put_fails_the_whole_transaction);
     RUN_TEST(test_a_transaction_sqlite_dropped_writes_nothing_more);
     RUN_TEST(test_a_full_database_undoes_the_transaction);
+    RUN_TEST(test_a_write_outside_a_transaction_must_be_durable);
+    RUN_TEST(test_an_oversized_list_dooms_the_transaction);
+    RUN_TEST(test_a_failed_bind_fails_the_write);
     RUN_TEST(test_a_failed_begin_dooms_the_transaction);
     RUN_TEST(test_a_lookup_that_fails_is_not_none);
     RUN_TEST(test_sqn_rises_across_a_core_restart);

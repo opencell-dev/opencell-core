@@ -77,6 +77,18 @@ static int done(oc_sql_t *s, sqlite3_stmt *st)
     return -1;
 }
 
+/* A prepared write whose binds returned b (their codes OR-ed, so 0 when
+ * every one was SQLITE_OK): a value that could not be bound is a failed
+ * write, never a NULL in its column. */
+static int run(oc_sql_t *s, sqlite3_stmt *st, int b)
+{
+    if (st != NULL && b != SQLITE_OK) {
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    return done(s, st);
+}
+
 /* A write refused before it starts: inside a failed transaction nothing is
  * written. SQLite rolls a transaction back by itself on some errors
  * (SQLITE_FULL, SQLITE_IOERR, SQLITE_NOMEM, SQLITE_BUSY), and the statements
@@ -85,6 +97,10 @@ static int done(oc_sql_t *s, sqlite3_stmt *st)
 static int blocked(oc_sql_t *s)
 {
     if (s->in_txn && s->began && !s->failed && sqlite3_get_autocommit(s->db)) s->failed = 1;
+    /* outside begin/commit a write is durable when it returns: not if the
+     * connection sits in a transaction the store did not open (one a failed
+     * ROLLBACK left, say), where it would wait for someone's COMMIT */
+    if (!s->in_txn && !sqlite3_get_autocommit(s->db)) return 1;
     return s->in_txn && s->failed;
 }
 
@@ -147,7 +163,15 @@ static int commit(void *c)
     oc_sql_t *s = S(c);
     if (!s->in_txn) return -1;
     int ok = !blocked(s) && s->began && sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
-    if (!ok && s->began) sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+    if (!ok && s->began && !sqlite3_get_autocommit(s->db)) {
+        /* a ROLLBACK can fail while a statement is still running; tried
+         * twice, and if the transaction is still open blocked() refuses
+         * every write outside begin/commit and begin fails, so nothing is
+         * written into it */
+        if (sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK || !sqlite3_get_autocommit(s->db)) {
+            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        }
+    }
     s->in_txn = s->began = s->failed = 0;
     return ok ? 0 : -1;
 }
@@ -185,20 +209,18 @@ static int netkey_get(void *c, uint16_t key_id, oc_core_netkey_t *out)
 static int netkey_put(void *c, const oc_core_netkey_t *k)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     uint8_t pk[2];
     if (blocked(s)) return -1;
     sqlite3_stmt *st = prep(s, "INSERT OR REPLACE INTO network(key_id, sk_enc, pk, period_s, created) VALUES(?,?,?,?,?)");
-    if (st == NULL) return done(s, st);
+    if (st == NULL) return run(s, st, b);
     key_pk(k->key_id, pk);
-    sqlite3_bind_int(st, 1, k->key_id);
-    if (seal_bind(s, st, 2, "network", "sk", pk, 2, k->sk, sizeof(k->sk)) != 0) {
-        sqlite3_finalize(st);
-        return done(s, NULL);
-    }
-    sqlite3_bind_blob(st, 3, k->pk, sizeof(k->pk), SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 4, k->period_s);
-    sqlite3_bind_int64(st, 5, k->created);
-    return done(s, st);
+    b |= sqlite3_bind_int(st, 1, k->key_id);
+    b |= seal_bind(s, st, 2, "network", "sk", pk, 2, k->sk, sizeof(k->sk));
+    b |= sqlite3_bind_blob(st, 3, k->pk, sizeof(k->pk), SQLITE_TRANSIENT);
+    b |= sqlite3_bind_int(st, 4, k->period_s);
+    b |= sqlite3_bind_int64(st, 5, k->created);
+    return run(s, st, b);
 }
 
 /* ---- cells ---- */
@@ -211,9 +233,10 @@ static int cell_get(void *c, uint32_t cell_id, oc_core_cell_t *out)
     if (st == NULL) return -1;
     sqlite3_bind_int64(st, 1, cell_id);
     memset(out, 0, sizeof(*out));
-    if (sqlite3_step(st) == SQLITE_ROW) {
+    const char *name;
+    if (sqlite3_step(st) == SQLITE_ROW && (name = (const char *)sqlite3_column_text(st, 0)) != NULL) {
         out->cell_id = cell_id;
-        snprintf(out->name, sizeof(out->name), "%s", (const char *)sqlite3_column_text(st, 0));
+        snprintf(out->name, sizeof(out->name), "%s", name);
         out->mode = (uint8_t)sqlite3_column_int(st, 1);
         out->enabled = (uint8_t)sqlite3_column_int(st, 2);
         out->list_id = (uint16_t)sqlite3_column_int(st, 3);
@@ -228,6 +251,7 @@ static int cell_get(void *c, uint32_t cell_id, oc_core_cell_t *out)
 static int cell_put(void *c, const oc_core_cell_t *x)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     if (blocked(s)) return -1;
     /* an upsert: cert_fpr (plan 9) is not oc_core's and survives */
     sqlite3_stmt *st = prep(s, "INSERT INTO cell(cell_id, name, mode, enabled, list_id, boot_id, last_seen)"
@@ -235,15 +259,15 @@ static int cell_put(void *c, const oc_core_cell_t *x)
                                " mode = excluded.mode, enabled = excluded.enabled, list_id = excluded.list_id,"
                                " boot_id = excluded.boot_id, last_seen = excluded.last_seen");
     if (st != NULL) {
-        sqlite3_bind_int64(st, 1, x->cell_id);
-        sqlite3_bind_text(st, 2, x->name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 3, x->mode);
-        sqlite3_bind_int(st, 4, x->enabled);
-        sqlite3_bind_int(st, 5, x->list_id);
-        sqlite3_bind_int64(st, 6, (sqlite3_int64)x->boot_id);
-        sqlite3_bind_int64(st, 7, x->last_seen);
+        b |= sqlite3_bind_int64(st, 1, x->cell_id);
+        b |= sqlite3_bind_text(st, 2, x->name, -1, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int(st, 3, x->mode);
+        b |= sqlite3_bind_int(st, 4, x->enabled);
+        b |= sqlite3_bind_int(st, 5, x->list_id);
+        b |= sqlite3_bind_int64(st, 6, (sqlite3_int64)x->boot_id);
+        b |= sqlite3_bind_int64(st, 7, x->last_seen);
     }
-    return done(s, st);
+    return run(s, st, b);
 }
 
 /* ---- channel lists: count x { freq_hz (4, BE), flags (1) } ---- */
@@ -277,8 +301,10 @@ static int list_get(void *c, uint16_t list_id, oc_sig_chan_list_t *out)
 static int list_put(void *c, uint16_t list_id, const oc_sig_chan_list_t *l)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     uint8_t e[5 * OC_SIG_CHAN_MAX];
-    if (blocked(s) || l->count > OC_SIG_CHAN_MAX) return -1;
+    if (blocked(s)) return -1;
+    if (l->count > OC_SIG_CHAN_MAX) return done(s, NULL); /* a failed write: dooms the transaction */
     for (int i = 0; i < l->count; i++) {
         e[5 * i] = (uint8_t)(l->freq_hz[i] >> 24);
         e[5 * i + 1] = (uint8_t)(l->freq_hz[i] >> 16);
@@ -288,11 +314,11 @@ static int list_put(void *c, uint16_t list_id, const oc_sig_chan_list_t *l)
     }
     sqlite3_stmt *st = prep(s, "INSERT OR REPLACE INTO chan_list(list_id, ver, entries) VALUES(?,?,?)");
     if (st != NULL) {
-        sqlite3_bind_int(st, 1, list_id);
-        sqlite3_bind_int(st, 2, l->ver);
-        sqlite3_bind_blob(st, 3, e, 5 * l->count, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int(st, 1, list_id);
+        b |= sqlite3_bind_int(st, 2, l->ver);
+        b |= sqlite3_bind_blob(st, 3, e, 5 * l->count, SQLITE_TRANSIENT);
     }
-    return done(s, st);
+    return run(s, st, b);
 }
 
 /* ---- subscribers ---- */
@@ -354,24 +380,22 @@ static int sub_by_tmid(void *c, uint32_t tmid, oc_core_sub_t *out)
 static int sub_put(void *c, const oc_core_sub_t *x)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     sqlite3_stmt *st = prep(s, "INSERT OR REPLACE INTO subscriber(" SUB_COLS ") VALUES(?,?,?,?,?,?,?,?,?)");
     if (st == NULL) return done(s, NULL);
     num_text(x->number, t);
-    sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 2, x->state);
-    sqlite3_bind_int64(st, 3, x->tmid);
-    sqlite3_bind_int(st, 4, x->activated);
-    if (seal_bind(s, st, 5, "subscriber", "k", x->number, OC_SIG_NUMBER_LEN, x->k, 16) != 0 ||
-        seal_bind(s, st, 6, "subscriber", "opc", x->number, OC_SIG_NUMBER_LEN, x->opc, 16) != 0) {
-        sqlite3_finalize(st);
-        return done(s, NULL);
-    }
-    sqlite3_bind_int64(st, 7, (sqlite3_int64)x->sqn);
-    sqlite3_bind_int64(st, 8, x->created);
-    sqlite3_bind_int64(st, 9, x->updated);
-    return done(s, st);
+    b |= sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
+    b |= sqlite3_bind_int(st, 2, x->state);
+    b |= sqlite3_bind_int64(st, 3, x->tmid);
+    b |= sqlite3_bind_int(st, 4, x->activated);
+    b |= seal_bind(s, st, 5, "subscriber", "k", x->number, OC_SIG_NUMBER_LEN, x->k, 16);
+    b |= seal_bind(s, st, 6, "subscriber", "opc", x->number, OC_SIG_NUMBER_LEN, x->opc, 16);
+    b |= sqlite3_bind_int64(st, 7, (sqlite3_int64)x->sqn);
+    b |= sqlite3_bind_int64(st, 8, x->created);
+    b |= sqlite3_bind_int64(st, 9, x->updated);
+    return run(s, st, b);
 }
 
 /* ---- tokens ---- */
@@ -399,6 +423,7 @@ static int token_get(void *c, const uint8_t token_id[8], oc_core_token_t *out)
 static int token_put(void *c, const oc_core_token_t *x)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     /* an upsert on token_id only: a second unused token for a number is
@@ -409,34 +434,33 @@ static int token_put(void *c, const oc_core_token_t *x)
                                " used_at = excluded.used_at, used_by_tmid = excluded.used_by_tmid");
     if (st == NULL) return done(s, NULL);
     num_text(x->number, t);
-    sqlite3_bind_blob(st, 1, x->token_id, 8, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, t, -1, SQLITE_TRANSIENT);
-    if (seal_bind(s, st, 3, "token", "secret", x->token_id, 8, x->secret, 16) != 0) {
-        sqlite3_finalize(st);
-        return done(s, NULL);
-    }
-    sqlite3_bind_int64(st, 4, x->expiry);
-    sqlite3_bind_int64(st, 5, x->used_at);
-    sqlite3_bind_int64(st, 6, x->used_by_tmid);
-    return done(s, st);
+    b |= sqlite3_bind_blob(st, 1, x->token_id, 8, SQLITE_TRANSIENT);
+    b |= sqlite3_bind_text(st, 2, t, -1, SQLITE_TRANSIENT);
+    b |= seal_bind(s, st, 3, "token", "secret", x->token_id, 8, x->secret, 16);
+    b |= sqlite3_bind_int64(st, 4, x->expiry);
+    b |= sqlite3_bind_int64(st, 5, x->used_at);
+    b |= sqlite3_bind_int64(st, 6, x->used_by_tmid);
+    return run(s, st, b);
 }
 
 static int by_number(oc_sql_t *s, const char *sql, const uint8_t number[OC_SIG_NUMBER_LEN])
 {
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     sqlite3_stmt *st = prep(s, sql);
     num_text(number, t);
-    if (st != NULL) sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-    return done(s, st);
+    if (st != NULL) b |= sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
+    return run(s, st, b);
 }
 
 static int by_int(oc_sql_t *s, const char *sql, sqlite3_int64 v)
 {
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     if (blocked(s)) return -1;
     sqlite3_stmt *st = prep(s, sql);
-    if (st != NULL) sqlite3_bind_int64(st, 1, v);
-    return done(s, st);
+    if (st != NULL) b |= sqlite3_bind_int64(st, 1, v);
+    return run(s, st, b);
 }
 
 static int token_void(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
@@ -449,21 +473,22 @@ static int token_void(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
 static int av_put(void *c, const oc_core_av_issued_t *a)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     sqlite3_stmt *st = prep(s, "INSERT OR REPLACE INTO av_issued(number, rand, xres, sqn, cell_id, issued, confirmed)"
                                " VALUES(?,?,?,?,?,?,?)");
     if (st != NULL) {
         num_text(a->number, t);
-        sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_blob(st, 2, a->rand, 16, SQLITE_TRANSIENT);
-        sqlite3_bind_blob(st, 3, a->xres, 8, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 4, (sqlite3_int64)a->sqn);
-        sqlite3_bind_int64(st, 5, a->cell_id);
-        sqlite3_bind_int64(st, 6, a->issued);
-        sqlite3_bind_int(st, 7, a->confirmed);
+        b |= sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_blob(st, 2, a->rand, 16, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_blob(st, 3, a->xres, 8, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int64(st, 4, (sqlite3_int64)a->sqn);
+        b |= sqlite3_bind_int64(st, 5, a->cell_id);
+        b |= sqlite3_bind_int64(st, 6, a->issued);
+        b |= sqlite3_bind_int(st, 7, a->confirmed);
     }
-    return done(s, st);
+    return run(s, st, b);
 }
 
 static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_t rand[16], oc_core_av_issued_t *out)
@@ -557,20 +582,21 @@ static int loc_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc
 static int loc_put(void *c, const oc_core_loc_t *l)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     sqlite3_stmt *st =
         prep(s, "INSERT OR REPLACE INTO location(number, cell_id, tmid, expires, sqn, rand) VALUES(?,?,?,?,?,?)");
     if (st != NULL) {
         num_text(l->number, t);
-        sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 2, l->cell_id);
-        sqlite3_bind_int64(st, 3, l->tmid);
-        sqlite3_bind_int64(st, 4, l->expires);
-        sqlite3_bind_int64(st, 5, (sqlite3_int64)l->sqn);
-        sqlite3_bind_blob(st, 6, l->rand, sizeof(l->rand), SQLITE_TRANSIENT);
+        b |= sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int64(st, 2, l->cell_id);
+        b |= sqlite3_bind_int64(st, 3, l->tmid);
+        b |= sqlite3_bind_int64(st, 4, l->expires);
+        b |= sqlite3_bind_int64(st, 5, (sqlite3_int64)l->sqn);
+        b |= sqlite3_bind_blob(st, 6, l->rand, sizeof(l->rand), SQLITE_TRANSIENT);
     }
-    return done(s, st);
+    return run(s, st, b);
 }
 
 /* -1 when there was none, which (unlike a delete that failed) does not doom
@@ -592,44 +618,46 @@ static int loc_purge_cell(void *c, uint32_t cell_id)
 static int cdr_add(void *c, const oc_core_cdr_t *x)
 {
     oc_sql_t *s = S(c);
-    char a[OC_SIG_NUMBER_TEXT], b[OC_SIG_NUMBER_TEXT];
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
+    char ta[OC_SIG_NUMBER_TEXT], tb[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     sqlite3_stmt *st = prep(s, "INSERT INTO cdr(caller, called, cell_a, cell_b, setup, answer, \"end\", cause)"
                                " VALUES(?,?,?,?,?,?,?,?)");
     if (st != NULL) {
-        num_text(x->caller, a);
-        num_text(x->called, b);
-        sqlite3_bind_text(st, 1, a, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, b, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 3, x->cell_a);
-        sqlite3_bind_int64(st, 4, x->cell_b);
-        sqlite3_bind_int64(st, 5, x->setup);
-        sqlite3_bind_int64(st, 6, x->answer);
-        sqlite3_bind_int64(st, 7, x->end);
-        sqlite3_bind_int(st, 8, x->cause);
+        num_text(x->caller, ta);
+        num_text(x->called, tb);
+        b |= sqlite3_bind_text(st, 1, ta, -1, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_text(st, 2, tb, -1, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int64(st, 3, x->cell_a);
+        b |= sqlite3_bind_int64(st, 4, x->cell_b);
+        b |= sqlite3_bind_int64(st, 5, x->setup);
+        b |= sqlite3_bind_int64(st, 6, x->answer);
+        b |= sqlite3_bind_int64(st, 7, x->end);
+        b |= sqlite3_bind_int(st, 8, x->cause);
     }
-    return done(s, st);
+    return run(s, st, b);
 }
 
 static int audit_add(void *c, const oc_core_audit_t *x)
 {
     oc_sql_t *s = S(c);
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
     static const uint8_t zero[OC_SIG_NUMBER_LEN];
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     sqlite3_stmt *st = prep(s, "INSERT INTO audit(ts, event, number, tmid, cell_id, detail) VALUES(?,?,?,?,?,?)");
     if (st != NULL) {
-        sqlite3_bind_int64(st, 1, x->ts);
-        sqlite3_bind_int(st, 2, x->event);
+        b |= sqlite3_bind_int64(st, 1, x->ts);
+        b |= sqlite3_bind_int(st, 2, x->event);
         if (memcmp(x->number, zero, OC_SIG_NUMBER_LEN) != 0) {
             num_text(x->number, t);
-            sqlite3_bind_text(st, 3, t, -1, SQLITE_TRANSIENT);
+            b |= sqlite3_bind_text(st, 3, t, -1, SQLITE_TRANSIENT);
         }
-        sqlite3_bind_int64(st, 4, x->tmid);
-        sqlite3_bind_int64(st, 5, x->cell_id);
-        sqlite3_bind_text(st, 6, x->detail, (int)strnlen(x->detail, sizeof(x->detail)), SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int64(st, 4, x->tmid);
+        b |= sqlite3_bind_int64(st, 5, x->cell_id);
+        b |= sqlite3_bind_text(st, 6, x->detail, (int)strnlen(x->detail, sizeof(x->detail)), SQLITE_TRANSIENT);
     }
-    return done(s, st);
+    return run(s, st, b);
 }
 
 /* ---- open, migrate, close ---- */
@@ -644,31 +672,84 @@ static int user_version(sqlite3 *db)
     return v;
 }
 
+/* The backup holds sealed keys only, but is owner-only like the database:
+ * created under umask 0077 (its journal too), then checked with chmod. A
+ * failed backup is removed. */
 static int backup_to(sqlite3 *db, const char *path)
 {
     sqlite3 *out = NULL;
+    mode_t old = umask(0077);
     int ok = sqlite3_open_v2(path, &out, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK;
     sqlite3_backup *b = ok ? sqlite3_backup_init(out, "main", db, "main") : NULL;
     ok = b != NULL && sqlite3_backup_step(b, -1) == SQLITE_DONE;
-    if (b != NULL) sqlite3_backup_finish(b);
-    ok = ok && sqlite3_errcode(out) == SQLITE_OK;
-    sqlite3_close(out);
-    if (ok) chmod(path, 0600);
+    if (b != NULL && sqlite3_backup_finish(b) != SQLITE_OK) ok = 0;
+    if (sqlite3_close(out) != SQLITE_OK) ok = 0;
+    umask(old);
+    if (ok && chmod(path, 0600) != 0) ok = 0;
+    if (!ok) unlink(path);
     return ok ? 0 : -1;
 }
 
+/* The key check: KEY_CHECK sealed under the master key, in meta. */
+static int key_check_put(oc_sql_t *s)
+{
+    int b = SQLITE_OK;
+    sqlite3_stmt *st = prep(s, "INSERT INTO meta(k, v) VALUES('key_check', ?)");
+    if (st != NULL) b |= seal_bind(s, st, 1, "meta", "key_check", (const uint8_t *)"", 0, (const uint8_t *)KEY_CHECK,
+                                   sizeof(KEY_CHECK) - 1);
+    return run(s, st, b);
+}
+
+/* The master key must open the check value of a database past v0; one
+ * without a check value is refused, not given one under whatever key
+ * opened it. */
+static int key_check(oc_sql_t *s, const char *path, char *err, size_t cap)
+{
+    uint8_t pt[sizeof(KEY_CHECK) - 1];
+    sqlite3_stmt *st = prep(s, "SELECT v FROM meta WHERE k = 'key_check'");
+    int rc = -1, step = st != NULL ? sqlite3_step(st) : SQLITE_ERROR;
+    if (step == SQLITE_ROW) {
+        rc = unseal_col(s, st, 0, "meta", "key_check", (const uint8_t *)"", 0, pt, sizeof(pt)) == 0 &&
+                     memcmp(pt, KEY_CHECK, sizeof(pt)) == 0
+                 ? 0
+                 : -1;
+        if (rc != 0) snprintf(err, cap, "%s: the master key does not open this database", path);
+        s->unseal_failures = 0;
+        oc_sig_wipe(pt, sizeof(pt));
+    } else if (step == SQLITE_DONE) {
+        snprintf(err, cap, "%s: missing key check: refusing to open", path);
+    } else {
+        snprintf(err, cap, "%s: can't read the key check: %s", path, sqlite3_errmsg(s->db));
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+/* Key check first, for a database past v0: a wrong key backs up and
+ * migrates nothing. Then the backup, then each migration in its own
+ * transaction; migration 0's writes the key check in the same one. */
 static int migrate(oc_sql_t *s, const char *path, const char *const *mig, unsigned n, char *err, size_t cap)
 {
     int v = user_version(s->db);
-    if (v < 0 || (unsigned)v > n) {
+    if (v < 0) {
+        snprintf(err, cap, "%s: can't read the schema version: %s", path, sqlite3_errmsg(s->db));
+        return -1;
+    }
+    if ((unsigned)v > n) {
         snprintf(err, cap, "%s: schema v%d is newer than this oc-core (v%u): install a newer oc-core", path, v, n);
         return -1;
     }
+    if (n == 0) {
+        snprintf(err, cap, "%s: no schema to create", path);
+        return -1;
+    }
+    if (v > 0 && key_check(s, path, err, cap) != 0) return -1;
     if ((unsigned)v == n) return 0;
     if (v > 0 && strcmp(path, ":memory:") != 0) {
         snprintf(s->backup, sizeof(s->backup), "%s.v%d.%lld.bak", path, v, (long long)time(NULL));
         if (backup_to(s->db, s->backup) != 0) {
             snprintf(err, cap, "%s: backup before migrating failed; nothing changed", s->backup);
+            s->backup[0] = '\0';
             return -1;
         }
     }
@@ -677,50 +758,18 @@ static int migrate(oc_sql_t *s, const char *path, const char *const *mig, unsign
         snprintf(pragma, sizeof(pragma), "PRAGMA user_version = %u", i + 1u);
         char *e = NULL;
         int ok = sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK &&
-                 sqlite3_exec(s->db, mig[i], NULL, NULL, &e) == SQLITE_OK &&
+                 sqlite3_exec(s->db, mig[i], NULL, NULL, &e) == SQLITE_OK && (i != 0 || key_check_put(s) == 0) &&
                  sqlite3_exec(s->db, pragma, NULL, NULL, NULL) == SQLITE_OK &&
                  sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
         if (!ok) {
-            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
             snprintf(err, cap, "%s: migration to v%u failed (%s); the database stays at v%u", path, i + 1u,
                      e != NULL ? e : sqlite3_errmsg(s->db), i);
             sqlite3_free(e);
+            if (!sqlite3_get_autocommit(s->db)) sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
             return -1;
         }
     }
     return 0;
-}
-
-/* The master key must open the check value; a new database gets one. */
-static int key_check(oc_sql_t *s, const char *path, char *err, size_t cap)
-{
-    uint8_t pt[sizeof(KEY_CHECK) - 1];
-    sqlite3_stmt *st = prep(s, "SELECT v FROM meta WHERE k = 'key_check'");
-    if (st == NULL) {
-        snprintf(err, cap, "%s: %s", path, sqlite3_errmsg(s->db));
-        return -1;
-    }
-    int rc;
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        rc = unseal_col(s, st, 0, "meta", "key_check", (const uint8_t *)"", 0, pt, sizeof(pt)) == 0 &&
-                     memcmp(pt, KEY_CHECK, sizeof(pt)) == 0
-                 ? 0
-                 : -1;
-        if (rc != 0) snprintf(err, cap, "%s: the master key does not open this database", path);
-        s->unseal_failures = 0;
-    } else {
-        sqlite3_stmt *ins = prep(s, "INSERT INTO meta(k, v) VALUES('key_check', ?)");
-        if (ins != NULL && seal_bind(s, ins, 1, "meta", "key_check", (const uint8_t *)"", 0,
-                                     (const uint8_t *)KEY_CHECK, sizeof(pt)) == 0) {
-            rc = done(s, ins);
-        } else {
-            sqlite3_finalize(ins);
-            rc = -1;
-        }
-        if (rc != 0) snprintf(err, cap, "%s: can't write the key check: %s", path, sqlite3_errmsg(s->db));
-    }
-    sqlite3_finalize(st);
-    return rc;
 }
 
 oc_sql_t *oc_sql_open(const oc_sql_cfg_t *cfg, char *err, size_t cap)
@@ -758,15 +807,32 @@ oc_sql_t *oc_sql_open(const oc_sql_cfg_t *cfg, char *err, size_t cap)
         oc_sql_close(s);
         return NULL;
     }
+    /* The lock keeps other oc-core processes out, so the only other
+     * connections are outside readers (sqlite3 on the database, a backup
+     * tool); in WAL mode they never block a write for long, and 2 s covers
+     * a checkpoint they hold up. */
     sqlite3_busy_timeout(s->db, 2000);
-    if (sqlite3_exec(s->db, "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;", NULL, NULL, NULL) != SQLITE_OK) {
+    /* journal_mode answers with the mode it got: anything but WAL (":memory:"
+     * has only "memory") is refused rather than run without it */
+    char mode[16] = "";
+    sqlite3_stmt *jm = prep(s, "PRAGMA journal_mode = WAL");
+    if (jm != NULL && sqlite3_step(jm) == SQLITE_ROW && sqlite3_column_text(jm, 0) != NULL) {
+        snprintf(mode, sizeof(mode), "%s", (const char *)sqlite3_column_text(jm, 0));
+    }
+    sqlite3_finalize(jm);
+    if (strcmp(mode, mem ? "memory" : "wal") != 0) {
+        snprintf(err, cap, "%s: can't use WAL (journal mode \"%s\"): %s", cfg->path, mode, sqlite3_errmsg(s->db));
+        oc_sql_close(s);
+        return NULL;
+    }
+    if (sqlite3_exec(s->db, "PRAGMA synchronous = FULL", NULL, NULL, NULL) != SQLITE_OK) {
         snprintf(err, cap, "%s: %s", cfg->path, sqlite3_errmsg(s->db));
         oc_sql_close(s);
         return NULL;
     }
     const char *const *mig = cfg->migrations != NULL ? cfg->migrations : MIGRATIONS;
     unsigned n = cfg->migrations != NULL ? cfg->nmigrations : (unsigned)(sizeof(MIGRATIONS) / sizeof(MIGRATIONS[0]));
-    if (migrate(s, cfg->path, mig, n, err, cap) != 0 || key_check(s, cfg->path, err, cap) != 0) {
+    if (migrate(s, cfg->path, mig, n, err, cap) != 0) {
         oc_sql_close(s);
         return NULL;
     }
@@ -776,7 +842,7 @@ oc_sql_t *oc_sql_open(const oc_sql_cfg_t *cfg, char *err, size_t cap)
 void oc_sql_close(oc_sql_t *s)
 {
     if (s == NULL) return;
-    if (s->db != NULL) sqlite3_close(s->db);
+    if (s->db != NULL) sqlite3_close_v2(s->db); /* every statement is finalized where it is used */
     if (s->lock_fd >= 0) close(s->lock_fd); /* drops the lock */
     oc_sig_wipe(s->key, sizeof(s->key));
     free(s);

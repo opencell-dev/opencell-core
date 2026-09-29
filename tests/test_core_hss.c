@@ -385,6 +385,70 @@ static void test_reactivation_cancels_the_old_location_first(void)
     TEST_ASSERT_EQUAL_INT(-1, ST.sub_by_tmid(ST.ctx, TMID, &(lc_core_sub_t){ 0 }));
 }
 
+/* Review Focus 6: the had_other path — a token activates a TMID some other
+ * subscriber is currently bound to: that subscriber is unbound, and since
+ * it had a live location, LOC_CANCEL goes to its cell too. */
+static void test_reactivation_unbinds_the_tmids_other_subscriber_and_cancels_its_location(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t ta;
+    term(&ta, TMID, 0x42, &qr);
+    activate(10, &ta);
+    put_location(1, TMID); /* NUM registered at cell 1 */
+
+    uint8_t n2[LC_SIG_NUMBER_LEN], got[LC_SIG_NUMBER_LEN];
+    number("+883160655501235", n2);
+    TEST_ASSERT_EQUAL_INT(0, lc_core_sub_add(&K, n2, got));
+    lc_sig_qr_t qr2 = issue("+883160655501235");
+    term_t tb;
+    term(&tb, TMID, 0x88, &qr2); /* the same TMID, another subscriber's QR */
+    int from = NSENT;
+    const lc_core_msg_t *r = activate(10, &tb);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_HEX8(LC_SIG_ACT_ACK, r->u.act_res.msg.type);
+    const lc_core_msg_t *c = sent_since(from, 10, LC_CORE_LOC_CANCEL);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_HEX32(TMID, c->u.loc_cancel.tmid);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_CANCEL_REACTIVATED, c->u.loc_cancel.cause);
+    uint8_t n1[LC_SIG_NUMBER_LEN];
+    number(NUM, n1);
+    lc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(-1, ST.loc_get(ST.ctx, n1, &l)); /* NUM's location is gone */
+    lc_core_sub_t sa;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n1, &sa));
+    TEST_ASSERT_EQUAL_UINT8(0, sa.activated); /* NUM lost the TMID */
+    TEST_ASSERT_EQUAL_UINT32(0, sa.tmid);
+    lc_core_sub_t sb;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &sb)); /* now bound to n2 */
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(n2, sb.number, LC_SIG_NUMBER_LEN);
+}
+
+/* Review Focus 3/6: a commit that fails during re-activation leaves the old
+ * location exactly as it was: no LOC_CANCEL, nothing deleted, since loc_del
+ * is now inside the same transaction as the bind. */
+static void test_failed_reactivation_commit_leaves_the_old_location_untouched(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    put_location(1, TMID);
+    qr = issue(NUM);
+    term(&t, TMID2, 0x55, &qr);
+    MEM.fail_commits = 1;
+    int from = NSENT;
+    TEST_ASSERT_NULL(activate(10, &t));
+    TEST_ASSERT_NULL(sent_since(from, 10, LC_CORE_LOC_CANCEL));
+    lc_core_loc_t l;
+    uint8_t n[LC_SIG_NUMBER_LEN];
+    number(NUM, n);
+    TEST_ASSERT_EQUAL_INT(0, ST.loc_get(ST.ctx, n, &l));
+    TEST_ASSERT_EQUAL_UINT32(1, l.cell_id);
+    TEST_ASSERT_EQUAL_UINT32(TMID, l.tmid);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s)); /* still the old binding */
+}
+
 static void test_vectors_rise_and_are_committed_first(void)
 {
     lc_sig_qr_t qr = sub_world();
@@ -402,10 +466,12 @@ static void test_vectors_rise_and_are_committed_first(void)
     TEST_ASSERT_EQUAL_UINT32(1, a.cell_id);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(r->u.av_res.av[1].xres, a.xres, 8);
 
+    unsigned nav = MEM.d.nav; /* Review Focus 6: a failed vector commit leaves no av_issued row */
     MEM.fail_commits = 1; /* the store can't commit: no vector may leave */
     r = ask_avs(10, TMID, 1);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_UNAVAILABLE, r->u.av_res.status);
     TEST_ASSERT_EQUAL_UINT8(0, r->u.av_res.count);
+    TEST_ASSERT_EQUAL_UINT(nav, MEM.d.nav);
     lc_core_sub_t s;
     TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s));
     TEST_ASSERT_EQUAL_UINT64(2, s.sqn);
@@ -417,6 +483,11 @@ static void test_vectors_rise_and_are_committed_first(void)
     TEST_ASSERT_EQUAL_INT64(3, terminal_sqn(&t, &r->u.av_res.av[0]));
     TEST_ASSERT_EQUAL_INT64(6, terminal_sqn(&t, &r->u.av_res.av[3]));
 
+    r = ask_avs(11, TMID, 0); /* controller ruling: count 0 -> 1 */
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_OK, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_UINT8(1, r->u.av_res.count);
+    TEST_ASSERT_EQUAL_INT64(7, terminal_sqn(&t, &r->u.av_res.av[0]));
+
     r = ask_avs(11, TMID2, 1);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_NOT_ACTIVATED, r->u.av_res.status);
     uint8_t n[LC_SIG_NUMBER_LEN];
@@ -424,6 +495,26 @@ static void test_vectors_rise_and_are_committed_first(void)
     TEST_ASSERT_EQUAL_INT(0, lc_core_sub_disable(&K, n, NOW));
     r = ask_avs(11, TMID, 1);
     TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_DISABLED, r->u.av_res.status);
+}
+
+/* Review Focus 1: the AV table is full (256 rows, a mem-store test hook: no
+ * pruning happens on its own): the store refuses the new av_issued row,
+ * which must fail the whole commit, not just be dropped on the floor while
+ * a vector still goes out unbacked by a record. */
+static void test_av_table_full_answers_unavailable(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    memset(MEM.d.av, 0, sizeof(MEM.d.av));
+    MEM.d.nav = LC_CORE_MEM_AVS;
+    const lc_core_msg_t *r = ask_avs(10, TMID, 1);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_UNAVAILABLE, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_UINT8(0, r->u.av_res.count);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s));
+    TEST_ASSERT_EQUAL_UINT64(0, s.sqn); /* not advanced: the whole transaction undid */
 }
 
 static void test_resync_takes_the_terminal_sqn(void)
@@ -466,6 +557,112 @@ static void test_resync_takes_the_terminal_sqn(void)
     TEST_ASSERT_EQUAL_UINT64(501, s.sqn);
 }
 
+/* Review Focus 4: a RESYNC whose RAND this core never issued to the number
+ * is refused, even with an AUTS that verifies against it (the terminal's
+ * real K/OPc, used here only to build the test message). */
+static void test_resync_requires_an_issued_rand(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    uint8_t fake_rand[16];
+    memset(fake_rand, 0x7a, 16);
+    static const uint8_t amf0[2] = { 0, 0 };
+    lc_milenage_t o;
+    uint8_t ms[6];
+    lc_sig_sqn_put(ms, 600);
+    lc_milenage(t.k, t.opc, fake_rand, ms, amf0, &o);
+    lc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_RESYNC;
+    m.u.resync.tmid = TMID;
+    memcpy(m.u.resync.rand, fake_rand, 16);
+    for (int i = 0; i < 6; i++) m.u.resync.auts[i] = (uint8_t)(ms[i] ^ o.ak_s[i]);
+    memcpy(m.u.resync.auts + 6, o.mac_s, 8);
+    int from = NSENT;
+    rx(10, &m);
+    const lc_core_msg_t *r = sent_since(from, 10, LC_CORE_AV_RES);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_AUTH_FAILED, r->u.av_res.status);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s));
+    TEST_ASSERT_EQUAL_UINT64(0, s.sqn); /* untouched */
+}
+
+/* Review Focus 4: TS 33.102 §6.3.5 step 2 - SQN_HE only ever moves forward.
+ * Replaying an old, already-superseded (RAND, AUTS) still verifies (same K,
+ * OPc), but must not roll SQN_HE back to it. */
+static void test_resync_replay_does_not_roll_back_the_sqn(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    const lc_core_msg_t *r = ask_avs(10, TMID, 1);
+    lc_core_av_t av0 = r->u.av_res.av[0];
+    static const uint8_t amf0[2] = { 0, 0 };
+    lc_milenage_t o;
+    uint8_t ms[6];
+    lc_sig_sqn_put(ms, 500);
+    lc_milenage(t.k, t.opc, av0.rand, ms, amf0, &o);
+    lc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_RESYNC;
+    m.u.resync.tmid = TMID;
+    memcpy(m.u.resync.rand, av0.rand, 16);
+    for (int i = 0; i < 6; i++) m.u.resync.auts[i] = (uint8_t)(ms[i] ^ o.ak_s[i]);
+    memcpy(m.u.resync.auts + 6, o.mac_s, 8);
+    int from = NSENT;
+    rx(10, &m); /* the first, legitimate resync: SQN_HE -> 500, vector 501 */
+    r = sent_since(from, 10, LC_CORE_AV_RES);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_OK, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_INT64(501, terminal_sqn(&t, &r->u.av_res.av[0]));
+
+    from = NSENT; /* replay the exact same (RAND, AUTS): SQN_MS(500) is behind */
+    rx(10, &m);
+    r = sent_since(from, 10, LC_CORE_AV_RES);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_OK, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_INT64(502, terminal_sqn(&t, &r->u.av_res.av[0])); /* continues on, not reset to 501 */
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s));
+    TEST_ASSERT_EQUAL_UINT64(502, s.sqn);
+}
+
+/* Review Focus 6: a commit that fails during resync leaves the SQN and the
+ * store exactly as they were: no vector, no rollback either way. */
+static void test_resync_failed_commit_changes_nothing(void)
+{
+    lc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    activate(10, &t);
+    const lc_core_msg_t *r = ask_avs(10, TMID, 1);
+    lc_core_av_t av = r->u.av_res.av[0];
+    static const uint8_t amf0[2] = { 0, 0 };
+    lc_milenage_t o;
+    uint8_t ms[6];
+    lc_sig_sqn_put(ms, 500);
+    lc_milenage(t.k, t.opc, av.rand, ms, amf0, &o);
+    lc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_RESYNC;
+    m.u.resync.tmid = TMID;
+    memcpy(m.u.resync.rand, av.rand, 16);
+    for (int i = 0; i < 6; i++) m.u.resync.auts[i] = (uint8_t)(ms[i] ^ o.ak_s[i]);
+    memcpy(m.u.resync.auts + 6, o.mac_s, 8);
+    unsigned nav = MEM.d.nav;
+    MEM.fail_commits = 1;
+    int from = NSENT;
+    rx(10, &m);
+    r = sent_since(from, 10, LC_CORE_AV_RES);
+    TEST_ASSERT_EQUAL_UINT8(LC_CORE_AV_UNAVAILABLE, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_UINT8(0, r->u.av_res.count);
+    TEST_ASSERT_EQUAL_UINT(nav, MEM.d.nav);
+    lc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_by_tmid(ST.ctx, TMID, &s));
+    TEST_ASSERT_EQUAL_UINT64(1, s.sqn); /* still just the one vector from before: the resync never landed */
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -479,7 +676,13 @@ int main(void)
     RUN_TEST(test_failed_activation_commit_leaves_the_token_usable);
     RUN_TEST(test_activation_refusals);
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
+    RUN_TEST(test_reactivation_unbinds_the_tmids_other_subscriber_and_cancels_its_location);
+    RUN_TEST(test_failed_reactivation_commit_leaves_the_old_location_untouched);
     RUN_TEST(test_vectors_rise_and_are_committed_first);
+    RUN_TEST(test_av_table_full_answers_unavailable);
     RUN_TEST(test_resync_takes_the_terminal_sqn);
+    RUN_TEST(test_resync_requires_an_issued_rand);
+    RUN_TEST(test_resync_replay_does_not_roll_back_the_sqn);
+    RUN_TEST(test_resync_failed_commit_changes_nothing);
     return UNITY_END();
 }

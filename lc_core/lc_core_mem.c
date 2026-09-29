@@ -7,12 +7,22 @@
 
 static int num_eq(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, LC_SIG_NUMBER_LEN) == 0; }
 
+/* A put that fails while a transaction is open dooms it (lc_core_store.h):
+ * remember that so commit() undoes everything, even if the caller that saw
+ * the put's own -1 pressed on and reached commit() anyway. */
+static void fail_txn(void *c)
+{
+    lc_core_mem_t *m = M(c);
+    if (m->in_txn) m->txn_failed = 1;
+}
+
 static int begin(void *c)
 {
     lc_core_mem_t *m = M(c);
     if (m->in_txn) return -1; /* already inside a transaction: leave it be */
     m->undo = m->d;
     m->in_txn = 1;
+    m->txn_failed = 0;
     return 0;
 }
 
@@ -21,8 +31,13 @@ static int commit(void *c)
     lc_core_mem_t *m = M(c);
     if (!m->in_txn) return -1; /* no matching begin(): nothing to commit */
     m->in_txn = 0;
+    int failed = m->txn_failed;
+    m->txn_failed = 0;
     if (m->fail_commits > 0) {
         m->fail_commits--;
+        failed = 1;
+    }
+    if (failed) {
         m->d = m->undo;
         return -1;
     }
@@ -50,7 +65,10 @@ static int netkey_put(void *c, const lc_core_netkey_t *k)
             return 0;
         }
     }
-    if (d->nkey >= LC_CORE_MEM_KEYS) return -1;
+    if (d->nkey >= LC_CORE_MEM_KEYS) {
+        fail_txn(c);
+        return -1;
+    }
     d->key[d->nkey++] = *k;
     return 0;
 }
@@ -75,7 +93,10 @@ static int cell_put(void *c, const lc_core_cell_t *x)
             return 0;
         }
     }
-    if (d->ncell >= LC_CORE_MEM_CELLS) return -1;
+    if (d->ncell >= LC_CORE_MEM_CELLS) {
+        fail_txn(c);
+        return -1;
+    }
     d->cell[d->ncell++] = *x;
     return 0;
 }
@@ -111,7 +132,10 @@ static int sub_put(void *c, const lc_core_sub_t *s)
             return 0;
         }
     }
-    if (d->nsub >= LC_CORE_MEM_SUBS) return -1;
+    if (d->nsub >= LC_CORE_MEM_SUBS) {
+        fail_txn(c);
+        return -1;
+    }
     d->sub[d->nsub++] = *s;
     return 0;
 }
@@ -136,7 +160,10 @@ static int token_put(void *c, const lc_core_token_t *t)
             return 0;
         }
     }
-    if (d->ntoken >= LC_CORE_MEM_TOKENS) return -1;
+    if (d->ntoken >= LC_CORE_MEM_TOKENS) {
+        fail_txn(c);
+        return -1;
+    }
     d->token[d->ntoken++] = *t;
     return 0;
 }
@@ -168,7 +195,10 @@ static int av_put(void *c, const lc_core_av_issued_t *a)
         d->av[i] = *a;
         return 0;
     }
-    if (d->nav >= LC_CORE_MEM_AVS) return -1;
+    if (d->nav >= LC_CORE_MEM_AVS) {
+        fail_txn(c);
+        return -1;
+    }
     d->av[d->nav++] = *a;
     return 0;
 }
@@ -223,7 +253,10 @@ static int loc_put(void *c, const lc_core_loc_t *l)
             return 0;
         }
     }
-    if (d->nloc >= LC_CORE_MEM_SUBS) return -1;
+    if (d->nloc >= LC_CORE_MEM_SUBS) {
+        fail_txn(c);
+        return -1;
+    }
     d->loc[d->nloc++] = *l;
     return 0;
 }

@@ -5,7 +5,12 @@
  *
  * Every function returns 0, or -1 (not found, full, or failed). A put
  * outside begin/commit is durable when it returns; between begin and commit
- * the puts are one change that commit makes durable or, failing, undoes. */
+ * the puts are one change that commit makes durable or, failing, undoes. A
+ * put that fails between begin and commit still dooms the whole
+ * transaction: commit must then return -1 and undo everything done since
+ * begin, even if the caller who saw that put's own -1 pressed on regardless
+ * (a store full of authentication vectors must never let a cell walk away
+ * with a vector whose av_issued row never made it to disk). */
 #ifndef LC_CORE_STORE_H
 #define LC_CORE_STORE_H
 

@@ -42,6 +42,7 @@ typedef struct {
     lc_core_mem_data_t d;
     lc_core_mem_data_t undo;        /* d as it was at begin */
     int                in_txn;
+    int                txn_failed;   /* a put inside this transaction returned -1: commit must undo it */
     int                fail_commits; /* test hook: the next n commits fail (and undo) */
     unsigned           commits;      /* successful commits */
 } lc_core_mem_t;

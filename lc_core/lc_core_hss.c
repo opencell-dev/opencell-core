@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "lc_sig_hss.h"
+#include "lc_sig_keys.h" /* lc_sig_wipe */
 
 static int home_number(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN])
 {
@@ -106,9 +107,12 @@ int lc_core_sub_disable(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
 
 static int num_eq(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, LC_SIG_NUMBER_LEN) == 0; }
 
-/* §7.1: the plan-5 checks, then bind, all in one commit; then the old
- * terminals are cut off (LOC_CANCEL before ACT_RES, so a cell drops its old
- * session before it hears the answer). */
+/* §7.1: the plan-5 checks, then bind, all in one commit (the old locations'
+ * loc_del inside it too, as lc_core_sub_disable does); then the old
+ * terminals are cut off (LOC_CANCEL after the commit, so a cell drops its
+ * old session once the bind that replaces it is durable, and never on a
+ * bind that the store then failed to keep). Single exit: every path wipes
+ * the key material it touched. */
 static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
 {
     static const uint8_t none[LC_SIG_NUMBER_LEN] = { 0 };
@@ -119,12 +123,22 @@ static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     lc_core_netkey_t key;
     lc_sig_act_token_t t;
     lc_core_msg_t r;
+    lc_core_loc_t loc_self, loc_other;
     uint8_t kk[16], opc[16];
+    int had_loc_self = 0, had_loc_other = 0;
+    memset(&tok, 0, sizeof(tok));
+    memset(&sub, 0, sizeof(sub));
+    memset(&other, 0, sizeof(other));
+    memset(&key, 0, sizeof(key));
     memset(&t, 0, sizeof(t));
     memset(&r, 0, sizeof(r));
+    memset(&loc_self, 0, sizeof(loc_self));
+    memset(&loc_other, 0, sizeof(loc_other));
+    memset(kk, 0, sizeof(kk));
+    memset(opc, 0, sizeof(opc));
     if (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
         lc_core_logf(k, "activation: no network key %u", k->cfg.key_id);
-        return;
+        goto done;
     }
     /* the token id's block says which core holds it (§14.3): one core, so
      * a token of a block this core isn't home for is unknown here */
@@ -150,12 +164,15 @@ static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         lc_core_audit(k, LC_CORE_AUDIT_ACT_FAIL, known ? sub.number : NULL, tmid, cell, d);
     } else if (res == LC_SIG_ACT_FRESH) {
         int had_other = k->st.sub_by_tmid(k->st.ctx, tmid, &other) == 0 && !num_eq(other.number, sub.number);
+        had_loc_self = k->st.loc_get(k->st.ctx, sub.number, &loc_self) == 0;
+        had_loc_other = had_other && k->st.loc_get(k->st.ctx, other.number, &loc_other) == 0;
         k->st.begin(k->st.ctx);
         if (had_other) { /* the terminal's previous subscriber loses it */
             other.activated = 0;
             other.tmid = 0;
             other.updated = lc_core_unix(k);
             k->st.sub_put(k->st.ctx, &other);
+            if (had_loc_other) k->st.loc_del(k->st.ctx, other.number);
         }
         memcpy(sub.k, kk, 16);
         memcpy(sub.opc, opc, 16);
@@ -164,20 +181,34 @@ static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         sub.activated = 1;
         sub.updated = lc_core_unix(k);
         k->st.sub_put(k->st.ctx, &sub);
+        if (had_loc_self) k->st.loc_del(k->st.ctx, sub.number); /* wherever it was registered: atomic with the bind */
         tok.used_at = lc_core_unix(k);
         tok.used_by_tmid = tmid;
         k->st.token_put(k->st.ctx, &tok);
         if (k->st.commit(k->st.ctx) != 0) {
             lc_core_logf(k, "activation of %08x: store FAILED, no answer", (unsigned)tmid);
-            return; /* the terminal retries */
+            goto done; /* the terminal retries; no LOC_CANCEL either: nothing actually changed */
         }
-        if (had_other) lc_core_loc_cancel(k, other.number, LC_CORE_CANCEL_REACTIVATED);
-        lc_core_loc_cancel(k, sub.number, LC_CORE_CANCEL_REACTIVATED); /* wherever it was registered */
+        if (had_loc_other) {
+            lc_core_loc_send_cancel(k, other.number, loc_other.cell_id, loc_other.tmid, LC_CORE_CANCEL_REACTIVATED);
+        }
+        if (had_loc_self) {
+            lc_core_loc_send_cancel(k, sub.number, loc_self.cell_id, loc_self.tmid, LC_CORE_CANCEL_REACTIVATED);
+        }
         lc_core_audit(k, LC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, NULL);
     }
-    memset(kk, 0, sizeof(kk));
-    memset(opc, 0, sizeof(opc));
     lc_core_send(k, cell, &r);
+done:
+    lc_sig_wipe(kk, sizeof(kk));
+    lc_sig_wipe(opc, sizeof(opc));
+    lc_sig_wipe(key.sk, sizeof(key.sk));
+    lc_sig_wipe(t.secret, sizeof(t.secret));
+    lc_sig_wipe(t.bound_k, sizeof(t.bound_k));
+    lc_sig_wipe(tok.secret, sizeof(tok.secret));
+    lc_sig_wipe(sub.k, sizeof(sub.k));
+    lc_sig_wipe(sub.opc, sizeof(sub.opc));
+    lc_sig_wipe(other.k, sizeof(other.k));
+    lc_sig_wipe(other.opc, sizeof(other.opc));
 }
 
 /* 0 (and the subscriber) when tmid may have vectors, else the status. */
@@ -189,62 +220,97 @@ static uint8_t av_status(lc_core_t *k, uint32_t tmid, lc_core_sub_t *sub)
     return LC_CORE_AV_OK;
 }
 
-/* §7.2: count vectors with rising SQN, committed (SQN and av_issued) before
- * AV_RES leaves; for RESYNC, SQN from AUTS first (TS 33.102 §6.3.5). */
+/* §7.2: count vectors, computed first (so a crypto failure never touches
+ * the store) and only then committed together (SQN and every av_issued row)
+ * before AV_RES leaves: the store contract now makes a failed put fail the
+ * whole commit, so a full AV table answers UNAVAILABLE instead of sending a
+ * vector no av_issued row backs. For RESYNC, SQN from AUTS first (TS 33.102
+ * §6.3.5): the RAND must be one this core issued to the number, and SQN_HE
+ * only ever moves forward, never back to a replayed (RAND, AUTS). Single
+ * exit: every path wipes the key material it touched. */
 static void answer_av(lc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, unsigned count, const uint8_t *rand,
                       const uint8_t *auts)
 {
     lc_core_msg_t r;
     lc_core_sub_t sub;
+    lc_core_av_issued_t iss[LC_CORE_AV_MAX];
+    uint8_t ms[6];
     memset(&r, 0, sizeof(r));
+    memset(&sub, 0, sizeof(sub));
+    memset(iss, 0, sizeof(iss));
+    memset(ms, 0, sizeof(ms));
     r.type = LC_CORE_AV_RES;
     r.u.av_res.req = req;
     r.u.av_res.tmid = tmid;
     uint8_t st = av_status(k, tmid, &sub);
     int resynced = 0;
     if (st == LC_CORE_AV_OK && auts != NULL) {
-        uint8_t ms[6];
-        if (lc_sig_av_auts(sub.k, sub.opc, rand, auts, ms) != 0) {
+        lc_core_av_issued_t seen;
+        if (k->st.av_get(k->st.ctx, sub.number, rand, &seen) != 0) {
+            st = LC_CORE_AV_AUTH_FAILED;
+            lc_core_audit(k, LC_CORE_AUDIT_AUTH_FAIL, sub.number, tmid, cell, "RAND not issued to this number");
+        } else if (lc_sig_av_auts(sub.k, sub.opc, rand, auts, ms) != 0) {
             st = LC_CORE_AV_AUTH_FAILED;
             lc_core_audit(k, LC_CORE_AUDIT_AUTH_FAIL, sub.number, tmid, cell, "AUTS did not verify");
         } else {
-            sub.sqn = lc_sig_sqn_get(ms);
+            /* TS 33.102 §6.3.5 step 2: SQN_HE only ever moves forward; a
+             * replayed (RAND, AUTS) whose SQN_MS is not ahead of what the
+             * core already holds changes nothing (no rollback). */
+            uint64_t sqn_ms = lc_sig_sqn_get(ms);
+            if (sqn_ms > sub.sqn) sub.sqn = sqn_ms;
             resynced = 1;
         }
     }
     if (st == LC_CORE_AV_OK) {
+        uint64_t sqn = sub.sqn;
+        int ok = 1;
         count = count < 1 ? 1 : count > LC_CORE_AV_MAX ? LC_CORE_AV_MAX : count;
-        k->st.begin(k->st.ctx);
         for (unsigned i = 0; i < count; i++) {
-            lc_core_av_issued_t a;
-            uint8_t sqn[6], rnd[16];
-            sub.sqn++;
-            lc_sig_sqn_put(sqn, sub.sqn);
+            uint8_t sqn6[6], rnd[16];
+            sqn++;
+            lc_sig_sqn_put(sqn6, sqn);
             k->io.random(k->io.ctx, rnd, sizeof(rnd));
-            lc_sig_av_make(sub.k, sub.opc, sqn, rnd, &r.u.av_res.av[i]);
-            memset(&a, 0, sizeof(a));
-            memcpy(a.number, sub.number, LC_SIG_NUMBER_LEN);
-            memcpy(a.rand, rnd, 16);
-            memcpy(a.xres, r.u.av_res.av[i].xres, 8);
-            a.sqn = sub.sqn;
-            a.cell_id = cell;
-            a.issued = lc_core_unix(k);
-            k->st.av_put(k->st.ctx, &a);
+            if (lc_sig_av_make(sub.k, sub.opc, sqn6, rnd, &r.u.av_res.av[i]) != 0) {
+                ok = 0;
+                break;
+            }
+            memcpy(iss[i].number, sub.number, LC_SIG_NUMBER_LEN);
+            memcpy(iss[i].rand, rnd, 16);
+            memcpy(iss[i].xres, r.u.av_res.av[i].xres, 8);
+            iss[i].sqn = sqn;
+            iss[i].cell_id = cell;
+            iss[i].issued = lc_core_unix(k);
         }
-        sub.updated = lc_core_unix(k);
-        k->st.sub_put(k->st.ctx, &sub);
-        if (k->st.commit(k->st.ctx) != 0) {
-            lc_core_logf(k, "vectors for %08x: store FAILED", (unsigned)tmid);
+        if (!ok) {
+            lc_core_logf(k, "vectors for %08x: lc_sig_av_make failed", (unsigned)tmid);
             st = LC_CORE_AV_UNAVAILABLE;
             memset(r.u.av_res.av, 0, sizeof(r.u.av_res.av));
         } else {
-            memcpy(r.u.av_res.number, sub.number, LC_SIG_NUMBER_LEN);
-            r.u.av_res.count = (uint8_t)count;
-            if (resynced) lc_core_audit(k, LC_CORE_AUDIT_RESYNC, sub.number, tmid, cell, NULL);
+            sub.sqn = sqn;
+            sub.updated = lc_core_unix(k);
+            k->st.begin(k->st.ctx);
+            for (unsigned i = 0; i < count; i++) k->st.av_put(k->st.ctx, &iss[i]);
+            k->st.sub_put(k->st.ctx, &sub);
+            if (k->st.commit(k->st.ctx) != 0) {
+                lc_core_logf(k, "vectors for %08x: store FAILED", (unsigned)tmid);
+                st = LC_CORE_AV_UNAVAILABLE;
+                memset(r.u.av_res.av, 0, sizeof(r.u.av_res.av));
+            } else {
+                memcpy(r.u.av_res.number, sub.number, LC_SIG_NUMBER_LEN);
+                r.u.av_res.count = (uint8_t)count;
+                if (resynced) lc_core_audit(k, LC_CORE_AUDIT_RESYNC, sub.number, tmid, cell, NULL);
+            }
         }
     }
     r.u.av_res.status = st;
     lc_core_send(k, cell, &r);
+    lc_sig_wipe(sub.k, sizeof(sub.k));
+    lc_sig_wipe(sub.opc, sizeof(sub.opc));
+    lc_sig_wipe(ms, sizeof(ms));
+    for (unsigned i = 0; i < LC_CORE_AV_MAX; i++) {
+        lc_sig_wipe(r.u.av_res.av[i].ck, sizeof(r.u.av_res.av[i].ck));
+        lc_sig_wipe(r.u.av_res.av[i].ik, sizeof(r.u.av_res.av[i].ik));
+    }
 }
 
 void lc_core_hss_rx(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m)

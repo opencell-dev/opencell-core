@@ -56,6 +56,10 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->list_get(c, 3, &cl2));
     TEST_ASSERT_EQUAL_MEMORY(&cl, &cl2, sizeof(cl));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->list_get(c, 4, &cl2));
+    uint8_t ver = 0; /* the last version written, kept apart from the list (a repair's floor) */
+    TEST_ASSERT_EQUAL_INT(0, st->list_ver_get(c, 3, &ver));
+    TEST_ASSERT_EQUAL_UINT8(2, ver);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->list_ver_get(c, 4, &ver));
 
     /* subscribers: by number; by TMID only while activated */
     oc_core_sub_t s, s2;

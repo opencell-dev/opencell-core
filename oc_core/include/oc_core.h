@@ -46,6 +46,9 @@ typedef struct {
     uint32_t link;
     uint32_t cell_id; /* 0 until its HELLO is accepted */
     uint64_t last_rx, last_tx;
+    uint8_t  cfg_pending;  /* CELL_CFG is owed to this cell: retried from oc_core_tick */
+    uint8_t  cfg_backoff_s; /* the next retry's wait: 1 s doubling to 60 s */
+    uint64_t cfg_retry_at;
 } oc_core_link_t;
 
 /* One leg of a call: a cell and the ref the leg started with. */
@@ -83,13 +86,23 @@ typedef struct {
 int  oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t period_s, const uint8_t random32[32],
                         uint32_t unix_now);
 
-/* 0, or -1 when cfg->key_id is not in the store (or can't be read). Keeps nothing of a previous
- * run but what the store holds (a restart). */
+/* 0, or -1 when cfg->key_id is not in the store (or can't be read). Keeps
+ * nothing of a previous run but what the store holds (a restart). */
 int  oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                   const oc_core_cfg_t *cfg);
 void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_link_down(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
+/* Liveness (PING, dead links), timers, pruning, and CELL_CFG a cell is owed:
+ * a HELLO is acked even when its cell's channel list can't be read then -
+ * the cell serves on the list it has (network-core spec §7.10) - and the
+ * CELL_CFG is retried from here, 1 s doubling to 60 s, never by dropping
+ * the link.
+ *
+ * For the daemons on both ends of a link (oc-core, oc-cell; plan 8 Tasks 6
+ * and 8): the cell's reconnect backoff is reset only after HELLO_ACK *and*
+ * a quiet period connected (30 s), not at HELLO_ACK alone, so a core that
+ * accepts and then drops a link can't drive a 1 s reconnect loop. */
 void oc_core_tick(oc_core_t *k, uint64_t now_us);
 
 /* Admin (plan 8's CLI drives these). A new cell is enabled, in channel-list
@@ -102,12 +115,19 @@ int  oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us);
  * sent in CELL_CFG to every linked cell of the group now and to each after
  * its HELLO_ACK. The core numbers the versions (list->ver is ignored): 1, 2,
  * ... 255, then 1 again. The new version, or -1: list_id 0, more than
- * OC_SIG_CHAN_MAX entries, or the store failed (nothing changed); or -2:
- * stored, but a read failed while pushing it to a linked cell of the group,
- * whose link was dropped - it gets the list when it says HELLO again. The
- * operator's anchors and the unique-anchor check per group come with
- * network core 2. */
+ * OC_SIG_CHAN_MAX entries, or the store failed - including a stored list
+ * that can't be read, whose version the new one must follow (nothing
+ * changed). A linked cell whose own record can't be read gets the list by
+ * oc_core_tick's retry. The operator's anchors and the unique-anchor check
+ * per group come with network core 2. */
 int  oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us);
+/* The operator's repair (the CLI's `chan-list set --force`): as
+ * oc_core_chan_list_set, but a stored list that can't be read (a failing
+ * or malformed row) is replaced, at the version after the last one written
+ * for list_id - which the store keeps apart from the list (list_ver_get) -
+ * so every cell of the group takes it as a change. -1 as above, or when
+ * that last version can't be read either. */
+int  oc_core_chan_list_replace(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us);
 
 /* Subscribers (admin). number NULL: a random free number in the first NANP
  * block this core is home for (numbering-plan.md "Assignment Modes"). 0 with

@@ -152,25 +152,66 @@ void oc_core_link_down(oc_core_t *k, uint32_t link, uint64_t now_us)
     if (cell != 0) cell_gone(k, cell, now_us);
 }
 
-/* CELL_CFG with list group list_id's channel list, if the group has one:
- * 0 (sent, or no list), or -1 when the list could not be read - then the
- * cell's link is dropped, so it re-HELLOs and gets its list then, rather
- * than running on without it. */
-static int send_list(oc_core_t *k, oc_core_link_t *l, uint16_t list_id, uint64_t now)
+/* CELL_CFG owed to a cell that couldn't have it now (a list or cell read
+ * failed): the link stays up - the cell serves on its old list meanwhile
+ * (network-core spec §7.10) - and oc_core_tick retries, 1 s doubling to
+ * 60 s. Logged when the state changes, not at every retry. */
+static void cfg_owed(oc_core_t *k, oc_core_link_t *l, uint64_t now, const char *what)
+{
+    if (!l->cfg_pending) {
+        oc_core_logf(k, "cell %u: CELL_CFG pending (%s read FAILED), retrying", (unsigned)l->cell_id, what);
+        l->cfg_pending = 1;
+        l->cfg_backoff_s = 1;
+    }
+    l->cfg_retry_at = now + (uint64_t)l->cfg_backoff_s * 1000000ull;
+    l->cfg_backoff_s = l->cfg_backoff_s >= 30u ? 60u : (uint8_t)(l->cfg_backoff_s * 2u);
+}
+
+static void cfg_done(oc_core_t *k, oc_core_link_t *l)
+{
+    if (l->cfg_pending) oc_core_logf(k, "cell %u: CELL_CFG no longer pending", (unsigned)l->cell_id);
+    l->cfg_pending = 0;
+}
+
+static void send_cfg(oc_core_t *k, oc_core_link_t *l, const oc_sig_chan_list_t *list)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = OC_CORE_CELL_CFG;
-    if (list_id == 0) return 0;
-    int got = k->st.list_get(k->st.ctx, list_id, &m.u.cell_cfg.list);
+    m.u.cell_cfg.list = *list;
+    send_link(k, l, &m);
+    cfg_done(k, l);
+}
+
+/* CELL_CFG with list group list_id's channel list, if the group has one;
+ * owed (above) if the list can't be read. */
+static void send_list(oc_core_t *k, oc_core_link_t *l, uint16_t list_id, uint64_t now)
+{
+    oc_sig_chan_list_t list;
+    int got = list_id != 0 ? k->st.list_get(k->st.ctx, list_id, &list) : OC_CORE_STORE_NONE;
     if (got == OC_CORE_STORE_FAILED) {
-        oc_core_logf(k, "cell %u: channel list %u read FAILED, link dropped", (unsigned)l->cell_id,
-                     (unsigned)list_id);
-        drop(k, l, now);
-        return -1;
+        cfg_owed(k, l, now, "channel list");
+    } else if (got == 0) {
+        send_cfg(k, l, &list);
+    } else {
+        cfg_done(k, l); /* no list: nothing owed */
     }
-    if (got == 0) send_link(k, l, &m);
-    return 0;
+}
+
+/* oc_core_tick: a retry that is due, from the cell's own record (its group
+ * may have changed meanwhile). */
+static void cfg_retry(oc_core_t *k, oc_core_link_t *l, uint64_t now)
+{
+    oc_core_cell_t c;
+    if (!l->cfg_pending || l->cell_id == 0 || now < l->cfg_retry_at) return;
+    int got = k->st.cell_get(k->st.ctx, l->cell_id, &c);
+    if (got == OC_CORE_STORE_FAILED) {
+        cfg_owed(k, l, now, "cell");
+    } else if (got == 0) {
+        send_list(k, l, c.list_id, now);
+    } else {
+        cfg_done(k, l);
+    }
 }
 
 static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, uint64_t now)
@@ -291,6 +332,7 @@ void oc_core_tick(oc_core_t *k, uint64_t now_us)
             p.type = OC_CORE_PING;
             send_link(k, l, &p);
         }
+        if (l->used) cfg_retry(k, l, now_us);
     }
     if (now_us >= k->prune_at) {
         k->prune_at = now_us + OC_CORE_US(3600);
@@ -329,7 +371,10 @@ int oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us)
     return 0;
 }
 
-int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us)
+/* set, or (force) replace: a list whose stored row can't be read is
+ * replaced at the version after the last one written (list_ver_get, kept
+ * apart from the row), so every cell of the group takes it as a change. */
+static int list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us, int force)
 {
     oc_sig_chan_list_t l, old;
     k->now = now_us;
@@ -338,26 +383,40 @@ int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list
     l.count = list->count;
     memcpy(l.freq_hz, list->freq_hz, sizeof(l.freq_hz[0]) * l.count);
     memcpy(l.flags, list->flags, l.count);
+    uint8_t prev = 0;
     int got = k->st.list_get(k->st.ctx, list_id, &old);
-    if (got == OC_CORE_STORE_FAILED) return -1; /* a version that could go backwards: nothing changed */
-    l.ver = got == 0 && old.ver != 255u ? (uint8_t)(old.ver + 1u) : 1u;
+    if (got == 0) {
+        prev = old.ver;
+    } else if (got == OC_CORE_STORE_FAILED) {
+        /* the version could go backwards: refused, unless forced and the
+         * last version written can be read */
+        if (!force || (got = k->st.list_ver_get(k->st.ctx, list_id, &prev)) == OC_CORE_STORE_FAILED) return -1;
+        if (got != 0) prev = 0;
+        oc_core_logf(k, "channel list %u: unreadable, replaced after version %u", (unsigned)list_id, (unsigned)prev);
+    }
+    l.ver = prev != 0 && prev != 255u ? (uint8_t)(prev + 1u) : 1u;
     if (k->st.list_put(k->st.ctx, list_id, &l) != 0) return -1;
-    int pushed = 1;
-    for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) { /* the list just written: nothing read back */
         oc_core_link_t *ln = &k->links[i];
         oc_core_cell_t c;
         if (!ln->used || ln->cell_id == 0) continue;
         int got_c = k->st.cell_get(k->st.ctx, ln->cell_id, &c);
-        if (got_c == OC_CORE_STORE_FAILED) { /* maybe in the group: it gets its list at its re-HELLO */
-            oc_core_logf(k, "cell %u: cell read FAILED, channel list %u not sent, link dropped",
-                         (unsigned)ln->cell_id, (unsigned)list_id);
-            drop(k, ln, now_us);
-            pushed = 0;
-        } else if (got_c == 0 && c.list_id == list_id && send_list(k, ln, list_id, now_us) != 0) {
-            pushed = 0;
+        if (got_c == OC_CORE_STORE_FAILED) {
+            cfg_owed(k, ln, now_us, "cell"); /* maybe of this group: the retry reads it again */
+        } else if (got_c == 0 && c.list_id == list_id) {
+            send_cfg(k, ln, &l);
         }
     }
-    oc_core_logf(k, "channel list %u: version %u, %u entries%s", (unsigned)list_id, (unsigned)l.ver,
-                 (unsigned)l.count, pushed ? "" : " (not pushed to every cell)");
-    return pushed ? l.ver : -2;
+    oc_core_logf(k, "channel list %u: version %u, %u entries", (unsigned)list_id, (unsigned)l.ver, (unsigned)l.count);
+    return l.ver;
+}
+
+int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us)
+{
+    return list_set(k, list_id, list, now_us, 0);
+}
+
+int oc_core_chan_list_replace(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us)
+{
+    return list_set(k, list_id, list, now_us, 1);
 }

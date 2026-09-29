@@ -574,6 +574,31 @@ static void test_a_wrong_sized_blob_is_a_failed_read(void)
     oc_sql_close(s);
 }
 
+/* The last version written for a list is kept apart from the list's row:
+ * a malformed row does not take it along (the core's repair needs it). */
+static void test_the_last_list_version_outlives_a_malformed_row(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_sig_chan_list_t l, got;
+    memset(&l, 0, sizeof(l));
+    l.count = 1;
+    l.ver = 7;
+    TEST_ASSERT_EQUAL_INT(0, st.list_put(st.ctx, 5, &l));
+    l.ver = 8;
+    TEST_ASSERT_EQUAL_INT(0, st.list_put(st.ctx, 5, &l));
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), "UPDATE chan_list SET entries = zeroblob(3), ver = 1",
+                                                  NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.list_get(st.ctx, 5, &got));
+    uint8_t ver = 0;
+    TEST_ASSERT_EQUAL_INT(0, st.list_ver_get(st.ctx, 5, &ver));
+    TEST_ASSERT_EQUAL_UINT8(8, ver);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.list_ver_get(st.ctx, 6, &ver));
+    oc_sql_close(s);
+}
+
 /* A transaction left open on the connection (both ROLLBACKs failed, say)
  * is rolled back by the next begin, so the store recovers without a
  * restart: nothing of the leftover lands. */
@@ -736,6 +761,7 @@ int main(void)
     RUN_TEST(test_every_get_tells_failed_from_none);
     RUN_TEST(test_a_wrong_sized_blob_is_a_failed_read);
     RUN_TEST(test_begin_clears_a_leftover_transaction);
+    RUN_TEST(test_the_last_list_version_outlives_a_malformed_row);
     RUN_TEST(test_sqn_rises_across_a_core_restart);
     return UNITY_END();
 }

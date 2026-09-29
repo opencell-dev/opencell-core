@@ -143,6 +143,20 @@ static int list_get(void *c, uint16_t list_id, oc_sig_chan_list_t *out)
     return OC_CORE_STORE_NONE;
 }
 
+/* Here the list's own ver: its read hook (OC_CORE_MEM_FAIL_LIST_GET) does
+ * not reach this one, as an unreadable row in oc_sql leaves its version. */
+static int list_ver_get(void *c, uint16_t list_id, uint8_t *ver)
+{
+    if (M(c)->fail_reads & OC_CORE_MEM_FAIL_LIST_VER_GET) return OC_CORE_STORE_FAILED;
+    for (unsigned i = 0; i < D(c)->nlist; i++) {
+        if (D(c)->list_id[i] == list_id) {
+            *ver = D(c)->list[i].ver;
+            return 0;
+        }
+    }
+    return OC_CORE_STORE_NONE;
+}
+
 static int list_put(void *c, uint16_t list_id, const oc_sig_chan_list_t *l)
 {
     if (refuse(c)) return -1;
@@ -422,6 +436,7 @@ oc_core_store_t oc_core_mem_store(oc_core_mem_t *m)
         .cell_put = cell_put,
         .list_get = list_get,
         .list_put = list_put,
+        .list_ver_get = list_ver_get,
         .sub_get = sub_get,
         .sub_by_tmid = sub_by_tmid,
         .sub_put = sub_put,

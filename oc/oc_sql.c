@@ -17,7 +17,9 @@
 /* Schema v1 (network-core spec §5, the tables plan 8 uses; route, block and
  * binding_idx come with plans 10-11). meta holds the master-key check.
  * location keeps the SQN and RAND of the vector that proved it (§19.2,
- * LOC_CANCEL); av_issued_newest answers av_newest_confirmed. */
+ * LOC_CANCEL); av_issued_newest answers av_newest_confirmed. chan_list_ver
+ * keeps the last version written for each list apart from the list (a
+ * trigger, in list_put's own statement), for oc_core_chan_list_replace. */
 static const char SCHEMA_V1[] =
     "CREATE TABLE meta(k TEXT PRIMARY KEY, v BLOB NOT NULL);"
     "CREATE TABLE network(key_id INTEGER PRIMARY KEY, sk_enc BLOB NOT NULL, pk BLOB NOT NULL,"
@@ -38,6 +40,10 @@ static const char SCHEMA_V1[] =
     "CREATE TABLE location(number TEXT PRIMARY KEY, cell_id INTEGER NOT NULL, tmid INTEGER NOT NULL,"
     " expires INTEGER NOT NULL, sqn INTEGER NOT NULL, rand BLOB NOT NULL);"
     "CREATE TABLE chan_list(list_id INTEGER PRIMARY KEY, ver INTEGER NOT NULL, entries BLOB NOT NULL);"
+    "CREATE TABLE chan_list_ver(list_id INTEGER PRIMARY KEY, ver INTEGER NOT NULL);"
+    "CREATE TRIGGER chan_list_ver_keep AFTER INSERT ON chan_list BEGIN"
+    " INSERT INTO chan_list_ver(list_id, ver) VALUES(new.list_id, new.ver)"
+    " ON CONFLICT(list_id) DO UPDATE SET ver = excluded.ver; END;"
     "CREATE TABLE cdr(id INTEGER PRIMARY KEY AUTOINCREMENT, caller TEXT NOT NULL, called TEXT NOT NULL,"
     " cell_a INTEGER NOT NULL, cell_b INTEGER NOT NULL, setup INTEGER NOT NULL, answer INTEGER NOT NULL,"
     " \"end\" INTEGER NOT NULL, cause INTEGER NOT NULL);"
@@ -317,6 +323,17 @@ static int list_get(void *c, uint16_t list_id, oc_sig_chan_list_t *out)
             }
         }
     }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+static int list_ver_get(void *c, uint16_t list_id, uint8_t *ver)
+{
+    oc_sql_t *s = S(c);
+    sqlite3_stmt *st = prep(s, "SELECT ver FROM chan_list_ver WHERE list_id = ?");
+    int b = st != NULL ? sqlite3_bind_int(st, 1, list_id) : SQLITE_ERROR;
+    int rc = get_step(st, b);
+    if (rc == 0) *ver = (uint8_t)sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     return rc;
 }
@@ -893,6 +910,7 @@ oc_core_store_t oc_sql_store(oc_sql_t *s)
         .cell_put = cell_put,
         .list_get = list_get,
         .list_put = list_put,
+        .list_ver_get = list_ver_get,
         .sub_get = sub_get,
         .sub_by_tmid = sub_by_tmid,
         .sub_put = sub_put,

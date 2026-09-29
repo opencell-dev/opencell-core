@@ -52,6 +52,7 @@ typedef struct {
 #define OC_CORE_MEM_FAIL_LIST_GET    64u
 #define OC_CORE_MEM_FAIL_TOKEN_GET   128u
 #define OC_CORE_MEM_FAIL_AV_GET      256u
+#define OC_CORE_MEM_FAIL_LIST_VER_GET 512u
 
 typedef struct {
     oc_core_mem_data_t d;

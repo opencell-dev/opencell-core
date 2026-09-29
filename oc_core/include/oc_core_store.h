@@ -143,6 +143,10 @@ typedef struct {
     /* channel lists, one per list group (channel-list spec §8; list_id 1-65535) */
     int (*list_get)(void *ctx, uint16_t list_id, oc_sig_chan_list_t *out);
     int (*list_put)(void *ctx, uint16_t list_id, const oc_sig_chan_list_t *l); /* insert or replace */
+    /* the version of the list list_put last wrote for list_id, kept apart
+     * from the list itself, so a list that can't be read still has it (the
+     * floor of oc_core_chan_list_replace): 0, NONE or FAILED */
+    int (*list_ver_get)(void *ctx, uint16_t list_id, uint8_t *ver);
     int (*sub_get)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_sub_t *out); /* 0, NONE or FAILED */
     int (*sub_by_tmid)(void *ctx, uint32_t tmid, oc_core_sub_t *out); /* activated, bound to tmid: 0, NONE or FAILED */
     int (*sub_put)(void *ctx, const oc_core_sub_t *s);                /* insert or replace */

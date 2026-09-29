@@ -7,7 +7,12 @@
  * A frame whose length is impossible (0, or more than OC_CORE_FRAME_MAX in
  * all) breaks the stream: oc_conn_read fails and the caller closes. A frame
  * of a good length that does not decode (a type this build does not know, a
- * bad number) is dropped and counted in bad, and the link stays up. */
+ * bad number) is dropped and counted in bad, and the link stays up.
+ *
+ * Bytes are wiped once done with (oc_sig_wipe): a frame's encoding once
+ * queued, queued bytes once sent, read bytes once handed on, and both
+ * buffers at close - the transport's part of oc_core.h's rule for AV_RES
+ * frames (CK, IK). */
 #ifndef OC_CONN_H
 #define OC_CONN_H
 

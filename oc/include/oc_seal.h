@@ -28,8 +28,10 @@ int oc_unseal(const uint8_t key[32], const char *table, const char *column, cons
               const uint8_t *in, size_t in_n, uint8_t *pt);
 /* The master key from path: a regular file, exactly 32 bytes, owned by the
  * caller's effective user (or root) and unreadable by group or others (a
- * systemd credential, or --key-file on the bench). 0, or -1 with the reason
- * in err. */
+ * systemd credential, or --key-file on the bench). A POSIX ACL may give the
+ * caller's effective user read access and no one else: that is how systemd
+ * hands a root-owned 0400 credential to a service's user on tmpfs (the
+ * mode then shows 0440, the ACL mask). 0, or -1 with the reason in err. */
 int oc_key_load(const char *path, uint8_t key[32], char *err, size_t cap);
 
 /* Internal: true if a file owned by file_uid may be used by a process whose

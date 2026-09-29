@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include "oc_seal.h"
@@ -173,6 +174,74 @@ static void test_key_file_rules(void)
     TEST_ASSERT_NOT_NULL(strstr(err, "No such file"));
 }
 
+/* A POSIX ACL as the kernel takes it (system.posix_acl_access): version 2,
+ * then (tag, perm, id) entries, little-endian, in the kernel's order. */
+static void set_acl(const char *path, const uint16_t (*e)[2], const uint32_t *id, size_t n)
+{
+    uint8_t b[4 + 8 * 8];
+    TEST_ASSERT_TRUE(n <= 8);
+    b[0] = 2;
+    b[1] = b[2] = b[3] = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t *q = b + 4 + 8 * i;
+        q[0] = (uint8_t)e[i][0];
+        q[1] = (uint8_t)(e[i][0] >> 8);
+        q[2] = (uint8_t)e[i][1];
+        q[3] = (uint8_t)(e[i][1] >> 8);
+        for (int k = 0; k < 4; k++) q[4 + k] = (uint8_t)(id[i] >> (8 * k));
+    }
+    if (setxattr(path, "system.posix_acl_access", b, 4 + 8 * n, 0) != 0) {
+        TEST_IGNORE_MESSAGE("no POSIX ACLs on this file system");
+    }
+}
+
+enum { A_UOBJ = 1, A_USER = 2, A_GOBJ = 4, A_GROUP = 8, A_MASK = 0x10, A_OTHER = 0x20 };
+#define NOID 0xffffffffu
+
+/* systemd's LoadCredential= on a file system with ACLs (tmpfs, where
+ * /run/credentials lives) leaves the credential owned by root, mode 0400,
+ * with an ACL entry giving the service's user read access - which makes
+ * stat() report the ACL mask as the group bits (0440). That file is the
+ * master key the unit hands oc-core, so it is taken; an ACL that lets
+ * anyone else read is not. (Here the named entry is for this test's own
+ * uid on its own file: the kernel reports the same 0440.) */
+static void test_key_file_systemd_credential_acl(void)
+{
+    char path[300], err[200];
+    uint8_t k[32];
+    uint32_t me = (uint32_t)geteuid(), other = me == 65534u ? 65533u : 65534u;
+    snprintf(path, sizeof(path), "%s/master.key", g_dir);
+
+    write_key(path, 32, 0400);
+    const uint16_t cred[][2] = { { A_UOBJ, 4 }, { A_USER, 4 }, { A_GOBJ, 0 }, { A_MASK, 4 }, { A_OTHER, 0 } };
+    const uint32_t cred_id[] = { NOID, me, NOID, NOID, NOID };
+    set_acl(path, cred, cred_id, 5);
+    struct stat st;
+    TEST_ASSERT_EQUAL_INT(0, stat(path, &st));
+    TEST_ASSERT_EQUAL_UINT(0440, st.st_mode & 0777); /* what oc-core sees under systemd */
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_key_load(path, k, err, sizeof(err)), err);
+    TEST_ASSERT_EQUAL_MEMORY(KEY, k, 32);
+
+    write_key(path, 32, 0400);
+    const uint32_t other_id[] = { NOID, other, NOID, NOID, NOID };
+    set_acl(path, cred, other_id, 5);
+    TEST_ASSERT_EQUAL_INT(-1, oc_key_load(path, k, err, sizeof(err)));
+    TEST_ASSERT_NOT_NULL(strstr(err, "ACL"));
+
+    write_key(path, 32, 0400);
+    const uint16_t grp[][2] = { { A_UOBJ, 4 }, { A_USER, 4 }, { A_GOBJ, 4 }, { A_MASK, 4 }, { A_OTHER, 0 } };
+    set_acl(path, grp, cred_id, 5);
+    TEST_ASSERT_EQUAL_INT(-1, oc_key_load(path, k, err, sizeof(err)));
+    TEST_ASSERT_NOT_NULL(strstr(err, "ACL"));
+
+    write_key(path, 32, 0400);
+    const uint16_t ngrp[][2] = { { A_UOBJ, 4 }, { A_USER, 4 }, { A_GOBJ, 0 }, { A_GROUP, 4 }, { A_MASK, 4 }, { A_OTHER, 0 } };
+    const uint32_t ngrp_id[] = { NOID, me, NOID, (uint32_t)getegid(), NOID, NOID };
+    set_acl(path, ngrp, ngrp_id, 6);
+    TEST_ASSERT_EQUAL_INT(-1, oc_key_load(path, k, err, sizeof(err)));
+    TEST_ASSERT_NOT_NULL(strstr(err, "ACL"));
+}
+
 /* A FIFO must be refused, and refused promptly: a blocking open() (no
  * writer on the other end) would hang the daemon at startup. This is the
  * test that proves the O_NONBLOCK added to oc_key_load's open() — without
@@ -219,6 +288,7 @@ int main(void)
     RUN_TEST(test_seal_refuses_n_over_max);
     RUN_TEST(test_seal_aad_pk_n_cannot_wrap);
     RUN_TEST(test_key_file_rules);
+    RUN_TEST(test_key_file_systemd_credential_acl);
     RUN_TEST(test_key_file_refuses_fifo);
     RUN_TEST(test_key_file_refuses_directory);
     RUN_TEST(test_owner_check_helper);

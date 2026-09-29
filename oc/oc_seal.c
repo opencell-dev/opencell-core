@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <openssl/evp.h>
@@ -105,6 +106,43 @@ static ssize_t read_full(int fd, uint8_t *buf, size_t cap)
     return (ssize_t)got;
 }
 
+/* A key file's POSIX ACL (system.posix_acl_access), when it has one: 1 if
+ * it lets no one read the file but its owner and self (the entries of the
+ * owning group, of named groups and of others grant nothing; named users
+ * other than self get nothing), 0 if it lets someone else in, -1 if there
+ * is no ACL (the mode bits are then the whole truth). With an ACL, the
+ * mode's group bits are the ACL mask, so the credential systemd's
+ * LoadCredential= makes on tmpfs - root's, 0400, plus "user:<service>:r" -
+ * shows as 0440 and is only told from a readable file here. The xattr is
+ * version 2, then (tag 2, perm 2, id 4) entries, little-endian. */
+static int acl_only_self(int fd, uid_t self)
+{
+    uint8_t b[4 + 8 * 32];
+    ssize_t n = fgetxattr(fd, "system.posix_acl_access", b, sizeof(b));
+    if (n < 0) return errno == ERANGE ? 0 : -1; /* ERANGE: more entries than any key file needs */
+    if (n < 4 || (n - 4) % 8 != 0 || b[0] != 2 || b[1] != 0 || b[2] != 0 || b[3] != 0) return 0;
+    for (ssize_t i = 4; i < n; i += 8) {
+        unsigned tag = (unsigned)b[i] | (unsigned)b[i + 1] << 8, perm = (unsigned)b[i + 2] | (unsigned)b[i + 3] << 8;
+        uint32_t id = (uint32_t)b[i + 4] | (uint32_t)b[i + 5] << 8 | (uint32_t)b[i + 6] << 16 | (uint32_t)b[i + 7] << 24;
+        switch (tag) {
+        case 0x01: /* ACL_USER_OBJ: the owner (root or self: checked apart) */
+        case 0x10: /* ACL_MASK: only narrows the others */
+            break;
+        case 0x02: /* ACL_USER */
+            if (perm != 0 && id != (uint32_t)self) return 0;
+            break;
+        case 0x04: /* ACL_GROUP_OBJ */
+        case 0x08: /* ACL_GROUP */
+        case 0x20: /* ACL_OTHER */
+            if (perm != 0) return 0;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int oc_key_load(const char *path, uint8_t key[32], char *err, size_t cap)
 {
     struct stat st;
@@ -129,8 +167,15 @@ int oc_key_load(const char *path, uint8_t key[32], char *err, size_t cap)
         close(fd);
         return -1;
     }
-    if ((st.st_mode & 077) != 0) {
+    int acl = (st.st_mode & 077) != 0 ? acl_only_self(fd, geteuid()) : 1;
+    if (acl == -1) {
         snprintf(err, cap, "%s: accessible by group or others (mode %03o): chmod 0400 it", path,
+                 (unsigned)(st.st_mode & 0777));
+        close(fd);
+        return -1;
+    }
+    if (acl == 0) {
+        snprintf(err, cap, "%s: accessible by group or others (mode %03o, ACL): setfacl -b and chmod 0400 it", path,
                  (unsigned)(st.st_mode & 0777));
         close(fd);
         return -1;

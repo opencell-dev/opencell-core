@@ -10,6 +10,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "oc_sig_keys.h" /* oc_sig_wipe */
+
 static void nonblock(int fd)
 {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
@@ -27,6 +29,8 @@ void oc_conn_close(oc_conn_t *c)
 {
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
+    oc_sig_wipe(c->rx, sizeof(c->rx)); /* what was read or queued is gone with the link, key material too */
+    oc_sig_wipe(c->tx, sizeof(c->tx));
     c->rn = c->tn = 0;
 }
 
@@ -57,6 +61,7 @@ int oc_conn_read(oc_conn_t *c, oc_conn_rx_fn cb, void *ctx)
             off += len + 2u;
         }
         memmove(c->rx, c->rx + off, c->rn - off);
+        oc_sig_wipe(c->rx + c->rn - off, off); /* the frames handed on */
         c->rn -= off;
     }
 }
@@ -72,6 +77,7 @@ int oc_conn_flush(oc_conn_t *c)
             return -1;
         }
         memmove(c->tx, c->tx + w, c->tn - (size_t)w);
+        oc_sig_wipe(c->tx + c->tn - (size_t)w, (size_t)w); /* the bytes sent (an AV_RES's CK and IK, say) */
         c->tn -= (size_t)w;
     }
     return 0;
@@ -82,8 +88,12 @@ int oc_conn_send(oc_conn_t *c, const oc_core_msg_t *m)
     uint8_t f[OC_CORE_FRAME_MAX];
     if (c->fd < 0) return -1;
     size_t n = oc_core_encode(m, f, sizeof(f));
-    if (n == 0 || c->tn + n > sizeof(c->tx)) return -1;
+    if (n == 0 || c->tn + n > sizeof(c->tx)) {
+        oc_sig_wipe(f, sizeof(f));
+        return -1;
+    }
     memcpy(c->tx + c->tn, f, n);
+    oc_sig_wipe(f, sizeof(f));
     c->tn += n;
     return oc_conn_flush(c);
 }

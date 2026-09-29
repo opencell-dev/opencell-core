@@ -13,6 +13,7 @@
 
 #include "oc_conn.h"
 #include "oc_kv.h"
+#include "oc_log.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -161,6 +162,67 @@ static void test_a_full_queue_refuses(void)
     close(raw);
 }
 
+static int all_zero(const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] != 0) return 0;
+    }
+    return 1;
+}
+
+/* An AV_RES frame carries CK and IK (oc_core.h): the transport wipes what
+ * it encoded, sent and read, not merely forgets it - a sent frame's bytes,
+ * a queue closed with frames in it, a frame read. */
+static void test_frames_are_wiped_once_done(void)
+{
+    oc_conn_t a, b;
+    int raw;
+    pair(&a, &raw);
+    oc_conn_init(&b, raw);
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_MEDIA;
+    m.u.media.len = OC_SIG_APP_MAX;
+    memset(m.u.media.data, 0x5a, sizeof(m.u.media.data));
+    TEST_ASSERT_EQUAL_INT(0, oc_conn_send(&a, &m));
+    TEST_ASSERT_EQUAL_UINT(0, a.tn);
+    TEST_ASSERT_TRUE(all_zero(a.tx, sizeof(a.tx)));
+    TEST_ASSERT_EQUAL_INT(0, oc_conn_read(&b, on_rx, NULL));
+    TEST_ASSERT_EQUAL_INT(1, ngot);
+    TEST_ASSERT_EQUAL_UINT(0, b.rn);
+    TEST_ASSERT_TRUE(all_zero(b.rx, sizeof(b.rx)));
+    int rc = 0;
+    for (int i = 0; i < 100000 && rc == 0; i++) rc = oc_conn_send(&a, &m); /* b reads no more */
+    TEST_ASSERT_TRUE(a.tn > 0);
+    oc_conn_close(&a);
+    TEST_ASSERT_TRUE(all_zero(a.tx, sizeof(a.tx)));
+    oc_conn_close(&b);
+}
+
+/* One oc_log call is one journal line: text from a peer can't start a line
+ * of its own ("\n<3>...") or carry terminal controls. */
+static void test_a_log_line_cannot_be_split(void)
+{
+    char path[] = "/tmp/oc_log_test_XXXXXX", got_line[256];
+    int f = mkstemp(path);
+    TEST_ASSERT_TRUE(f >= 0);
+    unlink(path);
+    fflush(stderr);
+    int saved = dup(2);
+    TEST_ASSERT_TRUE(saved >= 0);
+    TEST_ASSERT_EQUAL_INT(2, dup2(f, 2));
+    oc_log(OC_LOG_INFO, "admin: %s", "status\n<3>oc-core: forged\r\x1b[2J\x7f");
+    oc_log_line(NULL, "lib\nline");
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    ssize_t n = pread(f, got_line, sizeof(got_line) - 1u, 0);
+    close(f);
+    TEST_ASSERT_TRUE(n > 0);
+    got_line[n] = '\0';
+    TEST_ASSERT_EQUAL_STRING("<6>admin: status?<3>oc-core: forged??[2J?\n<6>lib?line\n", got_line);
+}
+
 static void test_unix_listen_and_connect(void)
 {
     char path[] = "/tmp/oc_conn_test_XXXXXX";
@@ -239,6 +301,8 @@ int main(void)
     RUN_TEST(test_an_impossible_length_breaks_the_link);
     RUN_TEST(test_rx_callback_may_close);
     RUN_TEST(test_a_full_queue_refuses);
+    RUN_TEST(test_frames_are_wiped_once_done);
+    RUN_TEST(test_a_log_line_cannot_be_split);
     RUN_TEST(test_unix_listen_and_connect);
     RUN_TEST(test_backoff);
     RUN_TEST(test_kv);

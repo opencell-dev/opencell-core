@@ -511,6 +511,22 @@ static void test_audit_detail_drops_c1_controls(void)
     done();
 }
 
+/* Offline under sudo: the audit keeps the operator behind uid 0 (SUDO_UID,
+ * taken before the process gives up root). */
+static void test_audit_names_the_operator_behind_sudo(void)
+{
+    world();
+    adm.uid = 0;
+    adm.sudo_uid = 1000;
+    TEST_ASSERT_EQUAL_INT(0, run("status"));
+    adm.sudo_uid = 0;
+    TEST_ASSERT_EQUAL_INT(0, run("status"));
+    TEST_ASSERT_EQUAL_INT(0, run("audit 3"));
+    HAS("u0 (sudo u1000) status");
+    HAS("u0 status");
+    done();
+}
+
 static void write_raw(const char *data, size_t n)
 {
     strcpy(hss, "/tmp/oc_admin_hss_XXXXXX");
@@ -646,6 +662,7 @@ int main(void)
     RUN_TEST(test_cells_locations_and_calls);
     RUN_TEST(test_an_allocation_failure_is_a_failure);
     RUN_TEST(test_audit_detail_drops_c1_controls);
+    RUN_TEST(test_audit_names_the_operator_behind_sudo);
     RUN_TEST(test_import_parser_cases);
     RUN_TEST(test_import_takes_the_write_lock_first);
     RUN_TEST(test_first_setup_and_subscribers);

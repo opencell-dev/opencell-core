@@ -57,33 +57,6 @@ void oc_buf_free(oc_buf_t *b)
 
 /* ---- helpers ---- */
 
-/* Text from a peer, made safe to store and print: C0 controls, DEL, C1
- * controls (U+0080-U+009F as UTF-8) and bytes that are not UTF-8 (a raw
- * 0x80-0x9f among them, or a sequence cut short) become '?'. Returns
- * whether anything changed. */
-static int clean_text(char *s)
-{
-    int changed = 0;
-    for (unsigned char *p = (unsigned char *)s; *p != '\0';) {
-        unsigned c = *p;
-        size_t len = 1;
-        int ok = c >= 0x20 && c != 0x7f;
-        if (ok && c >= 0x80) {
-            len = c >= 0xc2 && c <= 0xdf ? 2u : c >= 0xe0 && c <= 0xef ? 3u : c >= 0xf0 && c <= 0xf4 ? 4u : 0u;
-            ok = len != 0;
-            for (size_t i = 1; ok && i < len; i++) ok = (p[i] & 0xc0) == 0x80;
-            if (ok && c == 0xc2 && p[1] <= 0x9f) ok = 0; /* C1 */
-            if (!ok) len = 1;
-        }
-        if (!ok) {
-            *p = '?';
-            changed = 1;
-        }
-        p += len;
-    }
-    return changed;
-}
-
 static const char USAGE[] =
     "commands: status | net init [--period S] | cell add ID NAME [--mode part15|part97] [--list N]\n"
     "  | cell mode ID part15|part97 | cell revoke ID | cell list | sub add [NUMBER]\n"
@@ -371,7 +344,7 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         if (ok) {
             char name[sizeof(c.name)];
             snprintf(name, sizeof(name), "%s", argv[3]);
-            ok = !clean_text(name);
+            ok = !oc_log_clean(name);
         }
         if (!ok) {
             oc_buf_printf(o, "cell name '%s': 1-%zu printable characters\n", argv[3], sizeof(c.name) - 1u);
@@ -729,8 +702,9 @@ int oc_chan_parse(const char *text, oc_sig_chan_list_t *out, char *err, size_t c
 
 /* ---- dispatch and audit ---- */
 
-/* The record of one command: "u<uid> [(refused)|(usage)] <words>", cut to
- * the detail's size, a peer's control characters shown as '?' (clean_text),
+/* The record of one command: "u<uid> [(sudo u<uid>)] [(refused)|(usage)]
+ * <words>", cut to the detail's size, a peer's control characters shown as
+ * '?' (oc_log_clean),
  * with the subscriber's number in its own column when the command named or
  * picked one. */
 static void audit(oc_admin_t *a, int argc, char **argv, int rc, oc_buf_t *out)
@@ -741,12 +715,13 @@ static void audit(oc_admin_t *a, int argc, char **argv, int rc, oc_buf_t *out)
     r.ts = (uint32_t)time(NULL);
     r.event = OC_CORE_AUDIT_ADMIN;
     memcpy(r.number, a->audit_number, OC_SIG_NUMBER_LEN); /* all zero: none (NULL in the column) */
-    int n = snprintf(r.detail, sizeof(r.detail), "u%u%s", a->uid,
-                     rc == 0 ? "" : rc == 2 ? " (usage)" : " (refused)");
+    int n = snprintf(r.detail, sizeof(r.detail), "u%u", a->uid);
+    if (a->sudo_uid != 0) n += snprintf(r.detail + n, sizeof(r.detail) - (size_t)n, " (sudo u%u)", a->sudo_uid);
+    n += snprintf(r.detail + n, sizeof(r.detail) - (size_t)n, "%s", rc == 0 ? "" : rc == 2 ? " (usage)" : " (refused)");
     for (int i = 0; i < argc && n > 0 && (size_t)n < sizeof(r.detail); i++) {
         n += snprintf(r.detail + n, sizeof(r.detail) - (size_t)n, " %s", argv[i]);
     }
-    clean_text(r.detail);
+    oc_log_clean(r.detail);
     if (st.audit_add(st.ctx, &r) != 0) {
         oc_log(OC_LOG_ERR, "admin: audit write FAILED");
         oc_buf_printf(out, "WARNING: store error: this command's audit record was not written\n");

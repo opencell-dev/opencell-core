@@ -1,0 +1,12 @@
+# /etc/opencell/oc-core.conf: the network core (network-core spec §4.2).
+# key = value; '#' starts a comment. An unknown key stops oc-core.
+core_id = 1
+key_id = 1
+echo = +883160655500100
+# PREFIX INDEX: a numbering block this core is home for (one line each)
+block = 8831606 1
+db = /var/lib/opencell/core/core.db
+cell_socket = /run/opencell/core.sock
+cell_group = oc-cell
+admin_socket = /run/opencell/admin.sock
+admin_group = oc-admin

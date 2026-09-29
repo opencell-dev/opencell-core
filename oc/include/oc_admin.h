@@ -4,10 +4,10 @@
  * through oc_core and the store, so a disable in the daemon sends its
  * LOC_CANCEL at once. Every command - done, refused, failed or not a
  * command at all - is written to the audit log (event OC_CORE_AUDIT_ADMIN,
- * "u<uid> [(refused)|(usage)] <command line>", with the subscriber's number
- * in the record's number column for sub commands; C0 and C1 control
- * characters and bytes that are not UTF-8 shown as '?'). An output buffer
- * that could not grow (oc_buf_t.err) makes the command's result 1.
+ * "u<uid> [(sudo u<uid>)] [(refused)|(usage)] <command line>", with the
+ * subscriber's number in the record's number column for sub commands; C0
+ * and C1 control characters and bytes that are not UTF-8 shown as '?'). An
+ * output buffer that could not grow (oc_buf_t.err) makes the command's result 1.
  *
  *   status
  *   net init [--period S]                  the network key pair (first setup)
@@ -58,9 +58,14 @@ typedef struct {
     void    *ctx;
     /* who asked, for the audit record: the admin socket's peer uid
      * (SO_PEERCRED; who may connect at all is the socket's mode, 0660
-     * root:oc-admin, spec §17.1), or getuid() offline. Recorded only:
+     * root:oc-admin, spec §17.1), or offline getuid(), taken before the
+     * process becomes the database's owner. Recorded only:
      * nothing here grants or refuses by it. */
     uint32_t uid;
+    /* offline as root under sudo: SUDO_UID, the operator behind uid 0,
+     * recorded as "u0 (sudo u<N>)"; 0: none. As the environment claims it:
+     * recorded only. */
+    uint32_t sudo_uid;
     /* private */
     oc_core_t own;
     int       have_own;

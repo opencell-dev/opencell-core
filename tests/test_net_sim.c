@@ -361,6 +361,155 @@ static void test_a_local_call_sends_the_core_nothing(void)
     for (unsigned k = 0; k < sizeof(call_types); k++) TEST_ASSERT_EQUAL_UINT(0, to_core[0][call_types[k]]);
 }
 
+/* T0 on cell 1 calls T1 on cell 2: ring, answer, app data both ways,
+ * hang-up by the caller; then again, hung up by the callee. */
+static void test_cross_cell_call(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    const uint8_t *in = event(&TERM[1], LC_SIG_EV_INCOMING);
+    TEST_ASSERT_NOT_NULL(in);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(TERM[0].number, in + 5, LC_SIG_NUMBER_LEN); /* caller id across cells */
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_RINGING_OUT, state(0));
+    press(1, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(1));
+    talk(0, "HELLO FROM CELL 1");
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_UINT8(17, TERM[1].app_n);
+    TEST_ASSERT_EQUAL_MEMORY("HELLO FROM CELL 1", TERM[1].app, 17);
+    talk(1, "HI");
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_MEMORY("HI", TERM[0].app, 2);
+    press(0, LC_SIG_CMD_HANGUP);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NORMAL, ended(1));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(1));
+
+    forget_events();
+    dial(0, "+883-1-606-555-01231");
+    run_ms(3000);
+    press(1, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    press(1, LC_SIG_CMD_HANGUP); /* the callee hangs up this time */
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NORMAL, ended(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
+    const lc_core_cdr_t *c = &SMEM.d.cdr[(SMEM.d.ncdr - 1u) % LC_CORE_MEM_LOG];
+    TEST_ASSERT_EQUAL_UINT32(1, c->cell_a);
+    TEST_ASSERT_EQUAL_UINT32(2, c->cell_b);
+    TEST_ASSERT_NOT_EQUAL(0, c->answer);
+}
+
+/* Two terminals on one cell: switched there, as in plan 5; the core sees
+ * no call. */
+static void test_same_cell_call_stays_local(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(2, 0);
+    unsigned cdrs = SMEM.d.ncdr;
+    dial(0, "606-555-01232");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[2], LC_SIG_EV_INCOMING));
+    press(2, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    talk(2, "LOCAL");
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_MEMORY("LOCAL", TERM[0].app, 5);
+    press(0, LC_SIG_CMD_HANGUP);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NORMAL, ended(2));
+    TEST_ASSERT_EQUAL_UINT(cdrs, SMEM.d.ncdr);
+}
+
+static void test_reject_busy_unreachable_no_answer(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    registered_on(2, 1);
+
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    press(1, LC_SIG_CMD_REJECT);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_REJECTED, ended(0));
+
+    forget_events(); /* T1 is in a local call with T2 on cell 2: busy */
+    dial(2, "606-555-01231");
+    run_ms(3000);
+    press(1, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(1));
+    dial(0, "606-555-01231");
+    run_ms(4000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_BUSY, ended(0));
+    press(2, LC_SIG_CMD_HANGUP);
+    run_ms(3000);
+
+    forget_events();
+    dial(0, "606-555-01239"); /* no such subscriber */
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_UNREACHABLE, ended(0));
+    forget_events();
+    dial(0, "606-555-01233"); /* a subscriber registered nowhere */
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_UNREACHABLE, ended(0));
+
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(65000); /* the callee's cell gives up after 60 s of ringing */
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NO_ANSWER, ended(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(1));
+}
+
+/* Review Focus 3: T0 and T1, on different cells, dial each other at the
+ * same moment: each offer finds the callee busy placing its own call, and
+ * both calls end busy; nobody is left ringing. */
+static void test_both_dial_each_other_at_once(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    forget_events();
+    dial(0, "606-555-01231");
+    dial(1, "606-555-01230");
+    run_ms(5000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_BUSY, ended(0));
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_BUSY, ended(1));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(1));
+    TEST_ASSERT_NULL(event(&TERM[0], LC_SIG_EV_INCOMING));
+    TEST_ASSERT_NULL(event(&TERM[1], LC_SIG_EV_INCOMING));
+}
+
+static void test_echo_service(void)
+{
+    sim_world();
+    registered_on(0, 2);
+    forget_events();
+    dial(0, "606-555-0100");
+    run_ms(2000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_RINGING_OUT, state(0));
+    run_ms(3000); /* it answers after 3 s */
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(0));
+    talk(0, "ECHO?");
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_MEMORY("ECHO?", TERM[0].app, 5);
+    press(0, LC_SIG_CMD_HANGUP);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -374,5 +523,10 @@ int main(void)
     RUN_TEST(test_a_replayed_act_req_leaves_the_terminal_registered);
     RUN_TEST(test_a_late_cancel_spares_a_newer_registration);
     RUN_TEST(test_the_later_vector_keeps_the_number);
+    RUN_TEST(test_cross_cell_call);
+    RUN_TEST(test_same_cell_call_stays_local);
+    RUN_TEST(test_reject_busy_unreachable_no_answer);
+    RUN_TEST(test_both_dial_each_other_at_once);
+    RUN_TEST(test_echo_service);
     return UNITY_END();
 }

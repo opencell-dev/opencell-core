@@ -332,8 +332,15 @@ static void n_call(void *ctx, const lc_sig_net_call_ev_t *e)
         return;
     case LC_SIG_NET_ENDED:
         if (l != NULL) {
+            /* the same cause on the other leg - except that an MT leg set up
+             * here and then ended "unreachable" (its SETUP_IND expired: a
+             * lost page) is a link lost, not "no such session here": to the
+             * core, cause 4 on an offer's leg means the location is stale,
+             * and it would forget one that the terminal and this cell still
+             * hold. Only on_offer's immediate answer says 4 (§7.4 step 3). */
+            uint8_t cause = l->mt && e->cause == LC_SIG_CAUSE_UNREACHABLE ? LC_SIG_CAUSE_LINK_LOST : e->cause;
             l->used = 0;
-            call_msg(c, LC_CORE_CALL_RELEASE, l->ref, e->cause); /* the same cause on the other leg */
+            call_msg(c, LC_CORE_CALL_RELEASE, l->ref, cause);
         }
         return;
     default: /* LOCAL: switched here, nothing for the core */
@@ -445,10 +452,12 @@ static void on_offer(lc_cell_t *c, const lc_core_msg_t *m)
     uint32_t cid = 0;
     uint32_t ref = m->u.call_offer.call_ref;
     int r = lc_sig_net_call_in(&c->net, m->u.call_offer.callee, m->u.call_offer.caller, c->now, &cid);
-    if (r == 0 && leg_new(c, cid, ref, tmid_of_call(c, cid)) == NULL) { /* no room for the leg */
+    lc_cell_leg_t *l = r == 0 ? leg_new(c, cid, ref, tmid_of_call(c, cid)) : NULL;
+    if (r == 0 && l == NULL) { /* no room for the leg */
         lc_sig_net_peer_release(&c->net, cid, LC_SIG_CAUSE_NET_FAILURE, c->now);
         r = LC_SIG_NET_IN_UNREACHABLE;
     }
+    if (l != NULL) l->mt = 1;
     if (r == LC_SIG_NET_IN_BUSY) call_msg(c, LC_CORE_CALL_RELEASE, ref, LC_SIG_CAUSE_BUSY);
     if (r == LC_SIG_NET_IN_UNREACHABLE) call_msg(c, LC_CORE_CALL_RELEASE, ref, LC_SIG_CAUSE_UNREACHABLE);
 }

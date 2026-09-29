@@ -909,6 +909,52 @@ static void test_silent_callee_cell_times_out(void)
     TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(1)); /* its ringing leg released too */
 }
 
+/* Final review I1: a page that is lost is not a stale location. T1 is
+ * registered on cell 2, but its UL is lost for about 4 s while T0 on cell 1
+ * calls it: cell 2's SETUP_IND expires and its MT leg ends. The cell tells
+ * the core the link was lost (cause 6), not "no such session here" (4), so
+ * the core keeps T1's location; once T1 is heard again, both can call each
+ * other across the cells. */
+static void test_a_lost_page_keeps_the_callees_location(void)
+{
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    forget_events();
+    TERM[1].ul_lost = 1;
+    dial(0, "606-555-01231");
+    TEST_ASSERT_TRUE(run_until_event(0, LC_SIG_EV_ENDED, 9000)); /* before the core's own 10 s */
+    TEST_ASSERT_NOT_EQUAL(LC_SIG_CAUSE_UNREACHABLE, ended(0));
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_LINK_LOST, ended(0));
+    TEST_ASSERT_EQUAL_UINT32(2, located(1)); /* the core still knows where T1 is */
+    TERM[1].ul_lost = 0;
+    run_ms(65000); /* T1 stops ringing a call its cell has forgotten */
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(1));
+    TEST_ASSERT_EQUAL_UINT32(2, located(1));
+
+    forget_events();
+    dial(1, "606-555-01230");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[0], LC_SIG_EV_INCOMING));
+    press(0, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(1));
+    press(1, LC_SIG_CMD_HANGUP);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NORMAL, ended(0));
+
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    TEST_ASSERT_NOT_NULL(event(&TERM[1], LC_SIG_EV_INCOMING));
+    press(1, LC_SIG_CMD_ANSWER);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_IN_CALL, state(0));
+    press(0, LC_SIG_CMD_HANGUP);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NORMAL, ended(1));
+}
+
 /* Channel-list spec §7-8: the core's list for group 1 reaches cells 1 and 2
  * (CELL_CFG), and each pushes it to its terminals after REG_ACK. A change
  * reaches the cells at once and a terminal when it asks (a config service
@@ -986,5 +1032,6 @@ int main(void)
     RUN_TEST(test_rogue_cell_cannot_pull_a_subscriber);
     RUN_TEST(test_rogue_cell_cannot_replay_its_own_older_claim);
     RUN_TEST(test_silent_callee_cell_times_out);
+    RUN_TEST(test_a_lost_page_keeps_the_callees_location);
     return UNITY_END();
 }

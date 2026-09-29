@@ -47,17 +47,6 @@ void lc_core_loc_send_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LE
     lc_core_audit(k, LC_CORE_AUDIT_LOC_CANCEL, number, tmid, cell_id, d);
 }
 
-void lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint8_t cause)
-{
-    lc_core_loc_t l;
-    if (k->st.loc_get(k->st.ctx, number, &l) != 0) return;
-    if (k->st.loc_del(k->st.ctx, number) != 0) {
-        lc_core_logf(k, "cell %u: LOC_CANCEL: location delete failed", (unsigned)l.cell_id);
-        return; /* the location is still there: nothing was actually cancelled */
-    }
-    lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, cause, cause == LC_CORE_CANCEL_MOVED ? l.rand : NULL, NULL);
-}
-
 /* §7.7-7.8, §8, §19. Single exit: every path wipes what it read. */
 static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
 {

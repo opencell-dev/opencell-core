@@ -6,7 +6,12 @@
  * every live registration after each HELLO_ACK, and releases every
  * cross-cell leg (cause 5) when the link to the core drops. Portable C11
  * with no OS calls: oc-cell (plan 8) adds the radio backend and the
- * transport; the multi-cell simulation drives it directly. */
+ * transport; the multi-cell simulation drives it directly.
+ *
+ * Key material in frames: an AV_RES from the core carries each vector's CK
+ * and IK. The transport must wipe every buffer it received, decoded or
+ * queued an AV_RES frame in (lc_sig_wipe) once lc_cell_core_rx returns, not
+ * merely free or reuse it; lc_sig_net keeps the only copy it needs. */
 #ifndef LC_CELL_H
 #define LC_CELL_H
 

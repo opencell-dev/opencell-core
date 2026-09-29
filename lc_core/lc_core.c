@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "lc_sig_crypto.h"
+#include "lc_sig_keys.h" /* lc_sig_wipe */
 
 uint32_t lc_core_unix(lc_core_t *k)
 {
@@ -104,8 +105,9 @@ int lc_core_netkey_new(const lc_core_store_t *st, uint16_t key_id, uint16_t peri
     key.period_s = period_s;
     key.created = unix_now;
     memcpy(key.sk, random32, 32);
-    if (lc_sig_x25519_public(key.sk, key.pk) != 0) return -1;
-    return st->netkey_put(st->ctx, &key);
+    int r = lc_sig_x25519_public(key.sk, key.pk) == 0 ? st->netkey_put(st->ctx, &key) : -1;
+    lc_sig_wipe(key.sk, sizeof(key.sk));
+    return r;
 }
 
 int lc_core_init(lc_core_t *k, const lc_core_io_t *io, const lc_core_store_t *st, const lc_core_route_t *route,
@@ -117,7 +119,9 @@ int lc_core_init(lc_core_t *k, const lc_core_io_t *io, const lc_core_store_t *st
     k->st = *st;
     k->route = *route;
     k->cfg = *cfg;
-    return k->st.netkey_get(k->st.ctx, cfg->key_id, &key);
+    int r = k->st.netkey_get(k->st.ctx, cfg->key_id, &key); /* only asked whether it is there */
+    lc_sig_wipe(key.sk, sizeof(key.sk));
+    return r;
 }
 
 void lc_core_link_up(lc_core_t *k, uint32_t link, uint64_t now_us)
@@ -175,6 +179,7 @@ static void on_hello(lc_core_t *k, lc_core_link_t *l, const lc_core_msg_t *m, ui
     } else if (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
         reason = LC_CORE_NAK_DISABLED; /* the core itself can't serve: no network key */
     }
+    lc_sig_wipe(key.sk, sizeof(key.sk)); /* only period_s is wanted from it */
     if (reason != 0) {
         char d[48];
         snprintf(d, sizeof(d), "HELLO refused (%u)", reason);

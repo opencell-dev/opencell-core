@@ -3,7 +3,12 @@
  * library with no OS calls, like lc_sig. The caller moves whole frames
  * (lc_core_rx in, io.send out), calls lc_core_tick, and owns the store and
  * the block table. Links are the transport's handles; a link belongs to a
- * cell once its HELLO is accepted. */
+ * cell once its HELLO is accepted.
+ *
+ * Key material in frames: an AV_RES carries each vector's CK and IK (and
+ * HXRES), and lc_core wipes its own copy once io.send returns. The transport
+ * must wipe every buffer it encoded, queued or sent an AV_RES frame from
+ * once it is done with it (lc_sig_wipe), not merely free or reuse it. */
 #ifndef LC_CORE_H
 #define LC_CORE_H
 

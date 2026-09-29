@@ -6,6 +6,8 @@
 
 #include <string.h>
 
+#include "lc_sig_keys.h" /* lc_sig_wipe */
+
 static int num_eq(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, LC_SIG_NUMBER_LEN) == 0; }
 
 static void to_leg(lc_core_t *k, const lc_core_leg_t *leg, uint8_t type, uint8_t cause)
@@ -113,6 +115,8 @@ static void on_route(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
     } else if (!lc_core_linked(k, lb.cell_id)) {
         why = LC_SIG_CAUSE_NET_FAILURE; /* the callee's cell is cut off */
     }
+    lc_sig_wipe(s.k, sizeof(s.k)); /* only its state was wanted */
+    lc_sig_wipe(s.opc, sizeof(s.opc));
     if (why != 0) {
         to_leg(k, &c->a, LC_CORE_CALL_RELEASE, why);
         end_call(k, c, why);

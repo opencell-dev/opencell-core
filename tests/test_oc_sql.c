@@ -536,8 +536,12 @@ static void test_every_get_tells_failed_from_none(void)
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, x.number, &y));
 
     /* queries that can't run */
+    uint8_t lv = 0;
+    TEST_ASSERT_EQUAL_INT(0, st.list_ver_get(st.ctx, 1, &lv));
     TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(d, "DROP TABLE cell; DROP TABLE chan_list; DROP TABLE network;"
-                                                     "DROP TABLE token; DROP TABLE av_issued", NULL, NULL, NULL));
+                                                     "DROP TABLE token; DROP TABLE av_issued;"
+                                                     "DROP TABLE chan_list_ver", NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.list_ver_get(st.ctx, 1, &lv));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.netkey_get(st.ctx, 1, &kg));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.cell_get(st.ctx, 7, &cg));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.list_get(st.ctx, 1, &clg));

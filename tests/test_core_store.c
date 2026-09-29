@@ -401,6 +401,11 @@ static void test_failed_lookups_are_told_from_none(void)
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.cell_get(st.ctx, 9, &cell));
     mem.fail_reads = OC_CORE_MEM_FAIL_LIST_GET;
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.list_get(st.ctx, 9, &cl));
+    uint8_t lv = 0;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.list_ver_get(st.ctx, 9, &lv)); /* not list_get's hook */
+    mem.fail_reads = OC_CORE_MEM_FAIL_LIST_VER_GET;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.list_ver_get(st.ctx, 9, &lv));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.list_get(st.ctx, 9, &cl)); /* only the chosen lookup fails */
     mem.fail_reads = OC_CORE_MEM_FAIL_TOKEN_GET;
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.token_get(st.ctx, tid, &t));
     mem.fail_reads = OC_CORE_MEM_FAIL_AV_GET;

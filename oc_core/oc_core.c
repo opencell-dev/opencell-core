@@ -391,6 +391,14 @@ static int list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *li
         /* the version could go backwards: refused, unless forced and the
          * last version written can be read */
         if (!force || (got = k->st.list_ver_get(k->st.ctx, list_id, &prev)) == OC_CORE_STORE_FAILED) return -1;
+        /* NONE: no version was ever recorded for list_id. Either there is
+         * no row at all (list_get failed on the query, not on a row), and
+         * version 1 is right, or a row is there whose version was lost
+         * with it (chan_list_ver damaged too). Then the replacement starts
+         * again at version 1, and a cell of the group that holds a
+         * version-1 list keeps it until the next set (version 2), which
+         * the operator can run at once; refusing instead would leave no
+         * repair short of editing the database. */
         if (got != 0) prev = 0;
         oc_core_logf(k, "channel list %u: unreadable, replaced after version %u", (unsigned)list_id, (unsigned)prev);
     }

@@ -4,3 +4,8 @@
 add_library(oc_util STATIC oc_log.c oc_kv.c oc_conn.c)
 target_include_directories(oc_util PUBLIC include)
 target_link_libraries(oc_util PUBLIC oc_core)
+
+find_package(OpenSSL REQUIRED)
+add_library(oc_store STATIC oc_seal.c)
+target_include_directories(oc_store PUBLIC include)
+target_link_libraries(oc_store PUBLIC oc_core oc_util OpenSSL::Crypto)

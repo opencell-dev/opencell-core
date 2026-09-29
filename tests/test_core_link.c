@@ -144,6 +144,13 @@ static void test_core_needs_its_network_key(void)
     oc_core_cfg_t cfg = core_cfg();
     static oc_core_t k;
     TEST_ASSERT_EQUAL_INT(-1, oc_core_init(&k, &CORE_IO, &st, &rt, &cfg));
+    uint8_t r[32];
+    memset(r, 0x11, 32);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_netkey_new(&st, 1, 1800, r, UNIX0));
+    mem.fail_reads = OC_CORE_MEM_FAIL_NETKEY_GET; /* a key that can't be read: -1 too, as documented */
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_init(&k, &CORE_IO, &st, &rt, &cfg));
+    mem.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(0, oc_core_init(&k, &CORE_IO, &st, &rt, &cfg));
 }
 
 /* Channel-list spec §8: a group's list goes to its cells in CELL_CFG, after
@@ -193,6 +200,62 @@ static void test_channel_list_goes_to_the_group(void)
     TEST_ASSERT_EQUAL_INT(-1, oc_core_chan_list_set(&K, 0, &l, NOW)); /* 0: no group */
 }
 
+/* A cell or network-key read that fails is not "unknown cell" or "core
+ * disabled": the HELLO is refused by closing the link, with no HELLO_NAK
+ * and no CELL_REJECT audit to mislead; the cell reconnects. */
+static void test_a_failed_read_refuses_hello_without_a_nak(void)
+{
+    static const unsigned fails[] = { OC_CORE_MEM_FAIL_CELL_GET, OC_CORE_MEM_FAIL_NETKEY_GET };
+    for (unsigned i = 0; i < 2; i++) {
+        core_world();
+        MEM.fail_reads = fails[i];
+        hello(10, 1, 1);
+        MEM.fail_reads = 0;
+        TEST_ASSERT_NULL(sent(10, OC_CORE_HELLO_NAK));
+        TEST_ASSERT_NULL(sent(10, OC_CORE_HELLO_ACK));
+        TEST_ASSERT_EQUAL_INT(1, NCLOSED);
+        TEST_ASSERT_EQUAL_UINT32(10, CLOSED[0]);
+        TEST_ASSERT_NULL(oc_core_mem_audit(&MEM, OC_CORE_AUDIT_CELL_REJECT));
+        hello(11, 1, 1);
+        TEST_ASSERT_NOT_NULL(sent(11, OC_CORE_HELLO_ACK));
+    }
+}
+
+/* A cell whose record could not be read is not added again over it. */
+static void test_a_failed_cell_read_adds_nothing(void)
+{
+    core_world();
+    MEM.fail_reads = OC_CORE_MEM_FAIL_CELL_GET;
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_cell_add(&K, 1, "again", OC_SIG_MODE_PART97, 3));
+    MEM.fail_reads = 0;
+    oc_core_cell_t c;
+    TEST_ASSERT_EQUAL_INT(0, ST.cell_get(ST.ctx, 1, &c));
+    TEST_ASSERT_EQUAL_STRING("A", c.name);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART15, c.mode);
+    TEST_ASSERT_EQUAL_UINT16(0, c.list_id);
+}
+
+/* A channel list whose current version could not be read is not replaced
+ * by a "version 1" that would go backwards. */
+static void test_a_failed_list_read_changes_no_list(void)
+{
+    core_world();
+    oc_sig_chan_list_t l, got;
+    memset(&l, 0, sizeof(l));
+    l.count = 1;
+    l.freq_hz[0] = 917250000u;
+    TEST_ASSERT_EQUAL_INT(1, oc_core_chan_list_set(&K, 5, &l, NOW));
+    TEST_ASSERT_EQUAL_INT(2, oc_core_chan_list_set(&K, 5, &l, NOW));
+    l.freq_hz[0] = 918000000u;
+    MEM.fail_reads = OC_CORE_MEM_FAIL_LIST_GET;
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_chan_list_set(&K, 5, &l, NOW));
+    MEM.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(0, ST.list_get(ST.ctx, 5, &got));
+    TEST_ASSERT_EQUAL_UINT8(2, got.ver);
+    TEST_ASSERT_EQUAL_UINT32(917250000u, got.freq_hz[0]);
+    TEST_ASSERT_EQUAL_INT(3, oc_core_chan_list_set(&K, 5, &l, NOW));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -204,5 +267,8 @@ int main(void)
     RUN_TEST(test_ping_when_idle_and_down_when_silent);
     RUN_TEST(test_revoked_cell_loses_its_link);
     RUN_TEST(test_core_needs_its_network_key);
+    RUN_TEST(test_a_failed_read_refuses_hello_without_a_nak);
+    RUN_TEST(test_a_failed_cell_read_adds_nothing);
+    RUN_TEST(test_a_failed_list_read_changes_no_list);
     return UNITY_END();
 }

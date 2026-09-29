@@ -113,7 +113,8 @@ static void test_keys_are_sealed_on_disk_and_survive_a_restart(void)
     snprintf(wal, sizeof(wal), "%s-wal", db);
     TEST_ASSERT_EQUAL_INT(0, stat(wal, &sb));
     TEST_ASSERT_EQUAL_UINT(0600, sb.st_mode & 0777);
-    TEST_ASSERT_TRUE(file_has(wal, (const uint8_t *)"+883160655501234", 16)); /* numbers in the clear: the search works */
+    /* numbers are in the clear: the search works */
+    TEST_ASSERT_TRUE(file_has(wal, (const uint8_t *)"+883160655501234", 16));
     TEST_ASSERT_FALSE(file_has(wal, x.k, 16));
     TEST_ASSERT_FALSE(file_has(wal, x.opc, 16));
     oc_sql_close(s);
@@ -482,6 +483,69 @@ static void test_a_failed_bind_fails_the_write(void)
     oc_sql_close(s);
 }
 
+/* Every get is three-way (oc_core_store.h): a sealed value that does not
+ * open, a query that can't run, or a key that can't be bound is FAILED. */
+static void test_every_get_tells_failed_from_none(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    sqlite3 *d = oc_sql_db(s);
+    oc_core_netkey_t k = { 1, { 1 }, { 2 }, 1800, 100 }, kg;
+    oc_core_cell_t cell, cg;
+    oc_sig_chan_list_t cl, clg;
+    oc_core_token_t t, tg;
+    oc_core_av_issued_t a, ag;
+    oc_core_sub_t x = a_sub(), y;
+    oc_core_loc_t lg;
+    uint64_t top;
+    memset(&cell, 0, sizeof(cell));
+    cell.cell_id = 7;
+    strcpy(cell.name, "A");
+    memset(&cl, 0, sizeof(cl));
+    memset(&t, 0, sizeof(t));
+    memcpy(t.number, x.number, OC_SIG_NUMBER_LEN);
+    memset(t.token_id, 3, 8);
+    memset(&a, 0, sizeof(a));
+    memcpy(a.number, x.number, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, st.netkey_put(st.ctx, &k));
+    TEST_ASSERT_EQUAL_INT(0, st.cell_put(st.ctx, &cell));
+    TEST_ASSERT_EQUAL_INT(0, st.list_put(st.ctx, 1, &cl));
+    TEST_ASSERT_EQUAL_INT(0, st.token_put(st.ctx, &t));
+    TEST_ASSERT_EQUAL_INT(0, st.av_put(st.ctx, &a));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.netkey_get(st.ctx, 2, &kg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.cell_get(st.ctx, 8, &cg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.list_get(st.ctx, 2, &clg));
+
+    /* sealed values that don't open */
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(d, "UPDATE network SET sk_enc = zeroblob(61);"
+                                                     "UPDATE token SET secret_enc = zeroblob(45)", NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.netkey_get(st.ctx, 1, &kg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.token_get(st.ctx, t.token_id, &tg));
+    TEST_ASSERT_EQUAL_UINT(2, oc_sql_unseal_failures(s));
+
+    /* a key that can't be bound: not "no such row" */
+    sqlite3_limit(d, SQLITE_LIMIT_LENGTH, 15);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.sub_get(st.ctx, x.number, &y));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, x.number, &lg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_get(st.ctx, a.number, a.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, x.number, 0, &top));
+    sqlite3_limit(d, SQLITE_LIMIT_LENGTH, 1000000);
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, x.number, &y));
+
+    /* queries that can't run */
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(d, "DROP TABLE cell; DROP TABLE chan_list; DROP TABLE network;"
+                                                     "DROP TABLE token; DROP TABLE av_issued", NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.netkey_get(st.ctx, 1, &kg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.cell_get(st.ctx, 7, &cg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.list_get(st.ctx, 1, &clg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.token_get(st.ctx, t.token_id, &tg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_get(st.ctx, a.number, a.rand, &ag));
+    oc_sql_close(s);
+}
+
 /* The database fills up in the middle of a transaction (SQLITE_FULL, here
  * by a page limit): that put fails, every later write is refused, and none
  * of the transaction is left. */
@@ -620,6 +684,7 @@ int main(void)
     RUN_TEST(test_a_failed_bind_fails_the_write);
     RUN_TEST(test_a_failed_begin_dooms_the_transaction);
     RUN_TEST(test_a_lookup_that_fails_is_not_none);
+    RUN_TEST(test_every_get_tells_failed_from_none);
     RUN_TEST(test_sqn_rises_across_a_core_restart);
     return UNITY_END();
 }

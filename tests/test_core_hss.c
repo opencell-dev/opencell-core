@@ -540,6 +540,59 @@ static void test_a_failed_tmid_lookup_answers_vectors_unavailable(void)
     TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_OK, r->u.av_res.status);
 }
 
+/* A token read that fails is not a free token id (token_issue would write
+ * over whatever holds it) nor an unknown token (no ACT_NAK: no answer, the
+ * terminal retries). */
+static void test_a_failed_token_read_fails_closed(void)
+{
+    oc_sig_qr_t qr = sub_world(), qr2;
+    uint8_t n[OC_SIG_NUMBER_LEN];
+    number(NUM, n);
+    unsigned ntoken = MEM.d.ntoken, naudit = MEM.d.naudit;
+    MEM.fail_reads = OC_CORE_MEM_FAIL_TOKEN_GET;
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_token_issue(&K, n, 3600, &qr2));
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    int from = NSENT;
+    TEST_ASSERT_NULL(activate(10, &t));
+    MEM.fail_reads = 0;
+    TEST_ASSERT_EQUAL_INT(from, NSENT);
+    TEST_ASSERT_EQUAL_UINT(ntoken, MEM.d.ntoken);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    oc_core_token_t tok;
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &tok)); /* the old token still stands */
+    TEST_ASSERT_EQUAL_UINT32(0, tok.used_at);
+    const oc_core_msg_t *r = activate(10, &t);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, r->u.act_res.msg.type);
+}
+
+/* A RAND lookup that fails during a resync is a store failure: UNAVAILABLE,
+ * not AUTH_FAILED, and no AUTH_FAIL audit. */
+static void test_a_failed_rand_read_answers_the_resync_unavailable(void)
+{
+    oc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    TEST_ASSERT_NOT_NULL(activate(10, &t));
+    const oc_core_msg_t *r = ask_avs(10, TMID, 1);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_OK, r->u.av_res.status);
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_RESYNC;
+    m.u.resync.tmid = TMID;
+    memcpy(m.u.resync.rand, r->u.av_res.av[0].rand, 16);
+    unsigned naudit = MEM.d.naudit;
+    MEM.fail_reads = OC_CORE_MEM_FAIL_AV_GET;
+    int from = NSENT;
+    rx(10, &m);
+    MEM.fail_reads = 0;
+    r = sent_since(from, 10, OC_CORE_AV_RES);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_UNAVAILABLE, r->u.av_res.status);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+}
+
 static uint8_t nak(uint32_t link, const term_t *t)
 {
     const oc_core_msg_t *r = activate(link, t);
@@ -1019,6 +1072,8 @@ int main(void)
     RUN_TEST(test_a_failed_tmid_lookup_abandons_the_activation);
     RUN_TEST(test_a_failed_subscriber_read_gets_no_activation_answer);
     RUN_TEST(test_a_failed_tmid_lookup_answers_vectors_unavailable);
+    RUN_TEST(test_a_failed_token_read_fails_closed);
+    RUN_TEST(test_a_failed_rand_read_answers_the_resync_unavailable);
     RUN_TEST(test_reactivation_cancels_the_old_location_first);
     RUN_TEST(test_reactivation_voids_the_old_bindings_vectors);
     RUN_TEST(test_a_claim_from_before_a_reactivation_is_cancelled_back);

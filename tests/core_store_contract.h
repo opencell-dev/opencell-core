@@ -23,7 +23,7 @@ static inline void store_contract(const oc_core_store_t *st)
 
     /* network keys and cells: get what was put, replace by key */
     oc_core_netkey_t k = { 1, { 1 }, { 2 }, 1800, 100 }, k2;
-    TEST_ASSERT_EQUAL_INT(-1, st->netkey_get(c, 1, &k2));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->netkey_get(c, 1, &k2));
     TEST_ASSERT_EQUAL_INT(0, st->netkey_put(c, &k));
     TEST_ASSERT_EQUAL_INT(0, st->netkey_get(c, 1, &k2));
     TEST_ASSERT_EQUAL_MEMORY(&k, &k2, sizeof(k));
@@ -40,7 +40,7 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_STRING("bench A", cell2.name);
     TEST_ASSERT_EQUAL_UINT64(99, cell2.boot_id);
     TEST_ASSERT_EQUAL_UINT8(1, cell2.enabled);
-    TEST_ASSERT_EQUAL_INT(-1, st->cell_get(c, 8, &cell2));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->cell_get(c, 8, &cell2));
 
     /* channel lists: one per list group, replaced by group */
     oc_sig_chan_list_t cl, cl2;
@@ -48,14 +48,14 @@ static inline void store_contract(const oc_core_store_t *st)
     cl.ver = 1;
     cl.count = 1;
     cl.freq_hz[0] = 917250000u;
-    TEST_ASSERT_EQUAL_INT(-1, st->list_get(c, 3, &cl2));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->list_get(c, 3, &cl2));
     TEST_ASSERT_EQUAL_INT(0, st->list_put(c, 3, &cl));
     cl.ver = 2;
     cl.flags[0] = OC_SIG_CHAN_FIXED;
     TEST_ASSERT_EQUAL_INT(0, st->list_put(c, 3, &cl));
     TEST_ASSERT_EQUAL_INT(0, st->list_get(c, 3, &cl2));
     TEST_ASSERT_EQUAL_MEMORY(&cl, &cl2, sizeof(cl));
-    TEST_ASSERT_EQUAL_INT(-1, st->list_get(c, 4, &cl2));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->list_get(c, 4, &cl2));
 
     /* subscribers: by number; by TMID only while activated */
     oc_core_sub_t s, s2;
@@ -90,7 +90,7 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->token_put(c, &t2));
     TEST_ASSERT_EQUAL_INT(0, st->token_put(c, &t3));
     TEST_ASSERT_EQUAL_INT(0, st->token_void(c, n1));
-    TEST_ASSERT_EQUAL_INT(-1, st->token_get(c, t1.token_id, &tg));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->token_get(c, t1.token_id, &tg));
     TEST_ASSERT_EQUAL_INT(0, st->token_get(c, t2.token_id, &tg)); /* used: kept */
     TEST_ASSERT_EQUAL_UINT32(50, tg.used_at);
     TEST_ASSERT_EQUAL_INT(0, st->token_get(c, t3.token_id, &tg)); /* another number: kept */
@@ -111,14 +111,14 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &a2)); /* replaced, not added */
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a2.rand, &ag));
     TEST_ASSERT_EQUAL_UINT8(1, ag.confirmed);
-    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n2, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n2, a2.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_drop_cell(c, 7)); /* a1 (unconfirmed) goes, a2 stays */
-    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a1.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n1, a1.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a2.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_prune(c, 2000)); /* issued at 2000: not before */
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a2.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_prune(c, 2001));
-    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n1, a2.rand, &ag));
 
     /* a number's issued vectors go all at once (re-activation, network-core
      * spec §19.3), confirmed or not, and nobody else's; SQN is kept whole */
@@ -133,14 +133,14 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, a3.rand, &ag));
     TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 1u, ag.sqn);
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1));
-    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a1.rand, &ag));
-    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n1, a2.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n1, a1.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n1, a2.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n2, a4.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1)); /* none left: still 0, unlike loc_del's -1 */
     uint64_t top = 0;
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_newest_confirmed(c, n1, 0, &top)); /* none at all */
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
-    TEST_ASSERT_EQUAL_INT(-1, st->av_get(c, n2, a4.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n2, a4.rand, &ag));
 
     /* the newest confirmed vector of a number issued to any cell but one
      * (§19.2's floor for a claim from that cell) */

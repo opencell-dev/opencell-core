@@ -83,7 +83,7 @@ typedef struct {
 int  oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t period_s, const uint8_t random32[32],
                         uint32_t unix_now);
 
-/* 0, or -1 when cfg->key_id is not in the store. Keeps nothing of a previous
+/* 0, or -1 when cfg->key_id is not in the store (or can't be read). Keeps nothing of a previous
  * run but what the store holds (a restart). */
 int  oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                   const oc_core_cfg_t *cfg);

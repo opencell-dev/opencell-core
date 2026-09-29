@@ -73,13 +73,14 @@ static int commit(void *c)
 
 static int netkey_get(void *c, uint16_t key_id, oc_core_netkey_t *out)
 {
+    if (M(c)->fail_reads & OC_CORE_MEM_FAIL_NETKEY_GET) return OC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < D(c)->nkey; i++) {
         if (D(c)->key[i].key_id == key_id) {
             *out = D(c)->key[i];
             return 0;
         }
     }
-    return -1;
+    return OC_CORE_STORE_NONE;
 }
 
 static int netkey_put(void *c, const oc_core_netkey_t *k)
@@ -102,13 +103,14 @@ static int netkey_put(void *c, const oc_core_netkey_t *k)
 
 static int cell_get(void *c, uint32_t cell_id, oc_core_cell_t *out)
 {
+    if (M(c)->fail_reads & OC_CORE_MEM_FAIL_CELL_GET) return OC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < D(c)->ncell; i++) {
         if (D(c)->cell[i].cell_id == cell_id) {
             *out = D(c)->cell[i];
             return 0;
         }
     }
-    return -1;
+    return OC_CORE_STORE_NONE;
 }
 
 static int cell_put(void *c, const oc_core_cell_t *x)
@@ -131,13 +133,14 @@ static int cell_put(void *c, const oc_core_cell_t *x)
 
 static int list_get(void *c, uint16_t list_id, oc_sig_chan_list_t *out)
 {
+    if (M(c)->fail_reads & OC_CORE_MEM_FAIL_LIST_GET) return OC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < D(c)->nlist; i++) {
         if (D(c)->list_id[i] == list_id) {
             *out = D(c)->list[i];
             return 0;
         }
     }
-    return -1;
+    return OC_CORE_STORE_NONE;
 }
 
 static int list_put(void *c, uint16_t list_id, const oc_sig_chan_list_t *l)
@@ -203,13 +206,14 @@ static int sub_put(void *c, const oc_core_sub_t *s)
 
 static int token_get(void *c, const uint8_t token_id[8], oc_core_token_t *out)
 {
+    if (M(c)->fail_reads & OC_CORE_MEM_FAIL_TOKEN_GET) return OC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < D(c)->ntoken; i++) {
         if (memcmp(D(c)->token[i].token_id, token_id, 8) == 0) {
             *out = D(c)->token[i];
             return 0;
         }
     }
-    return -1;
+    return OC_CORE_STORE_NONE;
 }
 
 static int token_put(void *c, const oc_core_token_t *t)
@@ -269,8 +273,9 @@ static int av_put(void *c, const oc_core_av_issued_t *a)
 
 static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_t rand[16], oc_core_av_issued_t *out)
 {
+    if (M(c)->fail_reads & OC_CORE_MEM_FAIL_AV_GET) return OC_CORE_STORE_FAILED;
     int i = av_find(D(c), number, rand);
-    if (i < 0) return -1;
+    if (i < 0) return OC_CORE_STORE_NONE;
     *out = D(c)->av[i];
     return 0;
 }

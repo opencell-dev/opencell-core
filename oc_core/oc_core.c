@@ -121,7 +121,7 @@ int oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st
     k->cfg = *cfg;
     int r = k->st.netkey_get(k->st.ctx, cfg->key_id, &key); /* only asked whether it is there */
     oc_sig_wipe(key.sk, sizeof(key.sk));
-    return r;
+    return r == 0 ? 0 : -1; /* none, or the store failed: no core either way */
 }
 
 void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us)
@@ -158,7 +158,12 @@ static void send_list(oc_core_t *k, oc_core_link_t *l, uint16_t list_id)
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = OC_CORE_CELL_CFG;
-    if (list_id == 0 || k->st.list_get(k->st.ctx, list_id, &m.u.cell_cfg.list) != 0) return;
+    if (list_id == 0) return;
+    int got = k->st.list_get(k->st.ctx, list_id, &m.u.cell_cfg.list);
+    if (got == OC_CORE_STORE_FAILED) {
+        oc_core_logf(k, "cell %u: channel list %u read FAILED, not sent", (unsigned)l->cell_id, (unsigned)list_id);
+    }
+    if (got != 0) return;
     send_link(k, l, &m);
 }
 
@@ -169,17 +174,27 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     oc_core_msg_t r;
     uint32_t id = m->u.hello.cell_id;
     uint8_t reason = 0;
+    int got_cell = OC_CORE_STORE_NONE, got_key = OC_CORE_STORE_NONE;
     memset(&r, 0, sizeof(r));
+    memset(&key, 0, sizeof(key));
     if (m->u.hello.proto != OC_CORE_PROTO) {
         reason = OC_CORE_NAK_VERSION;
-    } else if (id == 0 || k->st.cell_get(k->st.ctx, id, &c) != 0) {
+    } else if (id == 0 || (got_cell = k->st.cell_get(k->st.ctx, id, &c)) == OC_CORE_STORE_NONE) {
         reason = OC_CORE_NAK_UNKNOWN_CELL;
-    } else if (!c.enabled) {
+    } else if (got_cell == 0 && !c.enabled) {
         reason = OC_CORE_NAK_DISABLED;
-    } else if (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
+    } else if (got_cell == 0 && (got_key = k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key)) == OC_CORE_STORE_NONE) {
         reason = OC_CORE_NAK_DISABLED; /* the core itself can't serve: no network key */
     }
     oc_sig_wipe(key.sk, sizeof(key.sk)); /* only period_s is wanted from it */
+    if (got_cell == OC_CORE_STORE_FAILED || got_key == OC_CORE_STORE_FAILED) {
+        /* a store failure, not a verdict on the cell: no HELLO_NAK or
+         * CELL_REJECT audit to say otherwise; the link closes, it retries */
+        oc_core_logf(k, "cell %u: HELLO: %s read FAILED, link closed", (unsigned)id,
+                     got_cell == OC_CORE_STORE_FAILED ? "cell" : "network key");
+        drop(k, l, now);
+        return;
+    }
     if (reason != 0) {
         char d[48];
         snprintf(d, sizeof(d), "HELLO refused (%u)", reason);
@@ -281,7 +296,9 @@ void oc_core_tick(oc_core_t *k, uint64_t now_us)
 int oc_core_cell_add(oc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id)
 {
     oc_core_cell_t c;
-    if (cell_id == 0 || k->st.cell_get(k->st.ctx, cell_id, &c) == 0) return -1;
+    /* only a cell known not to exist: one whose record could not be read
+     * is not written over (oc_core_store.h) */
+    if (cell_id == 0 || k->st.cell_get(k->st.ctx, cell_id, &c) != OC_CORE_STORE_NONE) return -1;
     memset(&c, 0, sizeof(c));
     c.cell_id = cell_id;
     snprintf(c.name, sizeof(c.name), "%s", name);
@@ -312,12 +329,19 @@ int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list
     l.count = list->count;
     memcpy(l.freq_hz, list->freq_hz, sizeof(l.freq_hz[0]) * l.count);
     memcpy(l.flags, list->flags, l.count);
-    l.ver = k->st.list_get(k->st.ctx, list_id, &old) == 0 && old.ver != 255u ? (uint8_t)(old.ver + 1u) : 1u;
+    int got = k->st.list_get(k->st.ctx, list_id, &old);
+    if (got == OC_CORE_STORE_FAILED) return -1; /* a version that could go backwards: nothing changed */
+    l.ver = got == 0 && old.ver != 255u ? (uint8_t)(old.ver + 1u) : 1u;
     if (k->st.list_put(k->st.ctx, list_id, &l) != 0) return -1;
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
         oc_core_link_t *ln = &k->links[i];
         oc_core_cell_t c;
-        if (ln->used && ln->cell_id != 0 && k->st.cell_get(k->st.ctx, ln->cell_id, &c) == 0 && c.list_id == list_id) {
+        if (!ln->used || ln->cell_id == 0) continue;
+        int got_c = k->st.cell_get(k->st.ctx, ln->cell_id, &c);
+        if (got_c == OC_CORE_STORE_FAILED) { /* stored all the same: the cell gets it at its next HELLO */
+            oc_core_logf(k, "cell %u: cell read FAILED, channel list %u not sent", (unsigned)ln->cell_id,
+                         (unsigned)list_id);
+        } else if (got_c == 0 && c.list_id == list_id) {
             send_list(k, ln, list_id);
         }
     }

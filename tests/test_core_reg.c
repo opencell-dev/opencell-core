@@ -112,6 +112,29 @@ static void test_proven_update_sets_the_location(void)
     TEST_ASSERT_EQUAL_UINT32(UNIX0 + 601u + 3600u, l.expires);
 }
 
+/* A claim whose vector or network key could not be read is refused (no
+ * location, nothing sent) without an AUTH_FAIL audit: nothing failed to
+ * authenticate, the store failed to answer. */
+static void test_a_failed_read_refuses_the_claim_without_blame(void)
+{
+    static const unsigned fails[] = { OC_CORE_MEM_FAIL_AV_GET, OC_CORE_MEM_FAIL_NETKEY_GET };
+    for (unsigned i = 0; i < 2; i++) {
+        reg_world();
+        oc_core_av_t av = vector_for(10);
+        unsigned naudit = MEM.d.naudit;
+        int from = NSENT;
+        MEM.fail_reads = fails[i];
+        loc_update(10, TMID, &av);
+        MEM.fail_reads = 0;
+        oc_core_loc_t l;
+        TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, where(&l));
+        TEST_ASSERT_EQUAL_INT(from, NSENT);
+        TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+        loc_update(10, TMID, &av); /* once the store answers */
+        TEST_ASSERT_EQUAL_INT(0, where(&l));
+    }
+}
+
 /* §7.8: the terminal registers on cell 2; cell 1 is told to drop it. */
 static void test_move_cancels_at_the_old_cell(void)
 {
@@ -441,6 +464,7 @@ int main(void)
     RUN_TEST(test_an_older_claim_is_refused_after_the_newer_location_went);
     RUN_TEST(test_purge_only_from_the_location_cell);
     RUN_TEST(test_the_location_floor_fails_closed);
+    RUN_TEST(test_a_failed_read_refuses_the_claim_without_blame);
     RUN_TEST(test_issued_vectors_are_pruned_after_a_day);
     return UNITY_END();
 }

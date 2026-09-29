@@ -89,6 +89,16 @@ static int run(oc_sql_t *s, sqlite3_stmt *st, int b)
     return done(s, st);
 }
 
+/* A get (oc_core_store.h): steps st, whose binds returned b, once: 0 (a
+ * row, to be read), OC_CORE_STORE_NONE (no row) or OC_CORE_STORE_FAILED (no
+ * statement, a bind that failed, or an error). */
+static int get_step(sqlite3_stmt *st, int b)
+{
+    if (st == NULL || b != SQLITE_OK) return OC_CORE_STORE_FAILED;
+    int rc = sqlite3_step(st);
+    return rc == SQLITE_ROW ? 0 : rc == SQLITE_DONE ? OC_CORE_STORE_NONE : OC_CORE_STORE_FAILED;
+}
+
 /* A write refused before it starts: inside a failed transaction nothing is
  * written. SQLite rolls a transaction back by itself on some errors
  * (SQLITE_FULL, SQLITE_IOERR, SQLITE_NOMEM, SQLITE_BUSY), and the statements
@@ -189,18 +199,19 @@ static int netkey_get(void *c, uint16_t key_id, oc_core_netkey_t *out)
     oc_sql_t *s = S(c);
     uint8_t pk[2];
     sqlite3_stmt *st = prep(s, "SELECT sk_enc, pk, period_s, created FROM network WHERE key_id = ?");
-    int rc = -1;
-    if (st == NULL) return -1;
-    sqlite3_bind_int(st, 1, key_id);
+    int b = st != NULL ? sqlite3_bind_int(st, 1, key_id) : SQLITE_ERROR;
+    int rc = get_step(st, b);
     key_pk(key_id, pk);
     memset(out, 0, sizeof(*out));
-    if (sqlite3_step(st) == SQLITE_ROW &&
-        unseal_col(s, st, 0, "network", "sk", pk, 2, out->sk, sizeof(out->sk)) == 0) {
-        out->key_id = key_id;
-        blob_col(st, 1, out->pk, sizeof(out->pk));
-        out->period_s = (uint16_t)sqlite3_column_int(st, 2);
-        out->created = (uint32_t)sqlite3_column_int64(st, 3);
-        rc = 0;
+    if (rc == 0) {
+        if (unseal_col(s, st, 0, "network", "sk", pk, 2, out->sk, sizeof(out->sk)) != 0) {
+            rc = OC_CORE_STORE_FAILED;
+        } else {
+            out->key_id = key_id;
+            blob_col(st, 1, out->pk, sizeof(out->pk));
+            out->period_s = (uint16_t)sqlite3_column_int(st, 2);
+            out->created = (uint32_t)sqlite3_column_int64(st, 3);
+        }
     }
     sqlite3_finalize(st);
     return rc;
@@ -229,20 +240,22 @@ static int cell_get(void *c, uint32_t cell_id, oc_core_cell_t *out)
 {
     oc_sql_t *s = S(c);
     sqlite3_stmt *st = prep(s, "SELECT name, mode, enabled, list_id, boot_id, last_seen FROM cell WHERE cell_id = ?");
-    int rc = -1;
-    if (st == NULL) return -1;
-    sqlite3_bind_int64(st, 1, cell_id);
+    int b = st != NULL ? sqlite3_bind_int64(st, 1, cell_id) : SQLITE_ERROR;
+    int rc = get_step(st, b);
     memset(out, 0, sizeof(*out));
-    const char *name;
-    if (sqlite3_step(st) == SQLITE_ROW && (name = (const char *)sqlite3_column_text(st, 0)) != NULL) {
-        out->cell_id = cell_id;
-        snprintf(out->name, sizeof(out->name), "%s", name);
-        out->mode = (uint8_t)sqlite3_column_int(st, 1);
-        out->enabled = (uint8_t)sqlite3_column_int(st, 2);
-        out->list_id = (uint16_t)sqlite3_column_int(st, 3);
-        out->boot_id = (uint64_t)sqlite3_column_int64(st, 4);
-        out->last_seen = (uint32_t)sqlite3_column_int64(st, 5);
-        rc = 0;
+    if (rc == 0) {
+        const char *name = (const char *)sqlite3_column_text(st, 0);
+        if (name == NULL) {
+            rc = OC_CORE_STORE_FAILED; /* NOT NULL: only out of memory gets here */
+        } else {
+            out->cell_id = cell_id;
+            snprintf(out->name, sizeof(out->name), "%s", name);
+            out->mode = (uint8_t)sqlite3_column_int(st, 1);
+            out->enabled = (uint8_t)sqlite3_column_int(st, 2);
+            out->list_id = (uint16_t)sqlite3_column_int(st, 3);
+            out->boot_id = (uint64_t)sqlite3_column_int64(st, 4);
+            out->last_seen = (uint32_t)sqlite3_column_int64(st, 5);
+        }
     }
     sqlite3_finalize(st);
     return rc;
@@ -276,14 +289,15 @@ static int list_get(void *c, uint16_t list_id, oc_sig_chan_list_t *out)
 {
     oc_sql_t *s = S(c);
     sqlite3_stmt *st = prep(s, "SELECT ver, entries FROM chan_list WHERE list_id = ?");
-    int rc = -1;
-    if (st == NULL) return -1;
-    sqlite3_bind_int(st, 1, list_id);
+    int b = st != NULL ? sqlite3_bind_int(st, 1, list_id) : SQLITE_ERROR;
+    int rc = get_step(st, b);
     memset(out, 0, sizeof(*out));
-    if (sqlite3_step(st) == SQLITE_ROW) {
+    if (rc == 0) {
         const uint8_t *e = sqlite3_column_blob(st, 1);
         int n = sqlite3_column_bytes(st, 1);
-        if (n % 5 == 0 && n / 5 <= (int)OC_SIG_CHAN_MAX) {
+        if (n % 5 != 0 || n / 5 > (int)OC_SIG_CHAN_MAX || (n > 0 && e == NULL)) {
+            rc = OC_CORE_STORE_FAILED; /* a row list_put never wrote */
+        } else {
             out->ver = (uint8_t)sqlite3_column_int(st, 0);
             out->count = (uint8_t)(n / 5);
             for (int i = 0; i < out->count; i++) {
@@ -291,7 +305,6 @@ static int list_get(void *c, uint16_t list_id, oc_sig_chan_list_t *out)
                                   ((uint32_t)e[5 * i + 2] << 8) | e[5 * i + 3];
                 out->flags[i] = e[5 * i + 4];
             }
-            rc = 0;
         }
     }
     sqlite3_finalize(st);
@@ -345,14 +358,11 @@ static int sub_row(oc_sql_t *s, sqlite3_stmt *st, oc_core_sub_t *out)
 }
 
 /* The lookups that tell "none" from "failed" (oc_core_store.h): a row, no
- * row, or a query that could not run. */
-static int sub_one(oc_sql_t *s, sqlite3_stmt *st, oc_core_sub_t *out)
+ * row, or a query that could not run (b: its binds' codes, OR-ed). */
+static int sub_one(oc_sql_t *s, sqlite3_stmt *st, int b, oc_core_sub_t *out)
 {
-    int rc = OC_CORE_STORE_FAILED;
-    if (st == NULL) return rc;
-    int step = sqlite3_step(st);
-    if (step == SQLITE_ROW) rc = sub_row(s, st, out);
-    else if (step == SQLITE_DONE) rc = OC_CORE_STORE_NONE;
+    int rc = get_step(st, b);
+    if (rc == 0) rc = sub_row(s, st, out);
     sqlite3_finalize(st);
     return rc;
 }
@@ -362,19 +372,17 @@ static int sub_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_sub
     oc_sql_t *s = S(c);
     char t[OC_SIG_NUMBER_TEXT];
     sqlite3_stmt *st = prep(s, "SELECT " SUB_COLS " FROM subscriber WHERE number = ?");
-    if (st != NULL) {
-        num_text(number, t);
-        sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-    }
-    return sub_one(s, st, out);
+    num_text(number, t);
+    int b = st != NULL ? sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT) : SQLITE_ERROR;
+    return sub_one(s, st, b, out);
 }
 
 static int sub_by_tmid(void *c, uint32_t tmid, oc_core_sub_t *out)
 {
     oc_sql_t *s = S(c);
     sqlite3_stmt *st = prep(s, "SELECT " SUB_COLS " FROM subscriber WHERE tmid = ? AND activated = 1");
-    if (st != NULL) sqlite3_bind_int64(st, 1, tmid);
-    return sub_one(s, st, out);
+    int b = st != NULL ? sqlite3_bind_int64(st, 1, tmid) : SQLITE_ERROR;
+    return sub_one(s, st, b, out);
 }
 
 static int sub_put(void *c, const oc_core_sub_t *x)
@@ -404,17 +412,20 @@ static int token_get(void *c, const uint8_t token_id[8], oc_core_token_t *out)
 {
     oc_sql_t *s = S(c);
     sqlite3_stmt *st = prep(s, "SELECT number, secret_enc, expiry, used_at, used_by_tmid FROM token WHERE token_id = ?");
-    int rc = -1;
-    if (st == NULL) return -1;
-    sqlite3_bind_blob(st, 1, token_id, 8, SQLITE_TRANSIENT);
+    int b = st != NULL ? sqlite3_bind_blob(st, 1, token_id, 8, SQLITE_TRANSIENT) : SQLITE_ERROR;
+    int rc = get_step(st, b);
     memset(out, 0, sizeof(*out));
-    if (sqlite3_step(st) == SQLITE_ROW && num_col(st, 0, out->number) == 0 &&
-        unseal_col(s, st, 1, "token", "secret", token_id, 8, out->secret, 16) == 0) {
-        memcpy(out->token_id, token_id, 8);
-        out->expiry = (uint32_t)sqlite3_column_int64(st, 2);
-        out->used_at = (uint32_t)sqlite3_column_int64(st, 3);
-        out->used_by_tmid = (uint32_t)sqlite3_column_int64(st, 4);
-        rc = 0;
+    if (rc == 0) {
+        if (num_col(st, 0, out->number) != 0 ||
+            unseal_col(s, st, 1, "token", "secret", token_id, 8, out->secret, 16) != 0) {
+            oc_sig_wipe(out, sizeof(*out));
+            rc = OC_CORE_STORE_FAILED;
+        } else {
+            memcpy(out->token_id, token_id, 8);
+            out->expiry = (uint32_t)sqlite3_column_int64(st, 2);
+            out->used_at = (uint32_t)sqlite3_column_int64(st, 3);
+            out->used_by_tmid = (uint32_t)sqlite3_column_int64(st, 4);
+        }
     }
     sqlite3_finalize(st);
     return rc;
@@ -496,13 +507,15 @@ static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_
     oc_sql_t *s = S(c);
     char t[OC_SIG_NUMBER_TEXT];
     sqlite3_stmt *st = prep(s, "SELECT xres, sqn, cell_id, issued, confirmed FROM av_issued WHERE number = ? AND rand = ?");
-    int rc = -1;
-    if (st == NULL) return -1;
     num_text(number, t);
-    sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(st, 2, rand, 16, SQLITE_TRANSIENT);
+    int b = SQLITE_ERROR;
+    if (st != NULL) {
+        b = sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_blob(st, 2, rand, 16, SQLITE_TRANSIENT);
+    }
+    int rc = get_step(st, b);
     memset(out, 0, sizeof(*out));
-    if (sqlite3_step(st) == SQLITE_ROW) {
+    if (rc == 0) {
         memcpy(out->number, number, OC_SIG_NUMBER_LEN);
         memcpy(out->rand, rand, 16);
         blob_col(st, 0, out->xres, 8);
@@ -510,7 +523,6 @@ static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_
         out->cell_id = (uint32_t)sqlite3_column_int64(st, 2);
         out->issued = (uint32_t)sqlite3_column_int64(st, 3);
         out->confirmed = (uint8_t)sqlite3_column_int(st, 4);
-        rc = 0;
     }
     sqlite3_finalize(st);
     return rc;
@@ -532,18 +544,21 @@ static int av_newest_confirmed(void *c, const uint8_t number[OC_SIG_NUMBER_LEN],
     char t[OC_SIG_NUMBER_TEXT];
     sqlite3_stmt *st =
         prep(s, "SELECT MAX(sqn) FROM av_issued WHERE number = ? AND confirmed = 1 AND cell_id <> ?");
-    int rc = OC_CORE_STORE_FAILED;
-    if (st == NULL) return rc;
     num_text(number, t);
-    sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, not_cell);
-    if (sqlite3_step(st) == SQLITE_ROW) {
+    int b = SQLITE_ERROR;
+    if (st != NULL) {
+        b = sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int64(st, 2, not_cell);
+    }
+    int rc = get_step(st, b); /* an aggregate: always one row, NULL when none */
+    if (rc == 0) {
         if (sqlite3_column_type(st, 0) == SQLITE_NULL) {
             rc = OC_CORE_STORE_NONE;
         } else {
             *sqn = (uint64_t)sqlite3_column_int64(st, 0);
-            rc = 0;
         }
+    } else if (rc == OC_CORE_STORE_NONE) {
+        rc = OC_CORE_STORE_FAILED;
     }
     sqlite3_finalize(st);
     return rc;
@@ -558,22 +573,17 @@ static int loc_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc
     oc_sql_t *s = S(c);
     char t[OC_SIG_NUMBER_TEXT];
     sqlite3_stmt *st = prep(s, "SELECT cell_id, tmid, expires, sqn, rand FROM location WHERE number = ?");
-    int rc = OC_CORE_STORE_FAILED;
-    if (st == NULL) return rc;
     num_text(number, t);
-    sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
+    int b = st != NULL ? sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT) : SQLITE_ERROR;
+    int rc = get_step(st, b);
     memset(out, 0, sizeof(*out));
-    int step = sqlite3_step(st);
-    if (step == SQLITE_ROW) {
+    if (rc == 0) {
         memcpy(out->number, number, OC_SIG_NUMBER_LEN);
         out->cell_id = (uint32_t)sqlite3_column_int64(st, 0);
         out->tmid = (uint32_t)sqlite3_column_int64(st, 1);
         out->expires = (uint32_t)sqlite3_column_int64(st, 2);
         out->sqn = (uint64_t)sqlite3_column_int64(st, 3);
         blob_col(st, 4, out->rand, sizeof(out->rand));
-        rc = 0;
-    } else if (step == SQLITE_DONE) {
-        rc = OC_CORE_STORE_NONE;
     }
     sqlite3_finalize(st);
     return rc;

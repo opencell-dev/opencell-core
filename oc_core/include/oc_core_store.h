@@ -40,9 +40,10 @@
  * loc_purge_cell - return 0 when they find nothing to delete. The contract
  * test (tests/core_store_contract.h) pins both.
  *
- * Lookups that tell "none" from "failed": sub_get, sub_by_tmid, loc_get and
- * av_newest_confirmed return 0 (found), OC_CORE_STORE_NONE (-1: there is no
- * such record) or OC_CORE_STORE_FAILED (-2: the store could not say). A
+ * Lookups tell "none" from "failed": every get (netkey_get, cell_get,
+ * list_get, sub_get, sub_by_tmid, token_get, av_get, av_newest_confirmed,
+ * loc_get) returns 0 (found), OC_CORE_STORE_NONE (-1: there is no such
+ * record) or OC_CORE_STORE_FAILED (-2: the store could not say). A
  * caller must never read "failed" as "none": oc_core fails closed on it -
  * the location floor of network-core spec §19.2 is not skipped because a
  * read failed, a number whose record could not be read is not assigned

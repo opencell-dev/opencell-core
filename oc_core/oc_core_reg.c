@@ -60,9 +60,13 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     memset(&a, 0, sizeof(a));
     memset(&s, 0, sizeof(s));
     memset(&key, 0, sizeof(key));
-    int proven = k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a) == 0 && a.cell_id == cell &&
-                 oc_sig_ct_equal(m->u.loc_update.res, a.xres, 8);
-    int got = k->st.sub_get(k->st.ctx, num, &s);
+    int got = k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a);
+    if (got == OC_CORE_STORE_FAILED) { /* fail closed, and no AUTH_FAIL: nothing failed to authenticate */
+        oc_core_logf(k, "cell %u: location claim for %08x: vector read FAILED", (unsigned)cell, (unsigned)tmid);
+        goto done;
+    }
+    int proven = got == 0 && a.cell_id == cell && oc_sig_ct_equal(m->u.loc_update.res, a.xres, 8);
+    got = k->st.sub_get(k->st.ctx, num, &s);
     if (got == OC_CORE_STORE_FAILED) { /* fail closed (oc_core_store.h): no cancel, no location */
         oc_core_logf(k, "cell %u: location claim for %08x: subscriber read FAILED", (unsigned)cell, (unsigned)tmid);
         goto done;
@@ -127,7 +131,12 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     memcpy(l.number, num, OC_SIG_NUMBER_LEN);
     l.cell_id = cell;
     l.tmid = tmid;
-    l.expires = oc_core_unix(k) + 2u * (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) == 0 ? key.period_s : 1800u);
+    got = k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key);
+    if (got == OC_CORE_STORE_FAILED) { /* the period the location lasts: refused, not guessed */
+        oc_core_logf(k, "cell %u: location claim for %08x: network key read FAILED", (unsigned)cell, (unsigned)tmid);
+        goto done;
+    }
+    l.expires = oc_core_unix(k) + 2u * (got == 0 ? key.period_s : 1800u);
     /* the newest vector that proved it: the same cell re-sending an older
      * claim refreshes the location without lowering it */
     int keep = had && !moved && old.sqn > a.sqn;

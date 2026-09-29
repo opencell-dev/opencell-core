@@ -79,13 +79,15 @@ int oc_core_token_issue(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], u
         s.state != OC_CORE_SUB_ACTIVE || k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
         goto done;
     }
-    int tries = 0;
-    do {
+    int tries = 0, got;
+    do { /* an id known to be free: one whose token could not be read is not taken */
         uint8_t r6[6];
         if (++tries > 8) goto done;
         k->io.random(k->io.ctx, r6, sizeof(r6));
         oc_core_token_id(b->block_idx, r6, t.token_id);
-    } while (k->st.token_get(k->st.ctx, t.token_id, &other) == 0);
+        got = k->st.token_get(k->st.ctx, t.token_id, &other);
+        if (got == OC_CORE_STORE_FAILED) goto done;
+    } while (got != OC_CORE_STORE_NONE);
     memcpy(t.number, number, OC_SIG_NUMBER_LEN);
     k->io.random(k->io.ctx, t.secret, sizeof(t.secret));
     t.expiry = oc_core_unix(k) + valid_s;
@@ -186,8 +188,15 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     }
     /* the token id's block says which core holds it (§14.3): one core, so
      * a token of a block this core isn't home for is unknown here */
-    int known = oc_core_route_home(&k->route, oc_core_route_block(&k->route, oc_core_token_block(tid))) &&
-                k->st.token_get(k->st.ctx, tid, &tok) == 0;
+    int known = oc_core_route_home(&k->route, oc_core_route_block(&k->route, oc_core_token_block(tid)));
+    if (known) {
+        int got = k->st.token_get(k->st.ctx, tid, &tok);
+        if (got == OC_CORE_STORE_FAILED) { /* not "unknown token": no answer, it retries */
+            oc_core_logf(k, "activation of %08x: token read FAILED, no answer", (unsigned)tmid);
+            goto done;
+        }
+        known = got == 0;
+    }
     if (known) {
         int got = k->st.sub_get(k->st.ctx, tok.number, &sub);
         if (got == OC_CORE_STORE_FAILED) { /* not "unknown token" (oc_core_store.h): no answer, it retries */
@@ -333,7 +342,12 @@ static void answer_av(oc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
     int resynced = 0;
     if (st == OC_CORE_AV_OK && auts != NULL) {
         oc_core_av_issued_t seen;
-        if (k->st.av_get(k->st.ctx, sub.number, rand, &seen) != 0) {
+        memset(&seen, 0, sizeof(seen));
+        int got = k->st.av_get(k->st.ctx, sub.number, rand, &seen);
+        if (got == OC_CORE_STORE_FAILED) {
+            oc_core_logf(k, "resync for %08x: vector read FAILED", (unsigned)tmid);
+            st = OC_CORE_AV_UNAVAILABLE; /* a store failure, not a failed authentication */
+        } else if (got != 0) {
             st = OC_CORE_AV_AUTH_FAILED;
             oc_core_audit(k, OC_CORE_AUDIT_AUTH_FAIL, sub.number, tmid, cell, "RAND not issued to this number");
         } else if (oc_sig_av_auts(sub.k, sub.opc, rand, auts, ms) != 0) {

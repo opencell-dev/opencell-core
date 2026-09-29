@@ -21,9 +21,9 @@
  * an open transaction, dooms it the same way. A delete that deletes nothing
  * is not a failure.
  *
- * Lookups (sub_get, sub_by_tmid, loc_get, av_newest_confirmed) tell "none"
- * (OC_CORE_STORE_NONE) from "failed" (OC_CORE_STORE_FAILED): a query that
- * could not run, or a row whose sealed keys do not open, is FAILED. */
+ * Every get tells "none" (OC_CORE_STORE_NONE) from "failed"
+ * (OC_CORE_STORE_FAILED): a query that could not run or bind, or a row
+ * whose sealed keys do not open, is FAILED. */
 #ifndef OC_SQL_H
 #define OC_SQL_H
 

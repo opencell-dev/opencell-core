@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h> /* uid_t, for oc_seal_owner_ok */
 
 #define OC_SEAL_VERSION  1u
 #define OC_SEAL_OVERHEAD 29u /* version + nonce + tag */
@@ -25,9 +26,16 @@ int oc_seal(const uint8_t key[32], const char *table, const char *column, const 
  * length that is not n + OC_SEAL_OVERHEAD for some n <= OC_SEAL_PT_MAX. */
 int oc_unseal(const uint8_t key[32], const char *table, const char *column, const uint8_t *pk, size_t pk_n,
               const uint8_t *in, size_t in_n, uint8_t *pt);
-/* The master key from path: a regular file of exactly 32 bytes that neither
- * group nor others may read (a systemd credential, or --key-file on the
- * bench). 0, or -1 with the reason in err. */
+/* The master key from path: a regular file, exactly 32 bytes, owned by the
+ * caller's effective user (or root) and unreadable by group or others (a
+ * systemd credential, or --key-file on the bench). 0, or -1 with the reason
+ * in err. */
 int oc_key_load(const char *path, uint8_t key[32], char *err, size_t cap);
+
+/* Internal: true if a file owned by file_uid may be used by a process whose
+ * effective uid is self (its own file, or root's). Exposed only so
+ * oc_key_load's ownership check can be tested without a chown, which would
+ * need root privileges the test process doesn't have. */
+int oc_seal_owner_ok(uid_t file_uid, uid_t self);
 
 #endif

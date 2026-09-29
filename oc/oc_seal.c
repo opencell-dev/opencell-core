@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <openssl/evp.h>
@@ -18,6 +19,12 @@ static size_t aad(uint8_t out[AAD_MAX], const char *table, const char *column, c
                   uint8_t version)
 {
     size_t t = strlen(table) + 1u, c = strlen(column) + 1u;
+    /* Bound each part before summing: a huge pk_n (an attacker-influenced
+     * primary key length) could otherwise wrap t + c + pk_n + 1 around
+     * size_t back under AAD_MAX, passing a single combined check and
+     * running memcpy(out + t + c, pk, pk_n) with pk_n bytes into an
+     * AAD_MAX-byte stack buffer. */
+    if (t >= AAD_MAX || c >= AAD_MAX || pk_n >= AAD_MAX) return 0;
     if (t + c + pk_n + 1u > AAD_MAX) return 0;
     memcpy(out, table, t);
     memcpy(out + t, column, c);
@@ -73,29 +80,84 @@ int oc_unseal(const uint8_t key[32], const char *table, const char *column, cons
     return 0;
 }
 
+int oc_seal_owner_ok(uid_t file_uid, uid_t self)
+{
+    return file_uid == self || file_uid == 0;
+}
+
+/* Read up to cap bytes, looping past short reads and EINTR, stopping at
+ * EOF. -1 only on a real read() error (errno left set). The caller compares
+ * the return value against the exact size it wants, rather than trusting a
+ * separate fstat()'d size that a concurrent writer could have moved past by
+ * the time read() actually runs. */
+static ssize_t read_full(int fd, uint8_t *buf, size_t cap)
+{
+    size_t got = 0;
+    while (got < cap) {
+        ssize_t r = read(fd, buf + got, cap - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) break; /* EOF */
+        got += (size_t)r;
+    }
+    return (ssize_t)got;
+}
+
 int oc_key_load(const char *path, uint8_t key[32], char *err, size_t cap)
 {
     struct stat st;
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    uint8_t buf[33]; /* one more than a valid key: any file with >= 33 bytes reads full and is refused */
+    /* O_NONBLOCK: a FIFO with no writer (or certain devices) would
+     * otherwise hang this open() forever; the regular-file check below
+     * rejects it once opened, and O_NONBLOCK has no effect on a real
+     * regular file's read(). O_NOCTTY: never let a tty path become this
+     * process's controlling terminal. */
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
     if (fd < 0) {
         snprintf(err, cap, "%s: %s", path, strerror(errno));
         return -1;
     }
-    int bad = fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != 32;
-    if (bad) {
-        snprintf(err, cap, "%s: the master key must be a file of exactly 32 bytes", path);
-    } else if ((st.st_mode & 077) != 0) {
-        snprintf(err, cap, "%s: readable by group or others (mode %03o): chmod 0400 it", path,
-                 (unsigned)(st.st_mode & 0777));
-        bad = 1;
-    } else if (read(fd, key, 32) != 32) {
-        snprintf(err, cap, "%s: short read", path);
-        /* a partial read may have left some of the key's bytes in the
-         * caller's buffer: wipe them rather than leave a fragment behind on
-         * the failure path. */
-        oc_sig_wipe(key, 32);
-        bad = 1;
+    if (fstat(fd, &st) != 0) {
+        snprintf(err, cap, "%s: %s", path, strerror(errno));
+        close(fd);
+        return -1;
     }
+    if (!S_ISREG(st.st_mode)) {
+        snprintf(err, cap, "%s: not a regular file", path);
+        close(fd);
+        return -1;
+    }
+    if ((st.st_mode & 077) != 0) {
+        snprintf(err, cap, "%s: accessible by group or others (mode %03o): chmod 0400 it", path,
+                 (unsigned)(st.st_mode & 0777));
+        close(fd);
+        return -1;
+    }
+    if (!oc_seal_owner_ok(st.st_uid, geteuid())) {
+        snprintf(err, cap, "%s: owned by uid %u, not this user or root", path, (unsigned)st.st_uid);
+        close(fd);
+        return -1;
+    }
+    ssize_t r = read_full(fd, buf, sizeof(buf));
     close(fd);
-    return bad ? -1 : 0;
+    if (r < 0) {
+        snprintf(err, cap, "%s: %s", path, strerror(errno));
+        oc_sig_wipe(buf, sizeof(buf));
+        return -1;
+    }
+    if (r != 32) {
+        /* Covers both a too-short file and, by reading one byte past 32,
+         * a file that has grown to 33+ bytes since fstat() reported its
+         * size (or was always larger): the size that matters is what
+         * read() actually delivers, not a stat() snapshot that a
+         * concurrent writer could have raced past. */
+        snprintf(err, cap, "%s: the master key must be exactly 32 bytes", path);
+        oc_sig_wipe(buf, sizeof(buf));
+        return -1;
+    }
+    memcpy(key, buf, 32);
+    oc_sig_wipe(buf, sizeof(buf));
+    return 0;
 }

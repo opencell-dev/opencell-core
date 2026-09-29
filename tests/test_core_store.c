@@ -87,6 +87,35 @@ static void test_failed_put_dooms_then_the_flag_resets(void)
     TEST_ASSERT_EQUAL_UINT64(42, sgot.sqn);
 }
 
+/* The same, for the channel-list table (channel-list spec §8): list_put's
+ * full-table branch must doom an open transaction too, not just return -1. */
+static void test_failed_list_put_dooms_then_the_flag_resets(void)
+{
+    lc_core_mem_init(&mem);
+    lc_core_store_t st = lc_core_mem_store(&mem);
+    lc_sig_chan_list_t l, got;
+    memset(&l, 0, sizeof(l));
+    for (unsigned i = 0; i < LC_CORE_MEM_LISTS; i++) {
+        TEST_ASSERT_EQUAL_INT(0, st.list_put(st.ctx, (uint16_t)(i + 1), &l)); /* fills the table */
+    }
+    TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
+    TEST_ASSERT_EQUAL_INT(-1, st.list_put(st.ctx, (uint16_t)(LC_CORE_MEM_LISTS + 1), &l)); /* one past the bound: fails */
+    TEST_ASSERT_EQUAL_INT(-1, st.commit(st.ctx)); /* the failed put dooms the whole transaction */
+    TEST_ASSERT_EQUAL_INT(-1, st.list_get(st.ctx, (uint16_t)(LC_CORE_MEM_LISTS + 1), &got)); /* nothing landed */
+    TEST_ASSERT_EQUAL_UINT(0, mem.commits);
+
+    lc_core_sub_t s, sgot;
+    memset(&s, 0, sizeof(s));
+    contract_num("+883200000000003", s.number);
+    s.sqn = 43;
+    TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s)); /* fits: does not fail */
+    TEST_ASSERT_EQUAL_INT(0, st.commit(st.ctx)); /* the flag did not linger doomed */
+    TEST_ASSERT_EQUAL_UINT(1, mem.commits);
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, s.number, &sgot));
+    TEST_ASSERT_EQUAL_UINT64(43, sgot.sqn);
+}
+
 static void test_logs_keep_the_newest(void)
 {
     lc_core_mem_init(&mem);
@@ -292,6 +321,7 @@ int main(void)
     RUN_TEST(test_mem_store_keeps_the_contract);
     RUN_TEST(test_failed_commit_undoes_everything_since_begin);
     RUN_TEST(test_failed_put_dooms_then_the_flag_resets);
+    RUN_TEST(test_failed_list_put_dooms_then_the_flag_resets);
     RUN_TEST(test_logs_keep_the_newest);
     RUN_TEST(test_netkey_table_fills_then_refuses);
     RUN_TEST(test_cell_table_fills_then_refuses);

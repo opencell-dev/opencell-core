@@ -121,7 +121,7 @@ int  oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us);
  * oc_core_tick's retry. The operator's anchors and the unique-anchor check
  * per group come with network core 2. */
 int  oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us);
-/* The operator's repair (the CLI's `chan-list set --force`): as
+/* The operator's repair (the CLI's `list set ID ... --force`): as
  * oc_core_chan_list_set, but a stored list that can't be read (a failing
  * or malformed row) is replaced, at the version after the last one written
  * for list_id - which the store keeps apart from the list (list_ver_get) -

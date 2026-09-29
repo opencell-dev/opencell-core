@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,12 +22,18 @@ void oc_buf_printf(oc_buf_t *b, const char *fmt, ...)
     va_start(ap, fmt);
     int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    if (n < 0) return;
+    if (n < 0 || (size_t)n > SIZE_MAX / 4u - b->n) {
+        b->err = 1;
+        return;
+    }
     if (b->n + (size_t)n + 1u > b->cap) {
         size_t cap = (b->cap == 0 ? 1024u : b->cap);
         while (cap < b->n + (size_t)n + 1u) cap *= 2u;
         char *p = malloc(cap); /* not realloc: the old buffer (an activation code, say) is wiped first */
-        if (p == NULL) return;
+        if (p == NULL) {
+            b->err = 1; /* the caller must not take a cut output for a whole one */
+            return;
+        }
         if (b->p != NULL) {
             memcpy(p, b->p, b->n + 1u);
             oc_sig_wipe(b->p, b->cap);
@@ -49,6 +56,33 @@ void oc_buf_free(oc_buf_t *b)
 }
 
 /* ---- helpers ---- */
+
+/* Text from a peer, made safe to store and print: C0 controls, DEL, C1
+ * controls (U+0080-U+009F as UTF-8) and bytes that are not UTF-8 (a raw
+ * 0x80-0x9f among them, or a sequence cut short) become '?'. Returns
+ * whether anything changed. */
+static int clean_text(char *s)
+{
+    int changed = 0;
+    for (unsigned char *p = (unsigned char *)s; *p != '\0';) {
+        unsigned c = *p;
+        size_t len = 1;
+        int ok = c >= 0x20 && c != 0x7f;
+        if (ok && c >= 0x80) {
+            len = c >= 0xc2 && c <= 0xdf ? 2u : c >= 0xe0 && c <= 0xef ? 3u : c >= 0xf0 && c <= 0xf4 ? 4u : 0u;
+            ok = len != 0;
+            for (size_t i = 1; ok && i < len; i++) ok = (p[i] & 0xc0) == 0x80;
+            if (ok && c == 0xc2 && p[1] <= 0x9f) ok = 0; /* C1 */
+            if (!ok) len = 1;
+        }
+        if (!ok) {
+            *p = '?';
+            changed = 1;
+        }
+        p += len;
+    }
+    return changed;
+}
 
 static const char USAGE[] =
     "commands: status | net init [--period S] | cell add ID NAME [--mode part15|part97] [--list N]\n"
@@ -334,7 +368,11 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         const char *ms = opt_str(argc, argv, "--mode");
         if ((ms != NULL && mode_arg(ms, &m, o) != 0) || opt_num(argc, argv, "--list", 0, 65535, &list, o) < 0) return 1;
         int ok = strlen(argv[3]) < sizeof(c.name) && argv[3][0] != '-';
-        for (const char *p = argv[3]; *p != '\0'; p++) ok &= (unsigned char)*p >= 0x20 && *p != 0x7f;
+        if (ok) {
+            char name[sizeof(c.name)];
+            snprintf(name, sizeof(name), "%s", argv[3]);
+            ok = !clean_text(name);
+        }
         if (!ok) {
             oc_buf_printf(o, "cell name '%s': 1-%zu printable characters\n", argv[3], sizeof(c.name) - 1u);
             return 1;
@@ -357,6 +395,10 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
     if (got != 0) return store_error(o, "the cell can't be read (nothing changed)");
     if (mode) {
         if (mode_arg(argv[3], &c.mode, o) != 0) return 1;
+        if (!c.enabled) {
+            oc_buf_printf(o, "cell %lu is revoked: nothing changed\n", id);
+            return 1;
+        }
         if (st.cell_put(st.ctx, &c) != 0) return store_error(o, "the mode was not stored");
         if (a->drop_cell != NULL && linked(a, (uint32_t)id)) {
             a->drop_cell(a->ctx, (uint32_t)id);
@@ -364,6 +406,10 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         } else {
             oc_buf_printf(o, "cell %lu: %s, from its next HELLO\n", id, argv[3]);
         }
+        return 0;
+    }
+    if (!c.enabled) {
+        oc_buf_printf(o, "cell %lu is revoked already: nothing changed\n", id);
         return 0;
     }
     if ((k = core(a, o)) == NULL) return 1;
@@ -394,6 +440,7 @@ static int cmd_sub(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
     if (strcmp(argv[1], "add") == 0 && argc <= 3) {
         if (argc == 3) {
             if (number_arg(argv[2], n, o) != 0) return 1;
+            memcpy(a->audit_number, n, OC_SIG_NUMBER_LEN);
             if (!home(a, n) || oc_core_number_reserved(n)) {
                 oc_buf_printf(o, "%s: not in a block this core is home for, or reserved\n", show(n, sh));
                 return 1;
@@ -414,6 +461,7 @@ static int cmd_sub(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
                              "or a store error\n");
             return 1;
         }
+        memcpy(a->audit_number, got, OC_SIG_NUMBER_LEN);
         oc_buf_printf(o, "subscriber %s added\n", show(got, sh));
         return 0;
     }
@@ -421,6 +469,7 @@ static int cmd_sub(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
     int disable = argc == 3 && strcmp(argv[1], "disable") == 0;
     if (!issue && !disable) return 2;
     if (number_arg(argv[2], n, o) != 0) return 1;
+    memcpy(a->audit_number, n, OC_SIG_NUMBER_LEN);
     long hours = 24;
     if (issue && opt_num(argc, argv, "--valid-h", 1, 720, &hours, o) < 0) return 1;
     if (issue && !home(a, n)) {
@@ -444,10 +493,17 @@ static int cmd_sub(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         if (oc_core_token_issue(k, n, (uint32_t)hours * 3600u, &qr) != 0) return store_error(o, "no code issued");
         size_t len = oc_sig_qr_format(&qr, text, sizeof(text));
         oc_sig_wipe(&qr, sizeof(qr));
-        if (len == 0) return store_error(o, "the code could not be formatted");
+        if (len == 0) {
+            oc_sig_wipe(text, sizeof(text));
+            return store_error(o, "the code could not be formatted");
+        }
         oc_buf_printf(o, "activation code for %s, valid %ld h (any older unused code is void):\n%s\n", show(n, sh),
                       hours, text);
         oc_sig_wipe(text, sizeof(text));
+        return 0;
+    }
+    if (state == OC_CORE_SUB_DISABLED) {
+        oc_buf_printf(o, "%s is already disabled: nothing changed\n", show(n, sh));
         return 0;
     }
     if (oc_core_sub_disable(k, n, now_us(a)) != 0) return store_error(o, "the subscriber was not disabled");
@@ -653,6 +709,13 @@ int oc_chan_parse(const char *text, oc_sig_chan_list_t *out, char *err, size_t c
             snprintf(err, cap, "'%.*s' is not a 915 grid channel (902.25-927.75 MHz, 0.5 MHz steps)", (int)num, p);
             return -1;
         }
+        for (uint8_t i = 0; i < out->count; i++) {
+            if (out->freq_hz[i] == hz) {
+                snprintf(err, cap, "'%.*s': %u.%02u MHz twice", (int)len, p, (unsigned)(hz / 1000000u),
+                         (unsigned)(hz % 1000000u / 10000u));
+                return -1;
+            }
+        }
         if (out->count == OC_SIG_CHAN_MAX) {
             snprintf(err, cap, "more than %u entries", OC_SIG_CHAN_MAX);
             return -1;
@@ -667,7 +730,9 @@ int oc_chan_parse(const char *text, oc_sig_chan_list_t *out, char *err, size_t c
 /* ---- dispatch and audit ---- */
 
 /* The record of one command: "u<uid> [(refused)|(usage)] <words>", cut to
- * the detail's size, a peer's control characters shown as '?'. */
+ * the detail's size, a peer's control characters shown as '?' (clean_text),
+ * with the subscriber's number in its own column when the command named or
+ * picked one. */
 static void audit(oc_admin_t *a, int argc, char **argv, int rc, oc_buf_t *out)
 {
     oc_core_audit_t r;
@@ -675,14 +740,13 @@ static void audit(oc_admin_t *a, int argc, char **argv, int rc, oc_buf_t *out)
     memset(&r, 0, sizeof(r));
     r.ts = (uint32_t)time(NULL);
     r.event = OC_CORE_AUDIT_ADMIN;
+    memcpy(r.number, a->audit_number, OC_SIG_NUMBER_LEN); /* all zero: none (NULL in the column) */
     int n = snprintf(r.detail, sizeof(r.detail), "u%u%s", a->uid,
                      rc == 0 ? "" : rc == 2 ? " (usage)" : " (refused)");
     for (int i = 0; i < argc && n > 0 && (size_t)n < sizeof(r.detail); i++) {
         n += snprintf(r.detail + n, sizeof(r.detail) - (size_t)n, " %s", argv[i]);
     }
-    for (char *c = r.detail; *c != '\0'; c++) {
-        if ((unsigned char)*c < 0x20 || *c == 0x7f) *c = '?';
-    }
+    clean_text(r.detail);
     if (st.audit_add(st.ctx, &r) != 0) {
         oc_log(OC_LOG_ERR, "admin: audit write FAILED");
         oc_buf_printf(out, "WARNING: store error: this command's audit record was not written\n");
@@ -693,6 +757,7 @@ int oc_admin_run(oc_admin_t *a, int argc, char **argv, oc_buf_t *out)
 {
     int rc = 2;
     const char *c = argc >= 1 ? argv[0] : "";
+    memset(a->audit_number, 0, sizeof(a->audit_number));
     if (strcmp(c, "status") == 0 && argc == 1) rc = cmd_status(a, out);
     else if (strcmp(c, "net") == 0) rc = cmd_net(a, argc, argv, out);
     else if (strcmp(c, "cell") == 0) rc = cmd_cell(a, argc, argv, out);
@@ -703,6 +768,10 @@ int oc_admin_run(oc_admin_t *a, int argc, char **argv, oc_buf_t *out)
     else if (strcmp(c, "list") == 0) rc = cmd_list(a, argc, argv, out);
     else if (strcmp(c, "import-ocb-hss") == 0 && argc == 2) rc = oc_import_ocb_hss(a, argv[1], out);
     if (rc == 2) oc_buf_printf(out, "%s", USAGE);
+    if (out->err) { /* the output is cut: `sub issue` must not look done with no code shown */
+        rc = 1;
+        oc_buf_printf(out, "\nout of memory: this output is incomplete (a code not shown can be issued again)\n");
+    }
     audit(a, argc, argv, rc, out);
     return rc;
 }

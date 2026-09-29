@@ -4,24 +4,33 @@
  *   network key_id=1 sk=<64 hex> pk=<64 hex> mode=part15 period=1800
  *   sub number=+883160655501234 token_id=<16 hex> token_secret=<32 hex> expiry=<unix s>
  *       used=0|1 tmid=<8 hex> activated=0|1 k=<32 hex> opc=<32 hex> sqn=<12 hex>   (one line)
- * Everything is checked before anything is written, and then written in
- * one transaction. The keys (SKn, K, OPc) go into the store, which seals
- * them, and nowhere else: no message names them, every copy here is wiped
- * on every path, and a store that can't answer refuses the import (a
- * network key there but unreadable must not be written over). */
+ * The file must be a regular file of at most 64 KiB. It is read with
+ * read(2) into one buffer of our own - no stdio, whose buffer would keep a
+ * copy of the keys we could not wipe - and that buffer, the line being
+ * parsed and the parsed records are wiped on every path. The keys (SKn, K,
+ * OPc) go into the store, which seals them, and nowhere else: no message
+ * names them. The write lock is taken first (BEGIN IMMEDIATE), then
+ * everything is checked, then written, then committed: the checks and the
+ * writes are one transaction. A store that can't answer refuses the import
+ * (a network key there but unreadable must not be written over). */
 #include "oc_admin.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "oc_sig_crypto.h"
 #include "oc_sig_keys.h"
 
 #define IMPORT_SUBS 64u
+#define IMPORT_MAX  (64u * 1024u) /* bytes: ocbench's 16 subscribers take ~4 KiB */
+#define IMPORT_LINE 512u
 
 typedef struct {
     uint8_t  number[OC_SIG_NUMBER_LEN];
@@ -65,17 +74,17 @@ static int num(const char *s, unsigned long max, unsigned long *out, int base)
     return 0;
 }
 
-/* One line's fields: 0, or -1 (an unknown key, a bad value, a field missing
- * or twice). */
-static int parse_line(imp_t *m, char *kind, char *save)
+/* One line's fields: NULL, or why the line is refused. */
+static const char *parse_line(imp_t *m, char *kind, char *save)
 {
+    static const char BAD[] = "not an ocbench HSS line";
     unsigned seen = 0, want, bit;
     unsigned long v;
     imp_sub_t s;
-    int ret = -1;
+    const char *ret = BAD;
     memset(&s, 0, sizeof(s));
     int net = strcmp(kind, "network") == 0;
-    if (!net && strcmp(kind, "sub") != 0) return -1;
+    if (!net && strcmp(kind, "sub") != 0) return BAD;
     for (char *tok = strtok_r(NULL, " \t\n", &save); tok != NULL; tok = strtok_r(NULL, " \t\n", &save)) {
         char *val = strchr(tok, '=');
         if (val == NULL) goto done;
@@ -99,19 +108,28 @@ static int parse_line(imp_t *m, char *kind, char *save)
         else if (!net && strcmp(tok, "expiry") == 0) bit = 256;
         else if (!net && strcmp(tok, "used") == 0) bit = 512;
         else goto done;
-        if (seen & bit) goto done; /* a field twice */
+        if (seen & bit) {
+            ret = "a field twice";
+            goto done;
+        }
         seen |= bit;
     }
     want = net ? 31u : 1023u;
     if (seen != want) goto done;
     if (net) {
-        if (m->have_net) goto done; /* one network line */
+        if (m->have_net) {
+            ret = "a second network line";
+            goto done;
+        }
         m->have_net = 1;
     } else {
-        if (m->n >= IMPORT_SUBS) goto done;
+        if (m->n >= IMPORT_SUBS) {
+            ret = "more than 64 subscribers";
+            goto done;
+        }
         m->sub[m->n++] = s;
     }
-    ret = 0;
+    ret = NULL;
 done:
     oc_sig_wipe(&s, sizeof(s));
     return ret;
@@ -120,36 +138,70 @@ done:
 /* The file into m: 0, or 1 with the reason in o. */
 static int load(imp_t *m, const char *path, oc_buf_t *o)
 {
-    char line[512];
+    char line[IMPORT_LINE];
+    struct stat sb;
+    size_t n = 0, pos = 0;
     unsigned ln = 0;
     int ret = 0;
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
+    /* O_NONBLOCK: a FIFO with no writer must not hang the open (it is refused below) */
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) {
         oc_buf_printf(o, "%s: %s (nothing imported)\n", path, strerror(errno));
         return 1;
     }
-    while (ret == 0 && fgets(line, sizeof(line), f) != NULL) {
-        char *save = NULL, *kind;
-        ln++;
-        size_t len = strlen(line);
-        if (len == sizeof(line) - 1u && line[len - 1u] != '\n' && !feof(f)) {
-            oc_buf_printf(o, "%s:%u: line too long for an ocbench HSS line (nothing imported)\n", path, ln);
-            ret = 1;
-            break;
-        }
-        kind = strtok_r(line, " \t\n", &save);
-        if (kind == NULL || kind[0] == '#') continue;
-        if (parse_line(m, kind, save) != 0) {
-            oc_buf_printf(o, "%s:%u: not an ocbench HSS line (nothing imported)\n", path, ln);
-            ret = 1;
-        }
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        close(fd);
+        oc_buf_printf(o, "%s: not a regular file (nothing imported)\n", path);
+        return 1;
     }
-    if (ret == 0 && ferror(f)) {
-        oc_buf_printf(o, "%s: read error (nothing imported)\n", path);
+    char *buf = sb.st_size <= (off_t)IMPORT_MAX ? malloc(IMPORT_MAX + 1u) : NULL;
+    if (buf == NULL) {
+        close(fd);
+        oc_buf_printf(o, "%s: %s (nothing imported)\n", path,
+                      sb.st_size > (off_t)IMPORT_MAX ? "larger than 64 KiB: not an ocbench HSS" : "out of memory");
+        return 1;
+    }
+    for (;;) { /* one byte past the cap, to see a file that grew */
+        ssize_t r = read(fd, buf + n, IMPORT_MAX + 1u - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) ret = 1;
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (n > IMPORT_MAX) break;
+    }
+    close(fd);
+    if (ret != 0) oc_buf_printf(o, "%s: read error (nothing imported)\n", path);
+    if (ret == 0 && n > IMPORT_MAX) {
+        oc_buf_printf(o, "%s: larger than 64 KiB: not an ocbench HSS (nothing imported)\n", path);
         ret = 1;
     }
+    while (ret == 0 && pos < n) {
+        const char *start = buf + pos, *nl = memchr(start, '\n', n - pos);
+        size_t len = nl != NULL ? (size_t)(nl - start) : n - pos;
+        const char *why = NULL;
+        pos += len + (nl != NULL);
+        ln++;
+        if (memchr(start, '\0', len) != NULL) why = "a NUL byte in the line";
+        else {
+            if (len > 0 && start[len - 1u] == '\r') len--; /* CRLF, as an editor may leave it */
+            if (len >= sizeof(line)) why = "line too long for an ocbench HSS line";
+        }
+        if (why == NULL) {
+            char *save = NULL, *kind;
+            memcpy(line, start, len);
+            line[len] = '\0';
+            kind = strtok_r(line, " \t", &save);
+            if (kind == NULL || kind[0] == '#') continue;
+            why = parse_line(m, kind, save);
+        }
+        if (why != NULL) {
+            oc_buf_printf(o, "%s:%u: %s (nothing imported)\n", path, ln, why);
+            ret = 1;
+        }
+    }
     oc_sig_wipe(line, sizeof(line));
-    fclose(f);
+    oc_sig_wipe(buf, IMPORT_MAX + 1u);
+    free(buf);
     return ret;
 }
 
@@ -225,12 +277,13 @@ static int check(oc_admin_t *a, imp_t *m, const char *path, int *key_there, oc_b
     return 0;
 }
 
-/* One transaction: 0, or 1 (nothing written). */
-static int write_all(oc_admin_t *a, const imp_t *m, int key_there, oc_buf_t *o)
+/* The writes, inside the caller's transaction: 0, or 1 (then the commit
+ * fails too: a failed write dooms the transaction, oc_core_store.h). */
+static int write_all(oc_admin_t *a, const imp_t *m, int key_there)
 {
     oc_core_store_t st = oc_sql_store(a->sql);
     uint32_t now = (uint32_t)time(NULL);
-    int bad = st.begin(st.ctx) != 0; /* a failed begin dooms it: nothing below is written, commit fails */
+    int bad = 0;
     if (!key_there) {
         oc_core_netkey_t key;
         memset(&key, 0, sizeof(key));
@@ -258,12 +311,7 @@ static int write_all(oc_admin_t *a, const imp_t *m, int key_there, oc_buf_t *o)
         bad |= st.sub_put(st.ctx, &x) != 0;
         oc_sig_wipe(&x, sizeof(x));
     }
-    bad |= st.commit(st.ctx) != 0;
-    if (bad) {
-        oc_buf_printf(o, "store error: nothing imported\n");
-        return 1;
-    }
-    return 0;
+    return bad;
 }
 
 int oc_import_ocb_hss(oc_admin_t *a, const char *path, oc_buf_t *o)
@@ -279,8 +327,23 @@ int oc_import_ocb_hss(oc_admin_t *a, const char *path, oc_buf_t *o)
         return 1;
     }
     int rc = load(m, path, o);
-    if (rc == 0) rc = check(a, m, path, &key_there, o);
-    if (rc == 0) rc = write_all(a, m, key_there, o);
+    if (rc == 0) {
+        oc_core_store_t st = oc_sql_store(a->sql);
+        if (st.begin(st.ctx) != 0) { /* the write lock, before the checks */
+            st.commit(st.ctx);       /* closes the doomed transaction (-1 by contract) */
+            oc_buf_printf(o, "store error: can't take the database's write lock (nothing imported)\n");
+            rc = 1;
+        } else {
+            rc = check(a, m, path, &key_there, o);
+            int wrote = rc == 0 && write_all(a, m, key_there) == 0;
+            /* refused: an empty transaction ends it and writes nothing */
+            if (st.commit(st.ctx) != 0 && rc == 0) wrote = 0;
+            if (rc == 0 && !wrote) {
+                oc_buf_printf(o, "store error: nothing imported\n");
+                rc = 1;
+            }
+        }
+    }
     if (rc == 0) {
         oc_buf_printf(o, "network key %u %s\n", m->key_id, key_there ? "was there already" : "imported");
         for (unsigned i = 0; i < m->n; i++) {

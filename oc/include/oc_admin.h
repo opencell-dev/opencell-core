@@ -4,8 +4,10 @@
  * through oc_core and the store, so a disable in the daemon sends its
  * LOC_CANCEL at once. Every command - done, refused, failed or not a
  * command at all - is written to the audit log (event OC_CORE_AUDIT_ADMIN,
- * "u<uid> [(refused)|(usage)] <command line>", control characters shown as
- * '?').
+ * "u<uid> [(refused)|(usage)] <command line>", with the subscriber's number
+ * in the record's number column for sub commands; C0 and C1 control
+ * characters and bytes that are not UTF-8 shown as '?'). An output buffer
+ * that could not grow (oc_buf_t.err) makes the command's result 1.
  *
  *   status
  *   net init [--period S]                  the network key pair (first setup)
@@ -39,6 +41,7 @@
 typedef struct {
     char  *p; /* NUL-terminated */
     size_t n, cap;
+    int    err; /* an append did not fit and could not grow: p is incomplete (the caller clears it) */
 } oc_buf_t;
 
 void oc_buf_printf(oc_buf_t *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -61,6 +64,7 @@ typedef struct {
     /* private */
     oc_core_t own;
     int       have_own;
+    uint8_t   audit_number[OC_SIG_NUMBER_LEN]; /* the number this command named, for its audit record */
 } oc_admin_t;
 
 /* Runs one command: argv[0] is its first word ("sub"). Output goes to out.

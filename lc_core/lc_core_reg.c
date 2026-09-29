@@ -97,6 +97,10 @@ static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         /* §19.2: not older than the location, nor than any vector another
          * cell has proved (those rows outlive a purged or expired location
          * as long as this claim's vector can be replayed) */
+        /* the location's own SQN is a floor here too, deliberately, next to
+         * the confirmed-av_issued floor below: defence in depth against a
+         * stale replay the other floor alone might miss (e.g. no confirmed
+         * row survives a purge) - do not "simplify" this away. */
         if (had) floor = old.sqn;
         if (k->st.av_newest_confirmed(k->st.ctx, num, cell, &top) == 0 && top > floor) floor = top;
         if (a.sqn < floor) {

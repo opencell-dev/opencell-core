@@ -9,6 +9,10 @@
  * (CALL_OFFER) by a core call ref with LC_CORE_REF_CORE set. Every later
  * message about a leg, in either direction, carries the ref it started with.
  *
+ * CELL_CFG (K->C) carries the cell's channel list (channel-list spec §8) as
+ * a CHAN_LIST body exactly as lc_sig encodes it (lc_sig_body_encode: its
+ * frequencies are big-endian, as everywhere in lc_sig).
+ *
  * Types not listed here are free. */
 #ifndef LC_CORE_MSG_H
 #define LC_CORE_MSG_H
@@ -23,6 +27,7 @@
 
 typedef enum {
     LC_CORE_HELLO = 0x01, LC_CORE_HELLO_ACK = 0x02, LC_CORE_HELLO_NAK = 0x03, LC_CORE_PING = 0x04, LC_CORE_PONG = 0x05,
+    LC_CORE_CELL_CFG = 0x06,
     LC_CORE_ACT_FWD = 0x10, LC_CORE_ACT_RES = 0x11, LC_CORE_AV_REQ = 0x12, LC_CORE_AV_RES = 0x13,
     LC_CORE_RESYNC = 0x14,
     LC_CORE_LOC_UPDATE = 0x18, LC_CORE_LOC_PURGE = 0x19, LC_CORE_LOC_CANCEL = 0x1A,
@@ -70,6 +75,7 @@ typedef struct {
         struct { uint8_t proto; uint32_t cell_id; uint64_t boot_id; uint8_t sw_version[3]; } hello;
         struct { uint8_t mode; uint16_t period_s, key_id; uint8_t echo_number[LC_SIG_NUMBER_LEN]; } hello_ack;
         struct { uint8_t reason; } hello_nak;
+        struct { lc_sig_chan_list_t list; } cell_cfg; /* list.count 0: no entries */
         struct { uint16_t req; uint32_t tmid; uint8_t token_id[8], pkt[32], tag[8]; } act_fwd;
         struct { uint16_t req; uint32_t tmid; lc_sig_msg_t msg; } act_res; /* msg: ACT_ACK or ACT_NAK */
         struct { uint16_t req; uint32_t tmid; uint8_t count; } av_req;

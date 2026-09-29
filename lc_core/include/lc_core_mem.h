@@ -18,12 +18,16 @@
 #define LC_CORE_MEM_TOKENS (2u * LC_CORE_MEM_SUBS)
 #define LC_CORE_MEM_AVS    256u
 #define LC_CORE_MEM_LOG    64u
+#define LC_CORE_MEM_LISTS  8u
 
 typedef struct {
     lc_core_netkey_t    key[LC_CORE_MEM_KEYS];
     unsigned            nkey;
     lc_core_cell_t      cell[LC_CORE_MEM_CELLS];
     unsigned            ncell;
+    uint16_t            list_id[LC_CORE_MEM_LISTS];
+    lc_sig_chan_list_t  list[LC_CORE_MEM_LISTS];
+    unsigned            nlist;
     lc_core_sub_t       sub[LC_CORE_MEM_SUBS];
     unsigned            nsub;
     lc_core_token_t     token[LC_CORE_MEM_TOKENS];

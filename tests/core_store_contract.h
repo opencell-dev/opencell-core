@@ -42,6 +42,21 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_UINT8(1, cell2.enabled);
     TEST_ASSERT_EQUAL_INT(-1, st->cell_get(c, 8, &cell2));
 
+    /* channel lists: one per list group, replaced by group */
+    lc_sig_chan_list_t cl, cl2;
+    memset(&cl, 0, sizeof(cl));
+    cl.ver = 1;
+    cl.count = 1;
+    cl.freq_hz[0] = 917250000u;
+    TEST_ASSERT_EQUAL_INT(-1, st->list_get(c, 3, &cl2));
+    TEST_ASSERT_EQUAL_INT(0, st->list_put(c, 3, &cl));
+    cl.ver = 2;
+    cl.flags[0] = LC_SIG_CHAN_FIXED;
+    TEST_ASSERT_EQUAL_INT(0, st->list_put(c, 3, &cl));
+    TEST_ASSERT_EQUAL_INT(0, st->list_get(c, 3, &cl2));
+    TEST_ASSERT_EQUAL_MEMORY(&cl, &cl2, sizeof(cl));
+    TEST_ASSERT_EQUAL_INT(-1, st->list_get(c, 4, &cl2));
+
     /* subscribers: by number; by TMID only while activated */
     lc_core_sub_t s, s2;
     memset(&s, 0, sizeof(s));

@@ -104,6 +104,9 @@ typedef struct {
     int (*netkey_put)(void *ctx, const lc_core_netkey_t *k);
     int (*cell_get)(void *ctx, uint32_t cell_id, lc_core_cell_t *out);
     int (*cell_put)(void *ctx, const lc_core_cell_t *c);
+    /* channel lists, one per list group (channel-list spec §8; list_id 1-65535) */
+    int (*list_get)(void *ctx, uint16_t list_id, lc_sig_chan_list_t *out);
+    int (*list_put)(void *ctx, uint16_t list_id, const lc_sig_chan_list_t *l); /* insert or replace */
     int (*sub_get)(void *ctx, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_sub_t *out);
     int (*sub_by_tmid)(void *ctx, uint32_t tmid, lc_core_sub_t *out); /* activated and bound to tmid */
     int (*sub_put)(void *ctx, const lc_core_sub_t *s);                /* insert or replace */

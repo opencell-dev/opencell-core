@@ -644,6 +644,7 @@ static void test_backhaul_outage_at_a_cell(void)
     run_ms(2000);
     TERM[4].cell = 1; /* to cell 2 */
     for (int k = 0; k < 100 && (sess_on(1, 4) == NULL || !sess_on(1, 4)->auth_pending); k++) frame();
+    TEST_ASSERT_NOT_NULL(sess_on(1, 4));
     TEST_ASSERT_TRUE_MESSAGE(sess_on(1, 4)->auth_pending, "AUTH_REQ on its way");
     sim_disconnect(1);
     run_ms(3000);
@@ -908,9 +909,59 @@ static void test_silent_callee_cell_times_out(void)
     TEST_ASSERT_EQUAL_INT(LC_SIG_CAUSE_NET_FAILURE, ended(1)); /* its ringing leg released too */
 }
 
+/* Channel-list spec §7-8: the core's list for group 1 reaches cells 1 and 2
+ * (CELL_CFG), and each pushes it to its terminals after REG_ACK. A change
+ * reaches the cells at once and a terminal when it asks (a config service
+ * request: its beacon's cfg_ver changed); a restarted cell gets the list at
+ * HELLO. Cell 3 (group 2, no list) pushes nothing. */
+static void test_channel_list_from_the_core(void)
+{
+    sim_world();
+    lc_sig_chan_list_t l, got;
+    memset(&l, 0, sizeof(l));
+    l.count = 2;
+    l.freq_hz[0] = 917250000u;
+    l.freq_hz[1] = 922250000u;
+    l.flags[1] = LC_SIG_CHAN_FIXED;
+    TEST_ASSERT_EQUAL_INT(1, lc_core_chan_list_set(&CORE, 1, &l, now));
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT8(1, lc_cell_list_ver(&CELL[0].c));
+    TEST_ASSERT_EQUAL_UINT8(1, lc_cell_list_ver(&CELL[1].c));
+    TEST_ASSERT_EQUAL_UINT8(0, lc_cell_list_ver(&CELL[2].c));
+
+    registered_on(0, 0);
+    registered_on(1, 2);
+    TEST_ASSERT_EQUAL_INT(1, lc_sig_term_chan_list(&TERM[0].t, &got)); /* pushed after REG_ACK */
+    TEST_ASSERT_EQUAL_UINT8(1, got.ver);
+    TEST_ASSERT_EQUAL_UINT8(2, got.count);
+    TEST_ASSERT_EQUAL_UINT32(922250000u, got.freq_hz[1]);
+    TEST_ASSERT_EQUAL_HEX8(LC_SIG_CHAN_FIXED, got.flags[1]);
+    TEST_ASSERT_EQUAL_INT(0, lc_sig_term_chan_list(&TERM[1].t, &got)); /* cell 3 has none */
+
+    l.count = 1; /* the operator changes group 1's list */
+    TEST_ASSERT_EQUAL_INT(2, lc_core_chan_list_set(&CORE, 1, &l, now));
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT8(2, lc_cell_list_ver(&CELL[0].c));
+    uint8_t svc = (uint8_t)(LC_SIG_KIND_SVC | LC_SIG_SVC_CONFIG); /* T0 saw cfg_ver 2 in the beacon */
+    lc_cell_upper(&CELL[0].c, TERM[0].tmid, &svc, 1, now);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(1, lc_sig_term_chan_list(&TERM[0].t, &got));
+    TEST_ASSERT_EQUAL_UINT8(2, got.ver);
+    TEST_ASSERT_EQUAL_UINT8(1, got.count);
+    TEST_ASSERT_EQUAL_UINT8(LC_SIG_ST_REGISTERED, state(0));
+
+    sim_disconnect(1); /* cell 2 restarts: HELLO brings the list back */
+    sim_cell_start(1);
+    TEST_ASSERT_EQUAL_UINT8(0, lc_cell_list_ver(&CELL[1].c));
+    sim_connect(1);
+    run_ms(500);
+    TEST_ASSERT_EQUAL_UINT8(2, lc_cell_list_ver(&CELL[1].c));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_channel_list_from_the_core);
     RUN_TEST(test_activation_and_registration_through_the_core);
     RUN_TEST(test_registration_while_the_core_link_comes_up);
     RUN_TEST(test_an_offline_registration_is_reported_when_the_link_is_back);

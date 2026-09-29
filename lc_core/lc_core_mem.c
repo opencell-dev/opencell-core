@@ -101,6 +101,35 @@ static int cell_put(void *c, const lc_core_cell_t *x)
     return 0;
 }
 
+static int list_get(void *c, uint16_t list_id, lc_sig_chan_list_t *out)
+{
+    for (unsigned i = 0; i < D(c)->nlist; i++) {
+        if (D(c)->list_id[i] == list_id) {
+            *out = D(c)->list[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int list_put(void *c, uint16_t list_id, const lc_sig_chan_list_t *l)
+{
+    lc_core_mem_data_t *d = D(c);
+    for (unsigned i = 0; i < d->nlist; i++) {
+        if (d->list_id[i] == list_id) {
+            d->list[i] = *l;
+            return 0;
+        }
+    }
+    if (d->nlist >= LC_CORE_MEM_LISTS) {
+        fail_txn(c);
+        return -1;
+    }
+    d->list_id[d->nlist] = list_id;
+    d->list[d->nlist++] = *l;
+    return 0;
+}
+
 static int sub_get(void *c, const uint8_t number[LC_SIG_NUMBER_LEN], lc_core_sub_t *out)
 {
     for (unsigned i = 0; i < D(c)->nsub; i++) {
@@ -341,6 +370,8 @@ lc_core_store_t lc_core_mem_store(lc_core_mem_t *m)
         .netkey_put = netkey_put,
         .cell_get = cell_get,
         .cell_put = cell_put,
+        .list_get = list_get,
+        .list_put = list_put,
         .sub_get = sub_get,
         .sub_by_tmid = sub_by_tmid,
         .sub_put = sub_put,

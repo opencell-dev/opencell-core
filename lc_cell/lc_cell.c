@@ -475,6 +475,10 @@ void lc_cell_core_rx(lc_cell_t *c, const lc_core_msg_t *m, uint64_t now_us)
         }
         logf_(c, "core: HELLO accepted");
         break;
+    case LC_CORE_CELL_CFG: /* the core's list for this cell's group: pushed to terminals from now on */
+        lc_sig_net_set_chan_list(&c->net, &m->u.cell_cfg.list);
+        logf_(c, "core: channel list v%u, %u entries", m->u.cell_cfg.list.ver, m->u.cell_cfg.list.count);
+        break;
     case LC_CORE_HELLO_NAK:
         logf_(c, "core: HELLO refused (%u)", m->u.hello_nak.reason);
         c->ready = 0;
@@ -584,4 +588,9 @@ void lc_cell_tick(lc_cell_t *c, uint64_t now_us)
         p.type = LC_CORE_PING;
         to_core(c, &p);
     }
+}
+
+uint8_t lc_cell_list_ver(const lc_cell_t *c)
+{
+    return c->net.have_list ? c->net.list.ver : 0;
 }

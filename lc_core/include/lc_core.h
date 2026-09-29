@@ -92,6 +92,13 @@ void lc_core_tick(lc_core_t *k, uint64_t now_us);
  * drops its link. */
 int  lc_core_cell_add(lc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id);
 int  lc_core_cell_revoke(lc_core_t *k, uint32_t cell_id, uint64_t now_us);
+/* The channel list of list group list_id (channel-list spec §8): stored, and
+ * sent in CELL_CFG to every linked cell of the group now and to each after
+ * its HELLO_ACK. The core numbers the versions (list->ver is ignored): 1, 2,
+ * ... 255, then 1 again. The new version, or -1: list_id 0, more than
+ * LC_SIG_CHAN_MAX entries, or the store failed. The operator's anchors and
+ * the unique-anchor check per group come with network core 2. */
+int  lc_core_chan_list_set(lc_core_t *k, uint16_t list_id, const lc_sig_chan_list_t *list, uint64_t now_us);
 
 /* Subscribers (admin). number NULL: a random free number in the first NANP
  * block this core is home for (numbering-plan.md "Assignment Modes"). 0 with

@@ -299,6 +299,35 @@ static void test_what_does_not_decode(void)
     TEST_ASSERT_EQUAL_INT(-1, lc_core_decode(big, sizeof(big), &m));
 }
 
+/* CELL_CFG carries a CHAN_LIST body exactly as lc_sig encodes it:
+ * ver, count, then count x { freq_hz (big-endian, as in lc_sig), flags }. */
+static void test_cell_cfg(void)
+{
+    lc_core_msg_t m, back;
+    uint8_t buf[LC_CORE_FRAME_MAX];
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_CELL_CFG;
+    m.u.cell_cfg.list.ver = 1;
+    m.u.cell_cfg.list.count = 2;
+    m.u.cell_cfg.list.freq_hz[0] = 917250000u;
+    m.u.cell_cfg.list.freq_hz[1] = 922250000u;
+    m.u.cell_cfg.list.flags[1] = LC_SIG_CHAN_FIXED;
+    static const uint8_t cfg[] = { 0x00, 0x0D, 0x06, 0x01, 0x02, 0x36, 0xAC, 0x1F, 0xD0, 0x00,
+                                   0x36, 0xF8, 0x6B, 0x10, 0x01 };
+    golden(&m, cfg, sizeof(cfg));
+
+    memset(&m, 0, sizeof(m)); /* no entries: the group's list was emptied */
+    m.type = LC_CORE_CELL_CFG;
+    m.u.cell_cfg.list.ver = 9;
+    static const uint8_t empty[] = { 0x00, 0x03, 0x06, 0x09, 0x00 };
+    golden(&m, empty, sizeof(empty));
+
+    m.u.cell_cfg.list.count = LC_SIG_CHAN_MAX + 1u;
+    TEST_ASSERT_EQUAL_size_t(0, lc_core_encode(&m, buf, sizeof(buf)));
+    static const uint8_t cut[] = { 0x00, 0x07, 0x06, 0x01, 0x01, 0x36, 0xAC, 0x1F, 0xD0 }; /* no flags byte */
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_decode(cut, sizeof(cut), &back));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -307,5 +336,6 @@ int main(void)
     RUN_TEST(test_the_largest_av_res_fits_a_frame);
     RUN_TEST(test_proto_2_and_the_old_av_res_does_not_decode);
     RUN_TEST(test_what_does_not_decode);
+    RUN_TEST(test_cell_cfg);
     return UNITY_END();
 }

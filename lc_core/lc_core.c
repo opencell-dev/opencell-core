@@ -140,6 +140,16 @@ void lc_core_link_down(lc_core_t *k, uint32_t link, uint64_t now_us)
     if (cell != 0) cell_gone(k, cell, now_us);
 }
 
+/* CELL_CFG with list group list_id's channel list, if the group has one. */
+static void send_list(lc_core_t *k, lc_core_link_t *l, uint16_t list_id)
+{
+    lc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = LC_CORE_CELL_CFG;
+    if (list_id == 0 || k->st.list_get(k->st.ctx, list_id, &m.u.cell_cfg.list) != 0) return;
+    send_link(k, l, &m);
+}
+
 static void on_hello(lc_core_t *k, lc_core_link_t *l, const lc_core_msg_t *m, uint64_t now)
 {
     lc_core_cell_t c;
@@ -189,6 +199,7 @@ static void on_hello(lc_core_t *k, lc_core_link_t *l, const lc_core_msg_t *m, ui
     r.u.hello_ack.key_id = k->cfg.key_id;
     memcpy(r.u.hello_ack.echo_number, k->cfg.echo_number, LC_SIG_NUMBER_LEN);
     send_link(k, l, &r);
+    send_list(k, l, c.list_id);
 }
 
 void lc_core_rx(lc_core_t *k, uint32_t link, const lc_core_msg_t *m, uint64_t now_us)
@@ -277,4 +288,26 @@ int lc_core_cell_revoke(lc_core_t *k, uint32_t cell_id, uint64_t now_us)
     lc_core_link_t *l = link_of_cell(k, cell_id);
     if (l != NULL) drop(k, l, now_us);
     return 0;
+}
+
+int lc_core_chan_list_set(lc_core_t *k, uint16_t list_id, const lc_sig_chan_list_t *list, uint64_t now_us)
+{
+    lc_sig_chan_list_t l, old;
+    k->now = now_us;
+    if (list_id == 0 || list->count > LC_SIG_CHAN_MAX) return -1;
+    memset(&l, 0, sizeof(l));
+    l.count = list->count;
+    memcpy(l.freq_hz, list->freq_hz, sizeof(l.freq_hz[0]) * l.count);
+    memcpy(l.flags, list->flags, l.count);
+    l.ver = k->st.list_get(k->st.ctx, list_id, &old) == 0 && old.ver != 255u ? (uint8_t)(old.ver + 1u) : 1u;
+    if (k->st.list_put(k->st.ctx, list_id, &l) != 0) return -1;
+    for (unsigned i = 0; i < LC_CORE_LINKS; i++) {
+        lc_core_link_t *ln = &k->links[i];
+        lc_core_cell_t c;
+        if (ln->used && ln->cell_id != 0 && k->st.cell_get(k->st.ctx, ln->cell_id, &c) == 0 && c.list_id == list_id) {
+            send_list(k, ln, list_id);
+        }
+    }
+    lc_core_logf(k, "channel list %u: version %u, %u entries", (unsigned)list_id, (unsigned)l.ver, (unsigned)l.count);
+    return l.ver;
 }

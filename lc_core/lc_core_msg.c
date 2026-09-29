@@ -96,6 +96,16 @@ size_t lc_core_encode(const lc_core_msg_t *m, uint8_t *out, size_t cap)
     case LC_CORE_PING:
     case LC_CORE_PONG:
         break;
+    case LC_CORE_CELL_CFG: {
+        lc_sig_msg_t cl;
+        memset(&cl, 0, sizeof(cl));
+        cl.type = LC_SIG_CHAN_LIST;
+        cl.u.chan_list = m->u.cell_cfg.list;
+        sn = lc_sig_body_encode(&cl, sig, sizeof(sig));
+        if (sn == 0) return 0;
+        wb(&w, sig, sn);
+        break;
+    }
     case LC_CORE_ACT_FWD:
         w16(&w, m->u.act_fwd.req);
         w32(&w, m->u.act_fwd.tmid);
@@ -205,6 +215,13 @@ int lc_core_decode(const uint8_t *in, size_t len, lc_core_msg_t *m)
     case LC_CORE_PING:
     case LC_CORE_PONG:
         break;
+    case LC_CORE_CELL_CFG: {
+        lc_sig_msg_t cl;
+        if (lc_sig_body_decode(LC_SIG_CHAN_LIST, in + r.at, len - r.at, &cl) != 0) return -1;
+        m->u.cell_cfg.list = cl.u.chan_list;
+        r.at = len;
+        break;
+    }
     case LC_CORE_ACT_FWD:
         m->u.act_fwd.req = r16(&r);
         m->u.act_fwd.tmid = r32(&r);

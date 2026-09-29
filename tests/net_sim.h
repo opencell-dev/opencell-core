@@ -344,7 +344,9 @@ static inline void sim_world(void)
     for (int i = 0; i < SIM_CELLS; i++) {
         char name[] = "cell ?";
         name[5] = (char)('1' + i);
-        TEST_ASSERT_EQUAL_INT(0, lc_core_cell_add(&CORE, (uint32_t)(i + 1), name, LC_SIG_MODE_PART15, 0));
+        /* cells 1 and 2 share channel-list group 1; cell 3 is group 2 */
+        TEST_ASSERT_EQUAL_INT(0, lc_core_cell_add(&CORE, (uint32_t)(i + 1), name, LC_SIG_MODE_PART15,
+                                                  (uint16_t)(i < 2 ? 1 : 2)));
         sim_cell_start(i);
         sim_connect(i);
     }

@@ -146,9 +146,57 @@ static void test_core_needs_its_network_key(void)
     TEST_ASSERT_EQUAL_INT(-1, lc_core_init(&k, &CORE_IO, &st, &rt, &cfg));
 }
 
+/* Channel-list spec §8: a group's list goes to its cells in CELL_CFG, after
+ * HELLO_ACK and whenever it changes; the core numbers the versions and keeps
+ * the list across a restart. */
+static void test_channel_list_goes_to_the_group(void)
+{
+    core_world();
+    TEST_ASSERT_EQUAL_INT(0, lc_core_cell_add(&K, 3, "C", LC_SIG_MODE_PART15, 5));
+    TEST_ASSERT_EQUAL_INT(0, lc_core_cell_add(&K, 4, "D", LC_SIG_MODE_PART15, 5));
+    lc_sig_chan_list_t l;
+    memset(&l, 0, sizeof(l));
+    l.ver = 77; /* the core numbers versions itself */
+    l.count = 1;
+    l.freq_hz[0] = 917250000u;
+    hello(10, 1, 1); /* group 0: none */
+    hello(30, 3, 1); /* group 5, before it has a list */
+    TEST_ASSERT_NULL(sent(30, LC_CORE_CELL_CFG));
+    TEST_ASSERT_EQUAL_INT(1, lc_core_chan_list_set(&K, 5, &l, NOW));
+    const lc_core_msg_t *c = sent(30, LC_CORE_CELL_CFG);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_UINT8(1, c->u.cell_cfg.list.ver);
+    TEST_ASSERT_EQUAL_UINT8(1, c->u.cell_cfg.list.count);
+    TEST_ASSERT_EQUAL_UINT32(917250000u, c->u.cell_cfg.list.freq_hz[0]);
+    TEST_ASSERT_NULL(sent(10, LC_CORE_CELL_CFG));
+
+    int from = NSENT;
+    hello(40, 4, 1); /* a cell of the group comes up: HELLO_ACK, then the list */
+    TEST_ASSERT_NOT_NULL(sent_since(from, 40, LC_CORE_HELLO_ACK));
+    c = sent_since(from, 40, LC_CORE_CELL_CFG);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_UINT8(1, c->u.cell_cfg.list.ver);
+    TEST_ASSERT_EQUAL_INT(2, lc_core_chan_list_set(&K, 5, &l, NOW)); /* a change reaches both */
+    TEST_ASSERT_EQUAL_UINT8(2, sent(30, LC_CORE_CELL_CFG)->u.cell_cfg.list.ver);
+    TEST_ASSERT_EQUAL_UINT8(2, sent(40, LC_CORE_CELL_CFG)->u.cell_cfg.list.ver);
+
+    core_restart(); /* the list is in the store */
+    from = NSENT;
+    hello(31, 3, 1);
+    c = sent_since(from, 31, LC_CORE_CELL_CFG);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_UINT8(2, c->u.cell_cfg.list.ver);
+
+    l.count = LC_SIG_CHAN_MAX + 1u;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_chan_list_set(&K, 5, &l, NOW));
+    l.count = 1;
+    TEST_ASSERT_EQUAL_INT(-1, lc_core_chan_list_set(&K, 0, &l, NOW)); /* 0: no group */
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_channel_list_goes_to_the_group);
     RUN_TEST(test_hello_is_acked_with_the_cell_settings);
     RUN_TEST(test_hello_refusals_close_the_link_and_are_audited);
     RUN_TEST(test_nothing_but_hello_before_hello);

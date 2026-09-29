@@ -83,5 +83,8 @@ void lc_cell_core_up(lc_cell_t *c, uint64_t now_us);
 void lc_cell_core_down(lc_cell_t *c, uint64_t now_us);
 void lc_cell_core_rx(lc_cell_t *c, const lc_core_msg_t *m, uint64_t now_us);
 void lc_cell_tick(lc_cell_t *c, uint64_t now_us);
+/* The version of the channel list this cell serves (0: none yet). Its beacon
+ * carries it as cfg_ver (ver & 3, channel-list spec §7): oc-cell's to set. */
+uint8_t lc_cell_list_ver(const lc_cell_t *c);
 
 #endif

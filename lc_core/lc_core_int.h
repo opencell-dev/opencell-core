@@ -28,6 +28,10 @@ void     lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN
  * gone. */
 void     lc_core_loc_send_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], uint32_t cell_id,
                                  uint32_t tmid, uint8_t cause);
+/* LOC_UPDATE and LOC_PURGE from a cell */
+void     lc_core_reg_rx(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m);
+/* Issued vectors older than a day go (network-core spec §5 av_issued). */
+void     lc_core_reg_tick(lc_core_t *k);
 
 /* lc_core_switch.c: CALL_* and MEDIA from a cell, the call timers, and a
  * cell whose link went (every call with a leg on it ends, cause 5) */

@@ -215,6 +215,10 @@ void lc_core_rx(lc_core_t *k, uint32_t link, const lc_core_msg_t *m, uint64_t no
     case LC_CORE_RESYNC:
         lc_core_hss_rx(k, l->cell_id, m);
         break;
+    case LC_CORE_LOC_UPDATE:
+    case LC_CORE_LOC_PURGE:
+        lc_core_reg_rx(k, l->cell_id, m);
+        break;
     case LC_CORE_CALL_ROUTE:
     case LC_CORE_CALL_ALERT:
     case LC_CORE_CALL_ANSWER:
@@ -242,6 +246,10 @@ void lc_core_tick(lc_core_t *k, uint64_t now_us)
             p.type = LC_CORE_PING;
             send_link(k, l, &p);
         }
+    }
+    if (now_us >= k->prune_at) {
+        k->prune_at = now_us + LC_CORE_US(3600);
+        lc_core_reg_tick(k);
     }
     lc_core_sw_tick(k);
 }

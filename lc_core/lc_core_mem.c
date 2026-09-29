@@ -270,6 +270,9 @@ static int loc_del(void *c, const uint8_t number[LC_SIG_NUMBER_LEN])
             return 0;
         }
     }
+    /* nothing to delete: -1, but not fail_txn(c) (lc_core_store.h) - this
+     * store's only way for a delete to fail is finding nothing, which the
+     * contract carves out as not dooming an open transaction. */
     return -1;
 }
 

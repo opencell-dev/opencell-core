@@ -49,3 +49,77 @@ void lc_core_loc_cancel(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
     }
     lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, cause);
 }
+
+static void on_loc_update(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
+{
+    const uint8_t *num = m->u.loc_update.number;
+    uint32_t tmid = m->u.loc_update.tmid;
+    lc_core_av_issued_t a;
+    lc_core_sub_t s;
+    lc_core_loc_t old, l;
+    lc_core_netkey_t key;
+    if (k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a) != 0 || a.cell_id != cell ||
+        !lc_sig_ct_equal(m->u.loc_update.res, a.xres, 8)) {
+        lc_core_audit(k, LC_CORE_AUDIT_AUTH_FAIL, num, tmid, cell, "LOC_UPDATE: no vector of this cell's matches");
+        lc_core_logf(k, "cell %u: location claim for %08x refused", (unsigned)cell, (unsigned)tmid);
+        return;
+    }
+    int known = k->st.sub_get(k->st.ctx, num, &s) == 0;
+    if (!known || !s.activated || s.tmid != tmid || s.state != LC_CORE_SUB_ACTIVE) {
+        /* a proven registration the core has since cancelled (re-activated
+         * or disabled while the cell was cut off): the cell drops it now.
+         * s.tmid != tmid also catches a RES from a vector issued before a
+         * re-activation: av_issued has no TMID column, so such a row can
+         * still verify against the cell that requested it, but the
+         * subscriber's current tmid has moved on and the claim is refused. */
+        int off = known && s.state == LC_CORE_SUB_DISABLED;
+        cancel(k, cell, tmid, off ? LC_CORE_CANCEL_DISABLED : LC_CORE_CANCEL_REACTIVATED);
+        return;
+    }
+    int moved = k->st.loc_get(k->st.ctx, num, &old) == 0 && (old.cell_id != cell || old.tmid != tmid);
+    memset(&l, 0, sizeof(l));
+    memcpy(l.number, num, LC_SIG_NUMBER_LEN);
+    l.cell_id = cell;
+    l.tmid = tmid;
+    l.expires = lc_core_unix(k) + 2u * (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) == 0 ? key.period_s : 1800u);
+    a.confirmed = 1;
+    k->st.begin(k->st.ctx);
+    k->st.av_put(k->st.ctx, &a);
+    k->st.loc_put(k->st.ctx, &l);
+    if (k->st.commit(k->st.ctx) != 0) {
+        lc_core_logf(k, "location of %08x: store FAILED", (unsigned)tmid);
+        return;
+    }
+    if (moved) { /* §7.8: the cell it left drops it */
+        cancel(k, old.cell_id, old.tmid, LC_CORE_CANCEL_MOVED);
+        lc_core_audit(k, LC_CORE_AUDIT_LOC_CANCEL, num, old.tmid, old.cell_id, "moved");
+    }
+    lc_core_audit(k, LC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
+}
+
+/* Not wrapped in begin/commit: one write, already durable on its own
+ * (lc_core_store.h). loc_del's result is checked: a genuine failure (not
+ * "nothing to delete", since loc_get above just found it) is logged rather
+ * than silently believed. */
+static void on_loc_purge(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
+{
+    lc_core_loc_t l;
+    if (k->st.loc_get(k->st.ctx, m->u.loc_purge.number, &l) == 0 && l.cell_id == cell &&
+        l.tmid == m->u.loc_purge.tmid) {
+        if (k->st.loc_del(k->st.ctx, m->u.loc_purge.number) != 0) {
+            lc_core_logf(k, "cell %u: LOC_PURGE: location delete failed", (unsigned)cell);
+        }
+    }
+}
+
+void lc_core_reg_rx(lc_core_t *k, uint32_t cell_id, const lc_core_msg_t *m)
+{
+    if (m->type == LC_CORE_LOC_UPDATE) on_loc_update(k, cell_id, m);
+    if (m->type == LC_CORE_LOC_PURGE) on_loc_purge(k, cell_id, m);
+}
+
+void lc_core_reg_tick(lc_core_t *k)
+{
+    uint32_t now = lc_core_unix(k);
+    if (now > 86400u) k->st.av_prune(k->st.ctx, now - 86400u);
+}

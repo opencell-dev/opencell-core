@@ -66,7 +66,8 @@ typedef struct {
     lc_core_store_t st;
     lc_core_route_t route;
     lc_core_link_t  links[LC_CORE_LINKS];
-    uint64_t        now; /* the now_us of the call being served */
+    uint64_t        now;      /* the now_us of the call being served */
+    uint64_t        prune_at; /* next pruning of issued vectors */
     lc_core_call_t  calls[LC_CORE_CALLS];
     uint32_t        next_ref; /* wraps at 2^31 (top bit is LC_CORE_REF_CORE); safe since calls[] does not survive a core restart (§7.10) */
 } lc_core_t;

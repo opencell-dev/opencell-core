@@ -122,6 +122,23 @@ static inline void store_contract(const lc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n1, &lg));
     TEST_ASSERT_EQUAL_INT(-1, st->loc_get(c, n2, &lg));
 
+    /* the store contract (lc_core_store.h): a write that fails inside a
+     * transaction dooms it, except a delete that finds nothing to delete,
+     * which must not. n1 has no location at this point (purged just above),
+     * so deleting it here is exactly that "nothing to delete" case, and
+     * must not stop the sub_put alongside it from landing. (A delete
+     * failing for a genuine reason - disk I/O, say - would still have to
+     * doom the transaction, but the in-memory store has no such failure to
+     * provoke through this store-agnostic test; the store that owns that
+     * failure mode, e.g. plan 8's SQLite store, tests it directly.) */
+    s.sqn = 7;
+    TEST_ASSERT_EQUAL_INT(0, st->begin(c));
+    TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
+    TEST_ASSERT_EQUAL_INT(-1, st->loc_del(c, n1)); /* nothing there to delete */
+    TEST_ASSERT_EQUAL_INT(0, st->commit(c)); /* not doomed */
+    TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n1, &s2));
+    TEST_ASSERT_EQUAL_UINT64(7, s2.sqn);
+
     /* records are appended */
     lc_core_cdr_t cdr;
     lc_core_audit_t au;

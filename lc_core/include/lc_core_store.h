@@ -3,14 +3,18 @@
  * lc_core_mem.h is the in-memory store (tests, simulation); plan 8's SQLite
  * store seals k, opc, sk and token secrets at rest behind the same calls.
  *
- * Every function returns 0, or -1 (not found, full, or failed). A put
- * outside begin/commit is durable when it returns; between begin and commit
- * the puts are one change that commit makes durable or, failing, undoes. A
- * put that fails between begin and commit still dooms the whole
- * transaction: commit must then return -1 and undo everything done since
- * begin, even if the caller who saw that put's own -1 pressed on regardless
- * (a store full of authentication vectors must never let a cell walk away
- * with a vector whose av_issued row never made it to disk). */
+ * Every function returns 0, or -1 (not found, full, or failed). A write
+ * (put or delete) outside begin/commit is durable when it returns; between
+ * begin and commit the writes are one change that commit makes durable or,
+ * failing, undoes. A write (put or delete) that fails between begin and
+ * commit, other than a delete that finds nothing to delete, still dooms the
+ * whole transaction: commit must then return -1 and undo everything done
+ * since begin, even if the caller who saw that write's own -1 pressed on
+ * regardless (a store full of authentication vectors must never let a cell
+ * walk away with a vector whose av_issued row never made it to disk).
+ * Deleting nothing is not itself a failure worth dooming a transaction over:
+ * a delete of a key that was never there, or is already gone, returns -1
+ * but leaves the transaction it happened in undoomed. */
 #ifndef LC_CORE_STORE_H
 #define LC_CORE_STORE_H
 

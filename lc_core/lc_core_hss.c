@@ -98,7 +98,12 @@ int lc_core_sub_disable(lc_core_t *k, const uint8_t number[LC_SIG_NUMBER_LEN], u
     k->st.begin(k->st.ctx);
     k->st.sub_put(k->st.ctx, &s);
     k->st.token_void(k->st.ctx, number);
-    if (had_loc) k->st.loc_del(k->st.ctx, number); /* atomic with disabling: a failed commit undoes both */
+    /* atomic with disabling: a genuine delete failure (not "nothing to
+     * delete", since loc_get above just found it) dooms the commit below;
+     * logged here too, for a diagnosis that does not depend on that. */
+    if (had_loc && k->st.loc_del(k->st.ctx, number) != 0) {
+        lc_core_logf(k, "sub_disable %08x: location delete failed", (unsigned)l.tmid);
+    }
     if (k->st.commit(k->st.ctx) != 0) return -1;
     if (had_loc) lc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, LC_CORE_CANCEL_DISABLED);
     lc_core_audit(k, LC_CORE_AUDIT_SUB_DISABLE, number, s.tmid, 0, NULL);
@@ -172,7 +177,11 @@ static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
             other.tmid = 0;
             other.updated = lc_core_unix(k);
             k->st.sub_put(k->st.ctx, &other);
-            if (had_loc_other) k->st.loc_del(k->st.ctx, other.number);
+            /* a genuine delete failure (not "nothing to delete": loc_get
+             * above just found it) dooms the commit below; logged here too. */
+            if (had_loc_other && k->st.loc_del(k->st.ctx, other.number) != 0) {
+                lc_core_logf(k, "activation of %08x: other number's location delete failed", (unsigned)tmid);
+            }
         }
         memcpy(sub.k, kk, 16);
         memcpy(sub.opc, opc, 16);
@@ -181,7 +190,10 @@ static void on_act_fwd(lc_core_t *k, uint32_t cell, const lc_core_msg_t *m)
         sub.activated = 1;
         sub.updated = lc_core_unix(k);
         k->st.sub_put(k->st.ctx, &sub);
-        if (had_loc_self) k->st.loc_del(k->st.ctx, sub.number); /* wherever it was registered: atomic with the bind */
+        /* wherever it was registered: atomic with the bind */
+        if (had_loc_self && k->st.loc_del(k->st.ctx, sub.number) != 0) {
+            lc_core_logf(k, "activation of %08x: location delete failed", (unsigned)tmid);
+        }
         tok.used_at = lc_core_unix(k);
         tok.used_by_tmid = tmid;
         k->st.token_put(k->st.ctx, &tok);

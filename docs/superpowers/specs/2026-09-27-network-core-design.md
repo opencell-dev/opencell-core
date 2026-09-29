@@ -8,14 +8,14 @@
 
 Sections 1–13 keep their numbers from the draft; §14–16 are new.
 
-**Builds on:** `2026-09-26-activation-registration-calls-design.md` (plan 5: `lc_sig`, `lcbench net`), plan 4 (`docs/superpowers/plans/2026-09-25-rhu-scheduler.md`, not yet implemented), `2026-09-23-lr2021-hardware-design.md`, `security-model.md`, `numbering-plan.md` v0.2 and `2026-09-27-numbering-v2-design.md` (branch `numbers-v2`), `architecture.md`.
+**Builds on:** `2026-09-26-activation-registration-calls-design.md` (plan 5: `oc_sig`, `ocbench net`), plan 4 (`docs/superpowers/plans/2026-09-25-rhu-scheduler.md`, not yet implemented), `2026-09-23-lr2021-hardware-design.md`, `security-model.md`, `numbering-plan.md` v0.2 and `2026-09-27-numbering-v2-design.md` (branch `numbers-v2`), `architecture.md`.
 
 ## 1. Goals and scope
 
 "Switching and routing" in OpenCell today means four things (from `architecture.md` §Network-Side Call State and plan-5 spec §5, §7, §11):
 
-1. **The cell's network role on the Pi**, replacing `lcbench net`: drive the base-station W12s over lc_link (plan 4's scheduler), run `lc_sig_net` for every terminal the cell hears, and switch calls between two terminals of the same cell (already in `lc_sig_net`, `local_setup()` in `firmware/components/lc_sig/lc_sig_net.c`).
-2. **A persistent HSS**: subscribers, activation tokens, TMID bindings, K, OPc and SQN, with the keys encrypted at rest. Today this is `lcb_hss`, a 0600 text file of at most 16 subscribers (`tools/lcbench/lcb_hss.h`).
+1. **The cell's network role on the Pi**, replacing `ocbench net`: drive the base-station W12s over oc_link (plan 4's scheduler), run `oc_sig_net` for every terminal the cell hears, and switch calls between two terminals of the same cell (already in `oc_sig_net`, `local_setup()` in `firmware/components/oc_sig/oc_sig_net.c`).
+2. **A persistent HSS**: subscribers, activation tokens, TMID bindings, K, OPc and SQN, with the keys encrypted at rest. Today this is `ocb_hss`, a 0600 text file of at most 16 subscribers (`tools/ocbench/ocb_hss.h`).
 3. **A location registry**: which cell (Pi) each registered number is on now.
 4. **Inter-cell switching**: a call from a terminal on one Pi to a terminal on another Pi, with its app data (later voice) relayed between them.
 
@@ -23,12 +23,12 @@ Scope:
 
 | Topic | Decision |
 |---|---|
-| In scope | 1–4 above; activation and registration through the core; MO/MT calls within a cell and across cells; busy, unreachable, no answer; a terminal moving between cells *while idle*; Pi, core and backhaul failures; an admin CLI that replaces `lcbench mkqr`. At the architecture level: several cores with home cores and replicas, block transfer (§14), inter-core signalling OCSS (§15), and the first server deployment (§16). |
+| In scope | 1–4 above; activation and registration through the core; MO/MT calls within a cell and across cells; busy, unreachable, no answer; a terminal moving between cells *while idle*; Pi, core and backhaul failures; an admin CLI that replaces `ocbench mkqr`. At the architecture level: several cores with home cores and replicas, block transfer (§14), inter-core signalling OCSS (§15), and the first server deployment (§16). |
 | Out of scope | Voice codec and audio (app data frames stand in, as in plan 5); PSTN/SIP gateway (`numbering-plan.md` §Future); Direct Connect / push-to-talk (`direct-connect.md`); the web portal (the admin CLI stands in); handover of an *active* call between cells; paging across several cells; automatic failover between cores (promotion is an operator command, §14.4); OCSS message layouts (their own spec, §15.7); RF backhaul between base stations (plan 4 R11) as the core's transport; emergency calls (none: plan-5 spec §1). |
-| Replaces from the 2026-05 vision | The central "phone RAN" that ran every call's signalling (`architecture.md` §Phone RAN Plane), RADIUS/EAP-AKA, Diameter, OAI HSS, etcd, Redis and PostgreSQL (`implementation-plan.md` Phases 2–4, §Technology Stack). Plan 5 already moved signalling into `lc_sig`; the core only needs what `lc_sig_net` cannot do alone. |
+| Replaces from the 2026-05 vision | The central "phone RAN" that ran every call's signalling (`architecture.md` §Phone RAN Plane), RADIUS/EAP-AKA, Diameter, OAI HSS, etcd, Redis and PostgreSQL (`implementation-plan.md` Phases 2–4, §Technology Stack). Plan 5 already moved signalling into `oc_sig`; the core only needs what `oc_sig_net` cannot do alone. |
 
 **Done means:**
-- `oc-cell` + `oc-core` on one machine with board A replace `lcbench net`, and the plan-5 done list (plan-5 spec §1) passes again with T and T2.
+- `oc-cell` + `oc-core` on one machine with board A replace `ocbench net`, and the plan-5 done list (plan-5 spec §1) passes again with T and T2.
 - With two cells (board A and a second bs-radio board) and one core: T on cell 1 calls T2 on cell 2 — ring, connect, app data both ways, hang-up from each side, reject, busy, unreachable.
 - T moves from cell 1 to cell 2 while idle; a call to T then rings on cell 2.
 - Killing `oc-cell` on one cell, or the core, never leaves a half-open call on the other side for more than 10 s, and every terminal is registered again within one re-attach after the process is back.
@@ -39,18 +39,18 @@ Scope:
 
 | Piece | Where | What it gives the core | Gap |
 |---|---|---|---|
-| `lc_sig_net` | `firmware/components/lc_sig/include/lc_sig_net.h`, `lc_sig_net.c` | Activation, MILENAGE registration and resync, call control, local terminal-to-terminal switching with per-leg voice keys, a far-end "peer" API (`lc_sig_net_peer_alert/answer/release`, `lc_sig_net_call_in`), app data in/out (`lc_sig_net_data_in/out`). Host-only C, no OS calls. | HSS access is **synchronous** (`by_token`, `by_tmid`, `by_number` return `lc_sig_sub_t *` and the library reads `sub->k`, `sub->opc`, `sub->sqn` itself, e.g. `new_av()`), and activation needs the network private key in `cfg.sk`. Only `LC_SIG_NET_TERMS` = 4 sessions. No event when a far-end MT leg rings, and `lc_sig_net_call_in` returns the same -1 for busy and unreachable. |
-| `lc_sig_term` | `lc_sig_term.c` | The terminal registers again whenever it re-attaches after losing the cell (`lc_sig_term_link`, the "ruling in plan 5"): the key to surviving a Pi restart and to moving between cells. | — |
-| `lcb_net` + `lcb_hss` + `lcb_cell` | `tools/lcbench/` | The working glue: `lc_sig_net_io_t` ↔ cell hooks (`on_ul`, `on_upper`), DL queue (`lcb_cell_dl_push`, 8 deep), page/grant/release on `channel(on/off)`, app data forwarding, simulated far end. Verified over the air with two W12s (commit 0ca8b22). | Laptop tool, at most 2 terminals (`LCB_CELL_MAX_TERMS`), one board, text-file HSS. |
-| Plan 4 (`rhu_bs`) | `docs/superpowers/plans/2026-09-25-rhu-scheduler.md` | The Pi scheduler: CONFIG/TIME/SCHEDULE per W12, admission, persistent grants, paging, band policy, W12 reset, PPS gating; a fronthaul callback set (`rhu_fronthaul_t {up_data, up_rach, term_event}`, `rhu_bs_send_dl`, `rhu_bs_page`). | **Not implemented**: no commit mentions it on any branch (`git log --all --oneline | grep -i rhu` is empty in `~/Documents/opencell`). Written before plan 5: it ends at a loopback UDP fronthaul "to the phone RAN" (Task 9), keeps one DL payload per terminal (`rhu_term_t.dl_buf`), and has no idle attach and no grant release, all of which `lc_sig_net`'s `channel(on/off)` model needs (§10). |
+| `oc_sig_net` | `firmware/components/oc_sig/include/oc_sig_net.h`, `oc_sig_net.c` | Activation, MILENAGE registration and resync, call control, local terminal-to-terminal switching with per-leg voice keys, a far-end "peer" API (`oc_sig_net_peer_alert/answer/release`, `oc_sig_net_call_in`), app data in/out (`oc_sig_net_data_in/out`). Host-only C, no OS calls. | HSS access is **synchronous** (`by_token`, `by_tmid`, `by_number` return `oc_sig_sub_t *` and the library reads `sub->k`, `sub->opc`, `sub->sqn` itself, e.g. `new_av()`), and activation needs the network private key in `cfg.sk`. Only `OC_SIG_NET_TERMS` = 4 sessions. No event when a far-end MT leg rings, and `oc_sig_net_call_in` returns the same -1 for busy and unreachable. |
+| `oc_sig_term` | `oc_sig_term.c` | The terminal registers again whenever it re-attaches after losing the cell (`oc_sig_term_link`, the "ruling in plan 5"): the key to surviving a Pi restart and to moving between cells. | — |
+| `ocb_net` + `ocb_hss` + `ocb_cell` | `tools/ocbench/` | The working glue: `oc_sig_net_io_t` ↔ cell hooks (`on_ul`, `on_upper`), DL queue (`ocb_cell_dl_push`, 8 deep), page/grant/release on `channel(on/off)`, app data forwarding, simulated far end. Verified over the air with two W12s (commit 0ca8b22). | Laptop tool, at most 2 terminals (`OCB_CELL_MAX_TERMS`), one board, text-file HSS. |
+| Plan 4 (`rhu_bs`) | `docs/superpowers/plans/2026-09-25-rhu-scheduler.md` | The Pi scheduler: CONFIG/TIME/SCHEDULE per W12, admission, persistent grants, paging, band policy, W12 reset, PPS gating; a fronthaul callback set (`rhu_fronthaul_t {up_data, up_rach, term_event}`, `rhu_bs_send_dl`, `rhu_bs_page`). | **Not implemented**: no commit mentions it on any branch (`git log --all --oneline | grep -i rhu` is empty in `~/Documents/opencell`). Written before plan 5: it ends at a loopback UDP fronthaul "to the phone RAN" (Task 9), keeps one DL payload per terminal (`rhu_term_t.dl_buf`), and has no idle attach and no grant release, all of which `oc_sig_net`'s `channel(on/off)` model needs (§10). |
 
 ## 3. Architecture options
 
 ### 3.1 Options
 
-- **(A) Autonomous Pi.** One C daemon per Pi links the scheduler, `lc_sig_net` and an SQLite HSS holding every subscriber's K and OPc. A small central registry/switch joins cells for cross-cell calls and location. This is what plan-5 spec §11 assumed ("the Pi HSS and switch").
-- **(B) Central core, thin Pi.** The Pi runs only the scheduler and forwards link payloads (plan 4's fronthaul datagrams `UP_DATA`, `UP_RACH`, `EVENT`, `DL_DATA`, `PAGE`, which map one-to-one onto `lc_sig_net_io_t`) over TLS to a central server that runs `lc_sig_net` for every cell, the HSS and the switch. This is the 2026-05 `architecture.md` model.
-- **(C) Edge cell + home core (split HSS).** The Pi daemon (`oc-cell`) runs the scheduler, `lc_sig_net` sessions and local switching. A separate program (`oc-core`) owns the subscriber keys, activation, authentication vectors (AVs), the location registry and inter-cell switching. The cell asks the core for AVs, as an LTE MME asks the HSS. **For a single site both programs run on the Pi**, over a Unix socket. For several sites the core runs on a server and cells connect to it over mutually authenticated TLS.
+- **(A) Autonomous Pi.** One C daemon per Pi links the scheduler, `oc_sig_net` and an SQLite HSS holding every subscriber's K and OPc. A small central registry/switch joins cells for cross-cell calls and location. This is what plan-5 spec §11 assumed ("the Pi HSS and switch").
+- **(B) Central core, thin Pi.** The Pi runs only the scheduler and forwards link payloads (plan 4's fronthaul datagrams `UP_DATA`, `UP_RACH`, `EVENT`, `DL_DATA`, `PAGE`, which map one-to-one onto `oc_sig_net_io_t`) over TLS to a central server that runs `oc_sig_net` for every cell, the HSS and the switch. This is the 2026-05 `architecture.md` model.
+- **(C) Edge cell + home core (split HSS).** The Pi daemon (`oc-cell`) runs the scheduler, `oc_sig_net` sessions and local switching. A separate program (`oc-core`) owns the subscriber keys, activation, authentication vectors (AVs), the location registry and inter-cell switching. The cell asks the core for AVs, as an LTE MME asks the HSS. **For a single site both programs run on the Pi**, over a Unix socket. For several sites the core runs on a server and cells connect to it over mutually authenticated TLS.
 
 ### 3.2 Trade-offs
 
@@ -58,11 +58,11 @@ Scope:
 |---|---|---|---|
 | Subscriber keys and network activation key on user-managed Pis (`architecture.md` §Responsibility Model: "Pi RHU hardware — User") | **Every Pi holds every K, OPc and SKn**: any Pi owner can clone any subscriber or impersonate the network. Homing each subscriber on one Pi instead makes that Pi a single point of failure and needs Pi-to-Pi connections through home NAT. | Only on the core | Only on the core. A cell sees CK/IK-derived session keys only for terminals it serves. |
 | Works without backhaul | Fully | **Not at all**, not even calls within one cell | Registered terminals keep local calls; new registrations use cached AVs (§7.8); activation needs the core |
-| Radio timing across the WAN | None | Every signalling fragment, every `channel()`/grant decision and every voice frame crosses the WAN. `lc_sig_net` expects `heard()` and `link()` updates every frame (`lcb_net_tick`) and drops an active call after 5 s without data | None |
+| Radio timing across the WAN | None | Every signalling fragment, every `channel()`/grant decision and every voice frame crosses the WAN. `oc_sig_net` expects `heard()` and `link()` updates every frame (`ocb_net_tick`) and drops an active call after 5 s without data | None |
 | Local call path | On the Pi | Hairpins through the server | On the Pi |
 | Pi restart | Loses in-memory sessions and calls; HSS persists | Loses the radio state only | Loses sessions and calls; the core notices (§7.9) |
-| New code | Registry/switch service; HSS store | WAN fronthaul, many-cell `lc_sig_net` host, HSS, switch | Core (HSS, AV, registry, switch), cell↔core protocol, an **async HSS interface in `lc_sig_net`** (§4.3) |
-| Reuses | `lcb_net` pattern almost as is | `lc_sig_net` unchanged, plan 4 Task 9 datagrams | `lcb_net` pattern; MILENAGE and activation KDF from `lc_sig` in the core |
+| New code | Registry/switch service; HSS store | WAN fronthaul, many-cell `oc_sig_net` host, HSS, switch | Core (HSS, AV, registry, switch), cell↔core protocol, an **async HSS interface in `oc_sig_net`** (§4.3) |
+| Reuses | `ocb_net` pattern almost as is | `oc_sig_net` unchanged, plan 4 Task 9 datagrams | `ocb_net` pattern; MILENAGE and activation KDF from `oc_sig` in the core |
 
 ### 3.3 Decision: (C), always two programs
 
@@ -73,9 +73,9 @@ Scope:
 ```
  Terminal W12s        Pi (oc-cell)                                         Server or same Pi (oc-core)
  ─────────────        ──────────────────────────────────────────           ─────────────────────────────────
-                LoRa  radio backend: lcb_cell (bench) | rhu_bs (plan 4)     HSS (SQLite, keys AES-GCM at rest)
- lc_sig_term  ◄─────► lc_sig_net sessions, local switching         core     activation (holds SKn), AV + resync
- lc_term              AV cache, leg table, core client           ◄──────►   location registry
+                LoRa  radio backend: ocb_cell (bench) | rhu_bs (plan 4)     HSS (SQLite, keys AES-GCM at rest)
+ oc_sig_term  ◄─────► oc_sig_net sessions, local switching         core     activation (holds SKn), AV + resync
+ oc_term              AV cache, leg table, core client           ◄──────►   location registry
                                                         Unix socket / mTLS  inter-cell switch + media relay
                                                                             echo service, CDR, audit, admin CLI
 ```
@@ -85,42 +85,42 @@ Scope:
 ### 4.1 `oc-cell` (Pi daemon)
 
 - **Radio backend**, behind one small interface: `dl_push`, `page`, `release`, `granted`, and upward `on_ul`, `on_upper`, `on_link`.
-  - `lcb_cell` over USB, as `lcbench net` does today: lets all of this proceed on the laptop with board A before plan 4 exists.
+  - `ocb_cell` over USB, as `ocbench net` does today: lets all of this proceed on the laptop with board A before plan 4 exists.
   - `rhu_bs` over the Pi UARTs, once plan 4 lands with the changes in §10.
-- **`lc_sig_net`** with the async HSS interface (§4.3) and `LC_SIG_NET_TERMS` raised to at least plan 4's `RHU_MAX_TERMS` (32), made a build-time setting.
-- **Glue**, grown from `lcb_net.c`:
-  - demultiplexes UL payload kinds (`LC_SIG_KIND_SIG` / `_DATA`, `_SVC` on RACH UPPER);
-  - forwards app data between two local legs (`lc_sig_net_local_peer`) or to the core for a cross-cell leg;
-  - keeps a **leg table** that maps its `lc_sig_net` call ids to core call refs.
+- **`oc_sig_net`** with the async HSS interface (§4.3) and `OC_SIG_NET_TERMS` raised to at least plan 4's `RHU_MAX_TERMS` (32), made a build-time setting.
+- **Glue**, grown from `ocb_net.c`:
+  - demultiplexes UL payload kinds (`OC_SIG_KIND_SIG` / `_DATA`, `_SVC` on RACH UPPER);
+  - forwards app data between two local legs (`oc_sig_net_local_peer`) or to the core for a cross-cell leg;
+  - keeps a **leg table** that maps its `oc_sig_net` call ids to core call refs.
 - **Core client**: reconnects with backoff, sends HELLO with a random `boot_id`, keeps a small AV cache (§7.8), and releases every cross-cell leg with cause 5 (network failure) when the link to the core drops.
 - **Config**: a key=value file like plan 4's `rhu_config`, plus `cell_id`, the core address, and the certificate paths.
 
 ### 4.2 `oc-core`
 
-- **Portable C11 core library** (`lc_core`: no OS calls, driven by messages and `tick(now)`, like `lc_sig` and plan 4's `rhu_bs`), with Linux glue for SQLite, sockets, TLS and the clock.
+- **Portable C11 core library** (`oc_core`: no OS calls, driven by messages and `tick(now)`, like `oc_sig` and plan 4's `rhu_bs`), with Linux glue for SQLite, sockets, TLS and the clock.
 - **HSS/AuC:**
-  - activation, using the same checks and KDF as `on_act_req()` / `lc_sig_act_keys()` in `lc_sig_net.c`;
-  - AV generation with `lc_milenage()`, with SQN stepped and committed *before* the AV leaves;
-  - resync from AUTS (the logic in `lc_sig_net.c` around line 357).
+  - activation, using the same checks and KDF as `on_act_req()` / `oc_sig_act_keys()` in `oc_sig_net.c`;
+  - AV generation with `oc_milenage()`, with SQN stepped and committed *before* the AV leaves;
+  - resync from AUTS (the logic in `oc_sig_net.c` around line 357).
 - **Location registry:** number → (cell, TMID, expiry).
 - **Switch:** routes a number, offers the call to the callee's cell, relays ALERT/ANSWER/RELEASE and MEDIA between the two legs, and runs the ring and setup timers.
-- **Echo service:** `lcb_net`'s simulated far end (answers after 3 s, echoes app data) becomes a configured service number, `+883160655500100` (`LCB_NET_PEER_NUMBER`; subscriber 00100 is in the service range of `numbering-plan.md` v0.2). It stays useful on the bench and in the field.
+- **Echo service:** `ocb_net`'s simulated far end (answers after 3 s, echoes app data) becomes a configured service number, `+883160655500100` (`OCB_NET_PEER_NUMBER`; subscriber 00100 is in the service range of `numbering-plan.md` v0.2). It stays useful on the bench and in the field.
 - **Records:** a CDR per call attempt, and an audit log of the `security-model.md` §Audit Logging events.
-- **Admin CLI:** `oc-core admin sub add|issue|disable|list`, `cell add|revoke`, `loc`, `cdr`. It replaces `lcbench mkqr` (QR text plus `qrencode`), and the portal later drives the same operations.
+- **Admin CLI:** `oc-core admin sub add|issue|disable|list`, `cell add|revoke`, `loc`, `cdr`. It replaces `ocbench mkqr` (QR text plus `qrencode`), and the portal later drives the same operations.
 
-### 4.3 `lc_sig_net` changes (async HSS)
+### 4.3 `oc_sig_net` changes (async HSS)
 
 The library stops holding K, OPc, SQN and SKn. It asks and gets answered later; a test or single-process backend may answer inside the call.
 
-| Now (`lc_sig_net_io_t`) | Proposed |
+| Now (`oc_sig_net_io_t`) | Proposed |
 |---|---|
-| `by_token` + `cfg.sk` + writes `sub->k/opc/sqn`, `unbind`, `save` | `act_req(ctx, tmid, token_id, pkt, tag)` → `lc_sig_net_act_done(n, tmid, msg)`: the core returns the finished `ACT_ACK`/`ACT_NAK` (it needs K for `confirm` and the token secret for the NAK tag). |
-| `by_tmid` + `new_av()` computing MILENAGE | `av_req(ctx, tmid)` → `lc_sig_net_av_done(n, tmid, status, number, av)`. `av` = RAND, AUTN, XRES, CK, IK. `status` ∈ ok / not activated / bound elsewhere / disabled / core unavailable (no answer: the terminal backs off as today). |
+| `by_token` + `cfg.sk` + writes `sub->k/opc/sqn`, `unbind`, `save` | `act_req(ctx, tmid, token_id, pkt, tag)` → `oc_sig_net_act_done(n, tmid, msg)`: the core returns the finished `ACT_ACK`/`ACT_NAK` (it needs K for `confirm` and the token secret for the NAK tag). |
+| `by_tmid` + `new_av()` computing MILENAGE | `av_req(ctx, tmid)` → `oc_sig_net_av_done(n, tmid, status, number, av)`. `av` = RAND, AUTN, XRES, CK, IK. `status` ∈ ok / not activated / bound elsewhere / disabled / core unavailable (no answer: the terminal backs off as today). |
 | resync inside `handle(AUTH_FAIL)` | `resync_req(ctx, tmid, rand, auts)` → `av_done` with a fresh AV |
 | — | `registered(ctx, tmid, number, rand, res)`: fired when `AUTH_RSP` matches (the cell sends `LOC_UPDATE`, §7.7) |
-| `by_number` for the local-callee test | The session keeps its `number` (from `av_done`); `lc_sig_net` finds a local callee among its own **registered** sessions. Anything else goes out as `LC_SIG_NET_MO`. |
+| `by_number` for the local-callee test | The session keeps its `number` (from `av_done`); `oc_sig_net` finds a local callee among its own **registered** sessions. Anything else goes out as `OC_SIG_NET_MO`. |
 | `by_tmid` for the caller's number | The session's `number` |
-| — | New event `LC_SIG_NET_ALERTING` for a far-end MT leg; `lc_sig_net_call_in` returns distinct busy / unreachable codes; `lc_sig_net_drop(n, tmid, cause)` for `LOC_CANCEL`. |
+| — | New event `OC_SIG_NET_ALERTING` for a far-end MT leg; `oc_sig_net_call_in` returns distinct busy / unreachable codes; `oc_sig_net_drop(n, tmid, cause)` for `LOC_CANCEL`. |
 
 The existing fixes stay: a REG_REQ never touches a registered session until `AUTH_RSP` matches (fix round 1, commit 58b3dc2), and pending and confirmed vectors stay separate (rounds 2–3). `test_sig_e2e.c`, `test_sig_local.c` and `test_term_sim.c` move to a synchronous fake core.
 
@@ -152,9 +152,9 @@ The existing fixes stay: a REG_REQ never touches a registered session until `AUT
   - Single site: a Unix stream socket (`/run/opencell/core.sock`, owner-only).
   - Multi-site: TLS 1.3 over TCP to one port (7443 in the deployment, §16), ALPN `oc-cell/1`. Both sides present certificates from an OpenCell CA; the core checks the client certificate's fingerprint against `cell.cert_fpr`, and the cell checks the core against the bundled CA (the "mTLS upgrade path" in `security-model.md`, taken now instead of bearer tokens).
   - Connections always go out from the cell, so cells behind home NAT work.
-- **Framing:** `len (2, BE) ‖ type (1) ‖ body`, at most 512 B, little-endian fields like lc_link; numbers are 8 BCD bytes, full form (numbering-v2 design §4.1). Signalling and media share the connection: a call carries at most 18 B per 120 ms each way.
+- **Framing:** `len (2, BE) ‖ type (1) ‖ body`, at most 512 B, little-endian fields like oc_link; numbers are 8 BCD bytes, full form (numbering-v2 design §4.1). Signalling and media share the connection: a call carries at most 18 B per 120 ms each way.
 - **Liveness:** PING every 5 s. The link counts as down after 15 s without traffic.
-- **Call refs:** a leg is named by `(cell, leg_ref)`, where `leg_ref` is the cell's `lc_sig_net` call id. Core-created legs (offers) carry a core `call_ref`, which the cell maps to its own call id.
+- **Call refs:** a leg is named by `(cell, leg_ref)`, where `leg_ref` is the cell's `oc_sig_net` call id. Core-created legs (offers) carry a core `call_ref`, which the cell maps to its own call id.
 
 | Type | Name | Dir | Body |
 |---|---|---|---|
@@ -163,7 +163,7 @@ The existing fixes stay: a REG_REQ never touches a registered session until `AUT
 | 0x03 | HELLO_NAK | K→C | reason 1 (unknown cell, disabled, bad version) |
 | 0x04 / 0x05 | PING / PONG | both | — |
 | 0x10 | ACT_FWD | C→K | req 2, tmid 4, token_id 8, PKt 32, tag 8 |
-| 0x11 | ACT_RES | K→C | req 2, tmid 4, lc_sig message (ACT_ACK or ACT_NAK, ≤ 20 B) |
+| 0x11 | ACT_RES | K→C | req 2, tmid 4, oc_sig message (ACT_ACK or ACT_NAK, ≤ 20 B) |
 | 0x12 | AV_REQ | C→K | req 2, tmid 4, count 1 (1–4) |
 | 0x13 | AV_RES | K→C | req 2, tmid 4, status 1, number 8, count 1, count × {RAND 16, AUTN 16, XRES 8, CK 16, IK 16} |
 | 0x14 | RESYNC | C→K | req 2, tmid 4, RAND 16, AUTS 14 (answered by AV_RES) |
@@ -174,7 +174,7 @@ The existing fixes stay: a REG_REQ never touches a registered session until `AUT
 | 0x21 | CALL_OFFER | K→C | call_ref 4, callee 8, caller 8 |
 | 0x22 | CALL_ALERT | both | ref 4 |
 | 0x23 | CALL_ANSWER | both | ref 4 |
-| 0x24 | CALL_RELEASE | both | ref 4, cause 1 (lc_sig causes) |
+| 0x24 | CALL_RELEASE | both | ref 4, cause 1 (oc_sig causes) |
 | 0x28 | MEDIA | both | ref 4, seq 2, data ≤ 18 |
 
 ## 7. Flows
@@ -184,7 +184,7 @@ The existing fixes stay: a REG_REQ never touches a registered session until `AUT
 1. The terminal sends `ACT_REQ`.
 2. The cell sends `ACT_FWD`.
 3. The core runs the plan-5 §3.2 checks (token exists, unused, unexpired, tag), derives K/OPc, sets `SQN = 0`, binds the TMID, marks the token used and commits.
-4. If the number was bound to another TMID with a location, the core sends `LOC_CANCEL(reactivated)` to that cell (as `lc_sig_net` fix round 1 "cut off old terminal on reactivation").
+4. If the number was bound to another TMID with a location, the core sends `LOC_CANCEL(reactivated)` to that cell (as `oc_sig_net` fix round 1 "cut off old terminal on reactivation").
 5. The core answers `ACT_RES` with the finished `ACT_ACK`, or with `ACT_NAK` (1 unknown, 2 used, 3 expired, 4 bad tag).
 6. The cell queues it to the terminal.
 
@@ -199,28 +199,28 @@ Timing: the terminal retransmits after 1 s, up to 3 times (plan-5 spec §4.4). A
 
 ### 7.3 MO/MT within a cell
 
-Unchanged from plan 5: `lc_sig_net` switches the call when the called number is a **registered session on this cell**. The core is not involved and `CALL_ROUTE` is not sent. A CDR notice for local calls can be added later; it is not in §6.
+Unchanged from plan 5: `oc_sig_net` switches the call when the called number is a **registered session on this cell**. The core is not involved and `CALL_ROUTE` is not sent. A CDR notice for local calls can be added later; it is not in §6.
 
 ### 7.4 Cross-cell call (T_A on cell A calls T_B on cell B)
 
-1. T_A sends `CALL_SETUP`. `lc_sig_net` answers `CALL_PROC` and raises `LC_SIG_NET_MO`, and cell A sends `CALL_ROUTE(leg_ref, caller, called)`.
+1. T_A sends `CALL_SETUP`. `oc_sig_net` answers `CALL_PROC` and raises `OC_SIG_NET_MO`, and cell A sends `CALL_ROUTE(leg_ref, caller, called)`.
 2. The core looks up the called number:
    - not a subscriber and not a service number → `CALL_RELEASE(4 unreachable)`;
    - no live location → `CALL_RELEASE(4)`;
    - the echo service → the core answers as the peer does today;
    - otherwise → `CALL_OFFER` to cell B.
-3. Cell B calls `lc_sig_net_call_in`:
+3. Cell B calls `oc_sig_net_call_in`:
    - busy → `CALL_RELEASE(2)`;
    - no session (stale location) → `CALL_RELEASE(4)`, and the core drops the location;
    - otherwise T_B gets `SETUP_IND` (paged if idle).
-4. T_B's `ALERTING` → `CALL_ALERT` → cell A calls `lc_sig_net_peer_alert` (T_A hears it ring).
-5. T_B's `CONNECT` → `CALL_ANSWER` → `lc_sig_net_peer_answer`.
-6. App data: cell A decrypts with leg A's `K_voice` (`lc_sig_net_data_in`) → `MEDIA` → core → cell B encrypts with leg B's key (`lc_sig_net_data_out`). This is hop-by-hop, as local calls are today (plan-5 spec §5); the plaintext travels only inside the TLS link.
+4. T_B's `ALERTING` → `CALL_ALERT` → cell A calls `oc_sig_net_peer_alert` (T_A hears it ring).
+5. T_B's `CONNECT` → `CALL_ANSWER` → `oc_sig_net_peer_answer`.
+6. App data: cell A decrypts with leg A's `K_voice` (`oc_sig_net_data_in`) → `MEDIA` → core → cell B encrypts with leg B's key (`oc_sig_net_data_out`). This is hop-by-hop, as local calls are today (plan-5 spec §5); the plaintext travels only inside the TLS link.
 7. A `RELEASE` from either terminal becomes `CALL_RELEASE` with the same cause on the other leg, and the core writes the CDR.
 
 Timers:
 - The core allows 10 s from `CALL_ROUTE` to an alert or a release. After that it sends `CALL_RELEASE(5)` to cell A and `CALL_RELEASE` to B.
-- Ringing is limited to 60 s by `lc_sig_net` on the MT leg (cause 3), and the core relays that release.
+- Ringing is limited to 60 s by `oc_sig_net` on the MT leg (cause 3), and the core relays that release.
 - Cell A with no core link releases the leg at once with cause 5.
 
 ### 7.5 MT from the core (echo service, later a gateway)
@@ -231,23 +231,23 @@ This is `CALL_OFFER` to the callee's cell, then the same as steps 3–7 above.
 
 | Situation | Where it is decided | Cause to the caller |
 |---|---|---|
-| Callee in a call (same or other cell), or the caller dialled itself | `lc_sig_net` (`local_setup`, `call_in`) | 2 busy |
+| Callee in a call (same or other cell), or the caller dialled itself | `oc_sig_net` (`local_setup`, `call_in`) | 2 busy |
 | Number unknown, not activated, not registered anywhere, stale location | core, or cell B | 4 unreachable |
 | No answer in 60 s / callee rejects | cell B | 3 / 1 |
 | Core or backhaul down, or core timeout | cell A or the core | 5 network failure |
-| Radio link lost in a call | `lc_sig_net` (5 s without data) | 6 link lost |
+| Radio link lost in a call | `oc_sig_net` (5 s without data) | 6 link lost |
 
 ### 7.7 Location
 
-- The core moves a number's location **only on `LOC_UPDATE`**, never on `AV_REQ`: an unauthenticated `REG_REQ` must not move anyone, just as it may not deregister anyone in `lc_sig_net`.
+- The core moves a number's location **only on `LOC_UPDATE`**, never on `AV_REQ`: an unauthenticated `REG_REQ` must not move anyone, just as it may not deregister anyone in `oc_sig_net`.
 - The core checks the update's `RES` against the stored `XRES` of an AV it issued to that cell (§8).
 - Expiry is 2 × `period_s` (plan-5 spec §4.3). `LOC_PURGE` clears the location early.
 
 ### 7.8 A terminal moves between cells (idle)
 
-1. T loses cell A, attaches to cell B, and registers again by itself (`lc_sig_term_link`).
+1. T loses cell A, attaches to cell B, and registers again by itself (`oc_sig_term_link`).
 2. Cell B sends `LOC_UPDATE`. The core sends `LOC_CANCEL(moved)` to cell A.
-3. Cell A calls `lc_sig_net_drop`, and its cached AVs for T are discarded.
+3. Cell A calls `oc_sig_net_drop`, and its cached AVs for T are discarded.
 4. If T was in a call, the call ends with cause 6 (no handover; out of scope).
 5. Cell selection is the terminal's: it takes the first beacon it acquires. No reselection policy exists yet.
 
@@ -257,7 +257,7 @@ This is `CALL_OFFER` to the callee's cell, then the same as steps 3–7 above.
 
 - **Radio side.** The W12s stay silent on a missed schedule (plan 4 constraint "no beacon replay"). The beacon stops, every terminal loses the cell, and each registers again on re-attach.
 - **Core side.** A `HELLO` with a new `boot_id` makes the core purge that cell's locations, release every call with a leg on it (cause 5 to the other leg), and discard its unconfirmed AVs. A reconnect with the same `boot_id` (the link dropped, the process did not) keeps locations; calls that spanned the link were already released on both sides.
-- **`lc_sig_net` call ids** restart at 1 after a restart. That is safe: they are unique within a registration, K_voice also binds RAND, and the core names legs by `(cell, leg_ref)`.
+- **`oc_sig_net` call ids** restart at 1 after a restart. That is safe: they are unique within a registration, K_voice also binds RAND, and the core names legs by `(cell, leg_ref)`.
 
 ### 7.10 Core restart and backhaul outage
 
@@ -269,8 +269,8 @@ This is `CALL_OFFER` to the callee's cell, then the same as steps 3–7 above.
 
 ### 7.11 Numbering
 
-Numbering v2 (`numbering-plan.md` v0.2): a number is 883 · country code · national number, at most 15 digits; NANP numbers are `+883 1 NPA NXX SSSSS`, exactly 15 (`+883-1-606-555-01234`). `lc_sig` carries only the full form, 8 BCD bytes (`LC_SIG_NUMBER_LEN` = 8). Terminals normalize what the user dials (`lc_sig_number_normalize`, with the subscriber's own number as the home context; numbering-v2 design §5), so no short form reaches a cell or a core.
-- The core checks the encoding (`lc_sig_number_valid`) and its policy: the number lies in a known block (§14.2) and is not reserved (00000, 00911, 09911, 99999, and the service range 00001–00999 except configured service numbers such as the echo service 00100).
+Numbering v2 (`numbering-plan.md` v0.2): a number is 883 · country code · national number, at most 15 digits; NANP numbers are `+883 1 NPA NXX SSSSS`, exactly 15 (`+883-1-606-555-01234`). `oc_sig` carries only the full form, 8 BCD bytes (`OC_SIG_NUMBER_LEN` = 8). Terminals normalize what the user dials (`oc_sig_number_normalize`, with the subscriber's own number as the home context; numbering-v2 design §5), so no short form reaches a cell or a core.
+- The core checks the encoding (`oc_sig_number_valid`) and its policy: the number lies in a known block (§14.2) and is not reserved (00000, 00911, 09911, 99999, and the service range 00001–00999 except configured service numbers such as the echo service 00100).
 - `admin sub add` auto-assigns a random free number (01000–99998, not 09911) in a block this core is home for (`numbering-plan.md` §Assignment Modes); `admin` commands accept any full form, e.g. `+883-1-606-555-1234`, and store the canonical `+883160655501234`.
 - Routing is the longest-prefix match of the full number on the block table (§14.2). In a single-core network every block is at home.
 - Numbers outside 883 get cause 4 until a gateway exists.
@@ -298,16 +298,16 @@ Numbering v2 (`numbering-plan.md` v0.2): a number is 883 · country code · nati
 
 ## 9. Testing
 
-1. **`lc_core` host tests** (Unity, like `host-tests/`):
+1. **`oc_core` host tests** (Unity, like `host-tests/`):
    - the codec with golden bytes;
    - HSS on an in-memory SQLite database;
    - AES-GCM seal/open, including a wrong AAD;
-   - activation, AV and resync checked against `lc_sig_term` as the reference terminal;
+   - activation, AV and resync checked against `oc_sig_term` as the reference terminal;
    - SQN monotonic across restarts;
    - token expiry and reuse;
    - LOC_UPDATE with a bad RES;
    - routing tables.
-2. **Multi-cell simulation** (new `host-tests/test_net_sim.c`, in the style of `test_sig_local.c`): N cells (`lc_sig_net` + glue), M `lc_sig_term` terminals on fake links, and the core over an in-memory transport with injectable delay, loss and disconnect. Scenarios:
+2. **Multi-cell simulation** (new `host-tests/test_net_sim.c`, in the style of `test_sig_local.c`): N cells (`oc_sig_net` + glue), M `oc_sig_term` terminals on fake links, and the core over an in-memory transport with injectable delay, loss and disconnect. Scenarios:
    - cross-cell call, reject, busy, unreachable, no answer, hang-up from each side;
    - echo service;
    - a terminal moves while idle;
@@ -316,16 +316,16 @@ Numbering v2 (`numbering-plan.md` v0.2): a number is 883 · country code · nati
    - a backhaul outage with the AV cache;
    - a stale cached AV → resync;
    - a rogue cell claiming a location.
-3. **Radio stack in simulation:** `test_term_sim.c` (lc_term against `lcb_cell` over simulated air) runs with the new glue and a fake core, so the plan-5 air path is covered unchanged.
+3. **Radio stack in simulation:** `test_term_sim.c` (oc_term against `ocb_cell` over simulated air) runs with the new glue and a fake core, so the plan-5 air path is covered unchanged.
 4. **Process-level:** `oc-core` and two `oc-cell --radio sim` processes on localhost, over Unix sockets and then over TLS with throw-away test certificates; kill/restart tests.
 5. **Bench** (the laptop first, then the Pi once plan 4 lands):
    - (a) `oc-core` + one `oc-cell` with board A: the plan-5 done list with T and T2;
-   - (b) two `oc-cell` processes, board A and a second bs-radio board, on different `cell_seed`s, one process per serial port (bench rule): cross-cell calls and an idle move. Terminals are placed by starting one cell at a time and switching a cell off (`lcb_cell.off`).
+   - (b) two `oc-cell` processes, board A and a second bs-radio board, on different `cell_seed`s, one process per serial port (bench rule): cross-cell calls and an idle move. Terminals are placed by starting one cell at a time and switching a cell off (`ocb_cell.off`).
    - Two co-located cells on 915 MHz are new ground for the radio layer (beacon collisions on sync channels); if they interfere, the bench staggers frames or falls back to a cabled attenuator setup.
    - (c) plan 9: one `oc-cell` on the laptop with board A, `oc-core` in the VM (§16), over the internet with mTLS.
 6. **Several cores** (plans 10–11): `test_net_sim.c` grows to N cores over in-memory OCSS links with injectable partitions. Scenarios:
    - a call between cells on different cores; LOCATE answered by a secondary while the home is down;
-   - promotion with the SQN jump, checked against `lc_sig_term`: the first AV is accepted without a resync for every lag L < M, and a larger gap resyncs;
+   - promotion with the SQN jump, checked against `oc_sig_term`: the first AV is accepted without a resync for every lag L < M, and a larger gap resyncs;
    - the old home returning, demoting itself and logging its tail;
    - a block transfer with registrations and calls during the freeze;
    - a forged takeover or replication record, a stale table version, a core not in the directory: all refused.
@@ -333,12 +333,12 @@ Numbering v2 (`numbering-plan.md` v0.2): a number is 883 · country code · nati
 
 ## 10. Relation to plan 4 (scheduler)
 
-Plan 4 is a separate, radio-only concern and stays so. `oc-cell` uses it as its Pi radio backend. Before it is implemented, the plan should be amended with what `lcb_cell` learned in plans 3 and 5:
+Plan 4 is a separate, radio-only concern and stays so. `oc-cell` uses it as its Pi radio backend. Before it is implemented, the plan should be amended with what `ocb_cell` learned in plans 3 and 5:
 
 1. An **in-process fronthaul**: `rhu_fronthaul_t` callbacks go straight into the `oc-cell` glue. Task 9's loopback UDP datagrams become an optional debug tap, or are dropped; the "phone RAN" target is gone.
-2. A **DL queue per terminal** (≥ 8 payloads, like `LCB_CELL_DLQ`) in place of the single `rhu_term_t.dl_buf`: a signalling message is up to 4 fragments.
-3. **Idle attach and release**: terminals attach without legs, get legs on `SERVICE_REQ` or a page, and `lc_sig_net`'s `channel(off)` sends an empty grant (`lcb_cell_release`). Otherwise `RHU_MAX_TERMS` idle terminals hold legs that fit only about 2 calls (plan 4 R5).
-4. **`SERVICE_REQ` on RACH UPPER** reaches `up_rach` with its TMID; attach/release events feed `lc_sig_net_link`, and UL data feeds `lc_sig_net_heard`.
+2. A **DL queue per terminal** (≥ 8 payloads, like `OCB_CELL_DLQ`) in place of the single `rhu_term_t.dl_buf`: a signalling message is up to 4 fragments.
+3. **Idle attach and release**: terminals attach without legs, get legs on `SERVICE_REQ` or a page, and `oc_sig_net`'s `channel(off)` sends an empty grant (`ocb_cell_release`). Otherwise `RHU_MAX_TERMS` idle terminals hold legs that fit only about 2 calls (plan 4 R5).
+4. **`SERVICE_REQ` on RACH UPPER** reaches `up_rach` with its TMID; attach/release events feed `oc_sig_net_link`, and UL data feeds `oc_sig_net_heard`.
 5. **Two-terminal SCHEDULE order**: all DL legs before UL legs (commit c9a4541).
 6. Naming: `loravoice-rhu` → `oc-cell` (the project was renamed OpenCell on 2026-09-25).
 
@@ -347,8 +347,8 @@ Plan 4 is a separate, radio-only concern and stays so. `oc-cell` uses it as its 
 | Plan | Content | Depends on |
 |---|---|---|
 | **6a, 6b: numbering v2** | 8-byte numbers, dial normalization, QR v2, identity blob v2, BLE contract v3 (6a, C side), and the app (6b): `2026-09-27-numbering-v2-design.md` §10, branch `numbers-v2`. | plan 5 |
-| **7: `lc_core` and async `lc_sig_net`** | §4.3 library changes with the existing tests moved over; `lc_core` (codec, HSS logic over a storage interface, AV/resync/activation, registry, switch, echo service); the multi-cell simulation (§9.2). Host-only. Numbers are 8 bytes from the start. Routing already goes through a one-core block table (longest prefix, "am I home?" checks), and token ids carry the block index (§14.3), so plan 10 adds cores without reshaping `lc_core`. | plan 5, 6a |
-| **8: `oc-core` and `oc-cell` on the bench** | SQLite store with sealed keys, admin CLI (replaces `mkqr`), Unix-socket transport, `oc-cell` on the `lcb_cell` backend (replaces `lcbench net`; `lcb_net` and `lcb_hss` retire), process tests, bench §9.5a. | 7 |
+| **7: `oc_core` and async `oc_sig_net`** | §4.3 library changes with the existing tests moved over; `oc_core` (codec, HSS logic over a storage interface, AV/resync/activation, registry, switch, echo service); the multi-cell simulation (§9.2). Host-only. Numbers are 8 bytes from the start. Routing already goes through a one-core block table (longest prefix, "am I home?" checks), and token ids carry the block index (§14.3), so plan 10 adds cores without reshaping `oc_core`. | plan 5, 6a |
+| **8: `oc-core` and `oc-cell` on the bench** | SQLite store with sealed keys, admin CLI (replaces `mkqr`), Unix-socket transport, `oc-cell` on the `ocb_cell` backend (replaces `ocbench net`; `ocb_net` and `ocb_hss` retire), process tests, bench §9.5a. | 7 |
 | **9: Multi-site and the first server** | TLS/mTLS transport, cell certificates and a small CA script, reconnect and outage handling, AV cache, two-cell bench (§9.5b); the `oc-core-1` VM on the Proxmox server with its port forward and backups (§16), and bench §9.5c. | 8 |
 | **10: OCSS and several cores** | The OCSS spec first (§15.7). Then the signed routing table, core directory and `admin route sign`; OCSS links; table and takeover distribution; activation, AV and location relay, LOCATE and the binding index; calls and media between cores; the cell's ordered core list (§14.6). Two cores: the VM and the laptop. | 9 |
 | **11: Replication, failover and block transfer** | Replication streams, snapshot and catch-up; manual promotion with the SQN jump; demotion and the conflict log; block transfer (freeze, final replication, flip, margin); §9.6 tests. | 10 |
@@ -366,14 +366,14 @@ The user accepted every recommended answer of the draft, with the changes marked
 
 1. Architecture: edge cell + home core, always two programs (a single site runs both on the Pi), as in §3.3: **option (C).**
 2. Subscriber keys live only in cores, and cells get AVs. With several cores: only in a block's home core and its secondaries (§14.7).
-3. Core stack: **C11 + SQLite + OpenSSL**, reusing `lc_sig`; RADIUS, Diameter, etcd and Redis are dropped.
+3. Core stack: **C11 + SQLite + OpenSSL**, reusing `oc_sig`; RADIUS, Diameter, etcd and Redis are dropped.
 4. Cell↔core transport: **TLS 1.3 with per-cell certificates (mTLS) over TCP**, signalling and media on one connection; UDP/DTLS media only if WAN loss proves it necessary.
 5. Part 15 / Part 97 mode: **per cell** (`cell.mode`); terminals already re-register when the beacon mode changes.
 6. Offline cells: **2 cached AVs per terminal**, refilled after use; activation always needs the core.
 7. Where `oc-core` runs: **the laptop (localhost) on the bench; the first server is a VM on the user's Proxmox server** (§16), in place of the draft's "small VPS".
 8. Master key for keys at rest: **a systemd credential file** (root-only; in the VM, on a disk excluded from backups, §16.4), `--key-file` on the bench.
-9. Order of work: **the `lcb_cell` backend first**; plan 4 is amended per §10 before it runs.
-10. `lcb_net`'s simulated far end becomes the core's **echo service**, now `+883160655500100`.
+9. Order of work: **the `ocb_cell` backend first**; plan 4 is amended per §10 before it runs.
+10. `ocb_net`'s simulated far end becomes the core's **echo service**, now `+883160655500100`.
 11. *Added:* several cores as **home core + asynchronous replicas**: each block's home core owns its subscribers' writes; secondaries replicate and serve location; failover promotes a secondary, which jumps SQN by M = 2^24; cells attach to the nearest core (§14).
 12. *Added:* blocks (NPAs, or NPA-NXXs) can be **transferred to another tenant**, whose core becomes the home; the previous home becomes a secondary (§14.5).
 13. *Added:* cores talk **OCSS**, the OpenCell Signalling System (§15); its message design gets its own spec in plan 10.
@@ -437,7 +437,7 @@ The **longest prefix wins**, so an exchange block can sit inside another tenant'
   1. The secondary writes a takeover record `{block, new home = itself, epoch + 1, last replication position applied}`, signs it, and sends it to every core it can reach.
   2. **SQN jump:** in the same transaction it adds **M = 2^24** to the SQN of every subscriber in the block, before it issues any AV.
   3. It serves the block's writes. Serving cores send AV, activation and location requests to it as soon as they accept the record.
-- **Why the jump makes asynchronous replication safe.** A terminal accepts an AV only if `SQN_ms < SQN ≤ SQN_ms + 2^28` (`lc_sig_term.c`, the check near line 355; plan-5 spec §4.3). The replica's SQN lags the lost home's by L, the AVs issued but not yet replicated for that subscriber (a few at most: 2 cached per cell plus any in flight). After the jump the new home's next SQN is SQN_replica + M + 1:
+- **Why the jump makes asynchronous replication safe.** A terminal accepts an AV only if `SQN_ms < SQN ≤ SQN_ms + 2^28` (`oc_sig_term.c`, the check near line 355; plan-5 spec §4.3). The replica's SQN lags the lost home's by L, the AVs issued but not yet replicated for that subscriber (a few at most: 2 cached per cell plus any in flight). After the jump the new home's next SQN is SQN_replica + M + 1:
   - it is above everything the old home issued as long as L < M, so the first new AV is accepted without a resync, and any AV the old home still had out becomes stale;
   - it stays inside the terminal's window as long as M + (unused AVs) ≤ 2^28;
   - outside these bounds the existing resync takes over (`AUTH_FAIL` cause 2 → AUTS → the new home sets SQN from it), so nothing gets stuck;
@@ -516,7 +516,7 @@ The cell↔core protocol (§6) does not change with several cores: a cell speaks
 | Call control | CALL_SETUP(call_ref, caller, called, hop), CALL_ALERT, CALL_ANSWER, CALL_RELEASE(cause), MEDIA(call_ref, seq, data ≤ 18) | the caller's serving core ↔ the callee's serving core |
 | Replication | REPL_SUBSCRIBE(block, position), REPL_SNAPSHOT, REPL_RECORD(position, record), REPL_ACK(position), FREEZE, FREEZE_DONE(P), FREEZE_ACK(P) | home ↔ secondaries |
 
-Status codes, shared with §6 where they overlap: ok, not activated, bound elsewhere, disabled, frozen, moved(core), not home, unavailable. Release causes are the `lc_sig` causes, carried end to end.
+Status codes, shared with §6 where they overlap: ok, not activated, bound elsewhere, disabled, frozen, moved(core), not home, unavailable. Release causes are the `oc_sig` causes, carried end to end.
 
 ### 15.4 Routing
 

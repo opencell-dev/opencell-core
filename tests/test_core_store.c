@@ -8,16 +8,16 @@
 #include <string.h>
 
 #include "core_store_contract.h"
-#include "lc_core_mem.h"
+#include "oc_core_mem.h"
 
 void setUp(void) {}
 void tearDown(void) {}
 
-static lc_core_mem_t mem;
+static oc_core_mem_t mem;
 
 /* A distinct valid number for index i: "883" + a non-'1' 4th digit keeps
  * digits_ok() out of the NANP branch, so any digit string is accepted. */
-static void num_for(unsigned i, uint8_t out[LC_SIG_NUMBER_LEN])
+static void num_for(unsigned i, uint8_t out[OC_SIG_NUMBER_LEN])
 {
     char text[16];
     snprintf(text, sizeof text, "8832%07u", i);
@@ -26,16 +26,16 @@ static void num_for(unsigned i, uint8_t out[LC_SIG_NUMBER_LEN])
 
 static void test_mem_store_keeps_the_contract(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
     store_contract(&st);
 }
 
 static void test_failed_commit_undoes_everything_since_begin(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_sub_t s, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_sub_t s, got;
     memset(&s, 0, sizeof(s));
     contract_num("+883160655501234", s.number);
     s.sqn = 10;
@@ -60,22 +60,22 @@ static void test_failed_commit_undoes_everything_since_begin(void)
  * not linger and doom the next, unrelated transaction too. */
 static void test_failed_put_dooms_then_the_flag_resets(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_netkey_t k, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_netkey_t k, got;
     memset(&k, 0, sizeof(k));
-    for (unsigned i = 0; i < LC_CORE_MEM_KEYS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_KEYS; i++) {
         k.key_id = (uint16_t)(i + 1);
         TEST_ASSERT_EQUAL_INT(0, st.netkey_put(st.ctx, &k)); /* fills the table */
     }
     TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
-    k.key_id = (uint16_t)(LC_CORE_MEM_KEYS + 1);
+    k.key_id = (uint16_t)(OC_CORE_MEM_KEYS + 1);
     TEST_ASSERT_EQUAL_INT(-1, st.netkey_put(st.ctx, &k)); /* one past the bound: fails */
     TEST_ASSERT_EQUAL_INT(-1, st.commit(st.ctx)); /* the failed put dooms the whole transaction */
     TEST_ASSERT_EQUAL_INT(-1, st.netkey_get(st.ctx, k.key_id, &got));
     TEST_ASSERT_EQUAL_UINT(0, mem.commits);
 
-    lc_core_sub_t s, sgot;
+    oc_core_sub_t s, sgot;
     memset(&s, 0, sizeof(s));
     contract_num("+883200000000002", s.number);
     s.sqn = 42;
@@ -91,20 +91,20 @@ static void test_failed_put_dooms_then_the_flag_resets(void)
  * full-table branch must doom an open transaction too, not just return -1. */
 static void test_failed_list_put_dooms_then_the_flag_resets(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_sig_chan_list_t l, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_sig_chan_list_t l, got;
     memset(&l, 0, sizeof(l));
-    for (unsigned i = 0; i < LC_CORE_MEM_LISTS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_LISTS; i++) {
         TEST_ASSERT_EQUAL_INT(0, st.list_put(st.ctx, (uint16_t)(i + 1), &l)); /* fills the table */
     }
     TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
-    TEST_ASSERT_EQUAL_INT(-1, st.list_put(st.ctx, (uint16_t)(LC_CORE_MEM_LISTS + 1), &l)); /* one past the bound: fails */
+    TEST_ASSERT_EQUAL_INT(-1, st.list_put(st.ctx, (uint16_t)(OC_CORE_MEM_LISTS + 1), &l)); /* one past the bound: fails */
     TEST_ASSERT_EQUAL_INT(-1, st.commit(st.ctx)); /* the failed put dooms the whole transaction */
-    TEST_ASSERT_EQUAL_INT(-1, st.list_get(st.ctx, (uint16_t)(LC_CORE_MEM_LISTS + 1), &got)); /* nothing landed */
+    TEST_ASSERT_EQUAL_INT(-1, st.list_get(st.ctx, (uint16_t)(OC_CORE_MEM_LISTS + 1), &got)); /* nothing landed */
     TEST_ASSERT_EQUAL_UINT(0, mem.commits);
 
-    lc_core_sub_t s, sgot;
+    oc_core_sub_t s, sgot;
     memset(&s, 0, sizeof(s));
     contract_num("+883200000000003", s.number);
     s.sqn = 43;
@@ -118,34 +118,34 @@ static void test_failed_list_put_dooms_then_the_flag_resets(void)
 
 static void test_logs_keep_the_newest(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_audit_t a;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_audit_t a;
     memset(&a, 0, sizeof(a));
-    for (unsigned i = 0; i < LC_CORE_MEM_LOG + 5u; i++) {
-        a.event = i == 3 ? LC_CORE_AUDIT_RESYNC : LC_CORE_AUDIT_REGISTER;
+    for (unsigned i = 0; i < OC_CORE_MEM_LOG + 5u; i++) {
+        a.event = i == 3 ? OC_CORE_AUDIT_RESYNC : OC_CORE_AUDIT_REGISTER;
         a.ts = i;
         st.audit_add(st.ctx, &a);
     }
-    TEST_ASSERT_NULL(lc_core_mem_audit(&mem, LC_CORE_AUDIT_RESYNC)); /* overwritten */
-    const lc_core_audit_t *last = lc_core_mem_audit(&mem, LC_CORE_AUDIT_REGISTER);
+    TEST_ASSERT_NULL(oc_core_mem_audit(&mem, OC_CORE_AUDIT_RESYNC)); /* overwritten */
+    const oc_core_audit_t *last = oc_core_mem_audit(&mem, OC_CORE_AUDIT_REGISTER);
     TEST_ASSERT_NOT_NULL(last);
-    TEST_ASSERT_EQUAL_UINT32(LC_CORE_MEM_LOG + 4u, last->ts);
-    TEST_ASSERT_NULL(lc_core_mem_audit(&mem, LC_CORE_AUDIT_ACTIVATE));
+    TEST_ASSERT_EQUAL_UINT32(OC_CORE_MEM_LOG + 4u, last->ts);
+    TEST_ASSERT_NULL(oc_core_mem_audit(&mem, OC_CORE_AUDIT_ACTIVATE));
 }
 
 static void test_netkey_table_fills_then_refuses(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_netkey_t k, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_netkey_t k, got;
     memset(&k, 0, sizeof(k));
-    for (unsigned i = 0; i < LC_CORE_MEM_KEYS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_KEYS; i++) {
         k.key_id = (uint16_t)(i + 1);
         k.created = i;
         TEST_ASSERT_EQUAL_INT(0, st.netkey_put(st.ctx, &k)); /* the last of these fills the table */
     }
-    k.key_id = (uint16_t)(LC_CORE_MEM_KEYS + 1);
+    k.key_id = (uint16_t)(OC_CORE_MEM_KEYS + 1);
     k.created = 999;
     TEST_ASSERT_EQUAL_INT(-1, st.netkey_put(st.ctx, &k)); /* one past the bound */
     TEST_ASSERT_EQUAL_INT(-1, st.netkey_get(st.ctx, k.key_id, &got)); /* not added */
@@ -155,16 +155,16 @@ static void test_netkey_table_fills_then_refuses(void)
 
 static void test_cell_table_fills_then_refuses(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_cell_t c, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_cell_t c, got;
     memset(&c, 0, sizeof(c));
-    for (unsigned i = 0; i < LC_CORE_MEM_CELLS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_CELLS; i++) {
         c.cell_id = i + 1;
         c.last_seen = i;
         TEST_ASSERT_EQUAL_INT(0, st.cell_put(st.ctx, &c));
     }
-    c.cell_id = LC_CORE_MEM_CELLS + 1;
+    c.cell_id = OC_CORE_MEM_CELLS + 1;
     c.last_seen = 999;
     TEST_ASSERT_EQUAL_INT(-1, st.cell_put(st.ctx, &c));
     TEST_ASSERT_EQUAL_INT(-1, st.cell_get(st.ctx, c.cell_id, &got));
@@ -174,18 +174,18 @@ static void test_cell_table_fills_then_refuses(void)
 
 static void test_sub_table_fills_then_refuses(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_sub_t s, got;
-    uint8_t first[LC_SIG_NUMBER_LEN];
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_sub_t s, got;
+    uint8_t first[OC_SIG_NUMBER_LEN];
     memset(&s, 0, sizeof(s));
-    for (unsigned i = 0; i < LC_CORE_MEM_SUBS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_SUBS; i++) {
         num_for(i, s.number);
-        if (i == 0) memcpy(first, s.number, LC_SIG_NUMBER_LEN);
+        if (i == 0) memcpy(first, s.number, OC_SIG_NUMBER_LEN);
         s.sqn = i;
         TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
     }
-    num_for(LC_CORE_MEM_SUBS, s.number);
+    num_for(OC_CORE_MEM_SUBS, s.number);
     s.sqn = 999;
     TEST_ASSERT_EQUAL_INT(-1, st.sub_put(st.ctx, &s));
     TEST_ASSERT_EQUAL_INT(-1, st.sub_get(st.ctx, s.number, &got));
@@ -195,13 +195,13 @@ static void test_sub_table_fills_then_refuses(void)
 
 static void test_token_table_fills_then_refuses(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_token_t t, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_token_t t, got;
     uint8_t first_id[8];
     memset(&t, 0, sizeof(t));
     contract_num("+883200000000001", t.number);
-    for (unsigned i = 0; i < LC_CORE_MEM_TOKENS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_TOKENS; i++) {
         memset(t.token_id, 0, sizeof t.token_id);
         t.token_id[6] = (uint8_t)(i >> 8);
         t.token_id[7] = (uint8_t)i;
@@ -210,8 +210,8 @@ static void test_token_table_fills_then_refuses(void)
         TEST_ASSERT_EQUAL_INT(0, st.token_put(st.ctx, &t));
     }
     memset(t.token_id, 0, sizeof t.token_id);
-    t.token_id[6] = (uint8_t)(LC_CORE_MEM_TOKENS >> 8);
-    t.token_id[7] = (uint8_t)LC_CORE_MEM_TOKENS;
+    t.token_id[6] = (uint8_t)(OC_CORE_MEM_TOKENS >> 8);
+    t.token_id[7] = (uint8_t)OC_CORE_MEM_TOKENS;
     t.used_at = 999;
     TEST_ASSERT_EQUAL_INT(-1, st.token_put(st.ctx, &t));
     TEST_ASSERT_EQUAL_INT(-1, st.token_get(st.ctx, t.token_id, &got));
@@ -221,13 +221,13 @@ static void test_token_table_fills_then_refuses(void)
 
 static void test_av_table_fills_then_refuses(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_av_issued_t a, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_av_issued_t a, got;
     uint8_t first_rand[16];
     memset(&a, 0, sizeof(a));
     contract_num("+883200000000001", a.number);
-    for (unsigned i = 0; i < LC_CORE_MEM_AVS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_AVS; i++) {
         memset(a.rand, 0, sizeof a.rand);
         a.rand[14] = (uint8_t)(i >> 8);
         a.rand[15] = (uint8_t)i;
@@ -236,8 +236,8 @@ static void test_av_table_fills_then_refuses(void)
         TEST_ASSERT_EQUAL_INT(0, st.av_put(st.ctx, &a));
     }
     memset(a.rand, 0, sizeof a.rand);
-    a.rand[14] = (uint8_t)(LC_CORE_MEM_AVS >> 8);
-    a.rand[15] = (uint8_t)LC_CORE_MEM_AVS;
+    a.rand[14] = (uint8_t)(OC_CORE_MEM_AVS >> 8);
+    a.rand[15] = (uint8_t)OC_CORE_MEM_AVS;
     a.issued = 999;
     TEST_ASSERT_EQUAL_INT(-1, st.av_put(st.ctx, &a));
     TEST_ASSERT_EQUAL_INT(-1, st.av_get(st.ctx, a.number, a.rand, &got));
@@ -247,19 +247,19 @@ static void test_av_table_fills_then_refuses(void)
 
 static void test_loc_table_fills_then_refuses(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_loc_t l, got;
-    uint8_t first[LC_SIG_NUMBER_LEN];
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_loc_t l, got;
+    uint8_t first[OC_SIG_NUMBER_LEN];
     memset(&l, 0, sizeof(l));
-    for (unsigned i = 0; i < LC_CORE_MEM_SUBS; i++) {
+    for (unsigned i = 0; i < OC_CORE_MEM_SUBS; i++) {
         num_for(i, l.number);
-        if (i == 0) memcpy(first, l.number, LC_SIG_NUMBER_LEN);
+        if (i == 0) memcpy(first, l.number, OC_SIG_NUMBER_LEN);
         l.cell_id = i;
         l.expires = i;
         TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
     }
-    num_for(LC_CORE_MEM_SUBS, l.number);
+    num_for(OC_CORE_MEM_SUBS, l.number);
     l.expires = 999;
     TEST_ASSERT_EQUAL_INT(-1, st.loc_put(st.ctx, &l));
     TEST_ASSERT_EQUAL_INT(-1, st.loc_get(st.ctx, l.number, &got));
@@ -269,9 +269,9 @@ static void test_loc_table_fills_then_refuses(void)
 
 static void test_begin_twice_is_refused(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_sub_t s, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_sub_t s, got;
     memset(&s, 0, sizeof(s));
     contract_num("+883200000000001", s.number);
     s.sqn = 1;
@@ -281,7 +281,7 @@ static void test_begin_twice_is_refused(void)
     TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
     TEST_ASSERT_EQUAL_INT(-1, st.begin(st.ctx)); /* already inside a transaction: refused */
     s.sqn = 3;
-    /* a failed begin dooms the transaction (lc_core_store.h): the write is
+    /* a failed begin dooms the transaction (oc_core_store.h): the write is
      * refused and commit undoes everything */
     TEST_ASSERT_EQUAL_INT(-1, st.sub_put(st.ctx, &s));
     TEST_ASSERT_EQUAL_INT(-1, st.commit(st.ctx));
@@ -298,14 +298,14 @@ static void test_begin_twice_is_refused(void)
  * commit returns -1, and the next begin starts afresh. */
 static void test_failed_begin_dooms_the_transaction(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_sub_t s, got;
-    lc_core_loc_t l, lg;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_sub_t s, got;
+    oc_core_loc_t l, lg;
     memset(&s, 0, sizeof(s));
     memset(&l, 0, sizeof(l));
     contract_num("+883200000000001", s.number);
-    memcpy(l.number, s.number, LC_SIG_NUMBER_LEN);
+    memcpy(l.number, s.number, OC_SIG_NUMBER_LEN);
     s.sqn = 1;
     l.cell_id = 7;
     TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
@@ -318,7 +318,7 @@ static void test_failed_begin_dooms_the_transaction(void)
     TEST_ASSERT_EQUAL_INT(-1, st.loc_del(st.ctx, s.number));
     TEST_ASSERT_EQUAL_INT(-1, st.loc_purge_cell(st.ctx, 7));
     TEST_ASSERT_EQUAL_INT(-1, st.av_del_number(st.ctx, s.number));
-    lc_core_cdr_t cdr;
+    oc_core_cdr_t cdr;
     memset(&cdr, 0, sizeof(cdr));
     TEST_ASSERT_EQUAL_INT(-1, st.cdr_add(st.ctx, &cdr));
     TEST_ASSERT_EQUAL_UINT(5, mem.refused);
@@ -338,44 +338,44 @@ static void test_failed_begin_dooms_the_transaction(void)
 }
 
 /* Final review I2(c): sub_get, loc_get and av_newest_confirmed tell "none"
- * (LC_CORE_STORE_NONE) from "failed" (LC_CORE_STORE_FAILED): the test hook
+ * (OC_CORE_STORE_NONE) from "failed" (OC_CORE_STORE_FAILED): the test hook
  * fail_reads makes the chosen lookups fail, found or not. */
 static void test_failed_lookups_are_told_from_none(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    uint8_t n1[LC_SIG_NUMBER_LEN], n2[LC_SIG_NUMBER_LEN];
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    uint8_t n1[OC_SIG_NUMBER_LEN], n2[OC_SIG_NUMBER_LEN];
     contract_num("+883200000000001", n1);
     contract_num("+883200000000002", n2);
-    lc_core_sub_t s;
-    lc_core_loc_t l;
-    lc_core_av_issued_t a;
+    oc_core_sub_t s;
+    oc_core_loc_t l;
+    oc_core_av_issued_t a;
     uint64_t top;
     memset(&s, 0, sizeof(s));
     memset(&l, 0, sizeof(l));
     memset(&a, 0, sizeof(a));
-    memcpy(s.number, n1, LC_SIG_NUMBER_LEN);
-    memcpy(l.number, n1, LC_SIG_NUMBER_LEN);
-    memcpy(a.number, n1, LC_SIG_NUMBER_LEN);
+    memcpy(s.number, n1, OC_SIG_NUMBER_LEN);
+    memcpy(l.number, n1, OC_SIG_NUMBER_LEN);
+    memcpy(a.number, n1, OC_SIG_NUMBER_LEN);
     a.cell_id = 7;
     a.confirmed = 1;
     TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &s));
     TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
     TEST_ASSERT_EQUAL_INT(0, st.av_put(st.ctx, &a));
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st.sub_get(st.ctx, n2, &s));
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st.loc_get(st.ctx, n2, &l));
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_NONE, st.av_newest_confirmed(st.ctx, n2, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.sub_get(st.ctx, n2, &s));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.loc_get(st.ctx, n2, &l));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.av_newest_confirmed(st.ctx, n2, 0, &top));
 
-    mem.fail_reads = LC_CORE_MEM_FAIL_SUB_GET;
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.sub_get(st.ctx, n1, &s));
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.sub_get(st.ctx, n2, &s));
+    mem.fail_reads = OC_CORE_MEM_FAIL_SUB_GET;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.sub_get(st.ctx, n1, &s));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.sub_get(st.ctx, n2, &s));
     TEST_ASSERT_EQUAL_INT(0, st.loc_get(st.ctx, n1, &l)); /* only the chosen lookup fails */
-    mem.fail_reads = LC_CORE_MEM_FAIL_LOC_GET;
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.loc_get(st.ctx, n1, &l));
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.loc_get(st.ctx, n2, &l));
-    mem.fail_reads = LC_CORE_MEM_FAIL_AV_NEWEST;
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n1, 0, &top));
-    TEST_ASSERT_EQUAL_INT(LC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n2, 0, &top));
+    mem.fail_reads = OC_CORE_MEM_FAIL_LOC_GET;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, n1, &l));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, n2, &l));
+    mem.fail_reads = OC_CORE_MEM_FAIL_AV_NEWEST;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n1, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n2, 0, &top));
     mem.fail_reads = 0;
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, n1, &s));
     TEST_ASSERT_EQUAL_INT(0, st.av_newest_confirmed(st.ctx, n1, 0, &top));
@@ -383,9 +383,9 @@ static void test_failed_lookups_are_told_from_none(void)
 
 static void test_commit_without_begin_is_refused(void)
 {
-    lc_core_mem_init(&mem);
-    lc_core_store_t st = lc_core_mem_store(&mem);
-    lc_core_sub_t s, got;
+    oc_core_mem_init(&mem);
+    oc_core_store_t st = oc_core_mem_store(&mem);
+    oc_core_sub_t s, got;
     memset(&s, 0, sizeof(s));
     contract_num("+883200000000001", s.number);
     s.sqn = 1;

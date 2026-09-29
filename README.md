@@ -5,7 +5,7 @@ The central network software of [OpenCell](https://github.com/opencell-dev/openc
 Status: design approved, implementation not started.
 
 - Design: `docs/superpowers/specs/2026-09-27-network-core-design.md`
-- First plan: `docs/superpowers/plans/2026-09-27-net-core-1-lc-core.md` (`lc_core` and the async network side of `lc_sig`, host-only)
+- First plan: `docs/superpowers/plans/2026-09-27-net-core-1-lc-core.md` (`oc_core` and the async network side of `oc_sig`, host-only)
 - Deployment target: a Debian 13 VM on the Proxmox server (spec §16).
 
-The core shares the `lc_sig` signalling library with the terminal firmware in [opencell-firmware](https://github.com/opencell-dev/opencell-firmware); how the two repositories share it is decided when the first plan runs.
+The core shares the `oc_sig` signalling library with the terminal firmware in [opencell-firmware](https://github.com/opencell-dev/opencell-firmware); how the two repositories share it is decided when the first plan runs.

@@ -16,13 +16,13 @@ git submodule update --init
 cmake -S . -B build && cmake --build build -j && (cd build && ctest)
 ~~~
 
-A new core, as root on its host after `oc-deploy` (the master key is 32 random bytes, root-only; back it up offline):
+A new core, as root on its host after `oc-deploy` (the master key is 32 random bytes, root's and 0400, network-core spec §5; back it up offline):
 
 ~~~bash
 useradd --system --user-group --no-create-home --shell /usr/sbin/nologin oc-core
 groupadd -f oc-admin; groupadd -f oc-cell
 install -d -m 0755 /etc/opencell; install -d -o oc-core -g oc-core -m 0700 /var/lib/opencell/core
-(umask 077; head -c 32 /dev/urandom > /etc/opencell/master.key)
+(umask 077; head -c 32 /dev/urandom > /etc/opencell/master.key) && chmod 0400 /etc/opencell/master.key
 cp dist/oc-core.conf.example /etc/opencell/oc-core.conf
 oc-core admin --offline --key-file /etc/opencell/master.key net init
 oc-core admin --offline --key-file /etc/opencell/master.key cell add 1 my-cell

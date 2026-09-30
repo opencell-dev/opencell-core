@@ -34,3 +34,7 @@ target_link_libraries(tool_oc_drip PRIVATE oc_util)
 add_test(NAME test_oc_core_proc
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_core_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_hello>
                  $<TARGET_FILE:tool_oc_drip>)
+
+# tools/deploy/oc-deploy with its host side run here (OC_DEPLOY_LOCAL) on a
+# toy repository; fake ssh, sudo and systemctl.
+add_test(NAME test_oc_deploy COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_deploy.sh ${PROJECT_SOURCE_DIR}/tools/deploy/oc-deploy)

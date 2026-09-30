@@ -23,7 +23,14 @@
  * On a stop every link goes down the same way before the database closes,
  * so the calls in progress end with their CDRs.
  * Reconnect backoff is the cell's business (oc_core.h, oc_core_tick): no
- * state here outlives a link. */
+ * state here outlives a link.
+ *
+ * The admin API (portal spec §7, oc_api.h): with api_listen set, the portal
+ * connects over TLS to that private address (oc_apisrv.h), in the same
+ * loop; api_cert, api_key and api_ca are files, or - a value with no '/' -
+ * systemd credentials by name ($CREDENTIALS_DIRECTORY). Every minute,
+ * whether or not the API listens, unactivated numbers whose code has
+ * expired are released (network-core spec §18.3, oc_api_tick). */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -42,6 +49,8 @@
 #include <unistd.h>
 
 #include "oc_admin.h"
+#include "oc_api.h"
+#include "oc_apisrv.h"
 #include "oc_conn.h"
 #include "oc_core.h"
 #include "oc_kv.h"
@@ -49,6 +58,7 @@
 #include "oc_seal.h"
 #include "oc_sig_keys.h"
 #include "oc_sql.h"
+#include "oc_tls.h"
 
 #ifndef OC_VERSION
 #define OC_VERSION "dev"
@@ -84,7 +94,13 @@ static struct {
     dlink_t         link[OC_CORE_LINKS];
     uint32_t        next_id;
     uint8_t         key[32]; /* only until the database has its copy */
-} D = { .cell_l = -1, .admin_l = -1 };
+    char            name[64];
+    oc_tls_cfg_t    tls_cfg; /* the admin API's, when api_listen is set */
+    const char     *api_listen;
+    oc_api_t        api;
+    oc_apisrv_t     apisrv;
+    oc_tls_t       *tls;
+} D = { .cell_l = -1, .admin_l = -1, .apisrv = { .lfd = -1 } };
 
 static volatile sig_atomic_t g_stop;
 
@@ -140,7 +156,8 @@ static void no_core_dumps(void)
 /* ---- configuration ---- */
 
 static const char *const KEYS[] = { "core_id", "key_id", "echo", "block", "db", "cell_socket", "cell_group",
-                                    "admin_socket", "admin_group", NULL };
+                                    "admin_socket", "admin_group", "name", "api_listen", "api_cert", "api_key",
+                                    "api_ca", "api_portal_fpr", "api_rate", NULL };
 
 static int load_config(const char *path, const char *db)
 {
@@ -178,6 +195,41 @@ static int load_config(const char *path, const char *db)
     D.db = db != NULL ? db : oc_kv_get(&D.kv, "db") ? oc_kv_get(&D.kv, "db") : "/var/lib/opencell/core/core.db";
     D.cell_sock = oc_kv_get(&D.kv, "cell_socket") ? oc_kv_get(&D.kv, "cell_socket") : "/run/opencell/core.sock";
     D.admin_sock = oc_kv_get(&D.kv, "admin_socket") ? oc_kv_get(&D.kv, "admin_socket") : DEFAULT_ADMIN;
+    snprintf(D.name, sizeof(D.name), "%s", oc_kv_get(&D.kv, "name") ? oc_kv_get(&D.kv, "name") : "");
+    if (D.name[0] == '\0') snprintf(D.name, sizeof(D.name), "oc-core-%u", D.cfg.core_id);
+    /* the admin API: all of it or none */
+    memset(&D.tls_cfg, 0, sizeof(D.tls_cfg));
+    D.api_listen = oc_kv_get(&D.kv, "api_listen");
+    if (D.api_listen != NULL) {
+        struct sockaddr_storage sa;
+        socklen_t len;
+        char err[200];
+        if (oc_apisrv_addr(D.api_listen, &sa, &len, err, sizeof(err)) != 0) {
+            oc_log(OC_LOG_ERR, "config: %s", err);
+            return -1;
+        }
+    }
+    const char *api_keys[] = { "api_cert", "api_key", "api_ca", "api_portal_fpr" };
+    for (unsigned i = 0; i < 4; i++) {
+        if (D.api_listen != NULL && oc_kv_get(&D.kv, api_keys[i]) == NULL) {
+            oc_log(OC_LOG_ERR, "config: api_listen is set: %s is needed too", api_keys[i]);
+            return -1;
+        }
+    }
+    if (D.api_listen == NULL && (oc_kv_get(&D.kv, "api_cert") || oc_kv_get(&D.kv, "api_key") ||
+                                 oc_kv_get(&D.kv, "api_ca") || oc_kv_get(&D.kv, "api_portal_fpr"))) {
+        oc_log(OC_LOG_ERR, "config: api_* is set but api_listen is not (the admin API would not listen)");
+        return -1;
+    }
+    for (unsigned i = 0; oc_kv_nth(&D.kv, "api_portal_fpr", i) != NULL; i++) {
+        const char *f = oc_kv_nth(&D.kv, "api_portal_fpr", i);
+        if (i >= OC_TLS_PINS || oc_tls_fpr_parse(f, D.tls_cfg.pin[i]) != 0) {
+            oc_log(OC_LOG_ERR, "config: api_portal_fpr = '%s': at most %u, each 64 hex digits (oc-ca fpr CERT)", f,
+                   OC_TLS_PINS);
+            return -1;
+        }
+        D.tls_cfg.npin = i + 1u;
+    }
     return 0;
 bad:
     oc_log(OC_LOG_ERR, "config: %s", D.kv.err);
@@ -218,6 +270,57 @@ static int open_db(void)
     if (oc_sql_backup(D.sql)[0] != '\0') {
         oc_log(OC_LOG_NOTICE, "database migrated to v%d; the old one is kept as %s", oc_sql_version(D.sql),
                oc_sql_backup(D.sql));
+    }
+    return 0;
+}
+
+/* A config value naming a file: as it is, or with no '/', a systemd
+ * credential (LoadCredential=NAME:PATH) in $CREDENTIALS_DIRECTORY. */
+static const char *cred_path(const char *v, char *buf, size_t cap)
+{
+    const char *dir = getenv("CREDENTIALS_DIRECTORY");
+    if (strchr(v, '/') != NULL || dir == NULL) return v;
+    snprintf(buf, cap, "%s/%s", dir, v);
+    return buf;
+}
+
+static uint32_t unix_now(void) { return (uint32_t)time(NULL); }
+
+/* The admin API's state (always: its expiry job runs without a listener
+ * too) and, with api_listen, its TLS listener. 0 or -1 (logged). */
+static int api_start(void)
+{
+    char err[400], cert[512], key[512], ca[512];
+    memset(&D.api, 0, sizeof(D.api));
+    D.api.sql = D.sql;
+    D.api.route = &D.route;
+    D.api.cfg = &D.cfg;
+    D.api.core = &D.core;
+    D.api.now_us = mono_us;
+    D.api.unix_now = unix_now;
+    D.api.name = D.name;
+    D.api.version = OC_VERSION;
+    oc_api_init(&D.api);
+    for (unsigned i = 0; oc_kv_nth(&D.kv, "api_rate", i) != NULL; i++) {
+        if (oc_api_rate_set(&D.api, oc_kv_nth(&D.kv, "api_rate", i), err, sizeof(err)) != 0) {
+            oc_log(OC_LOG_ERR, "config: %s", err);
+            return -1;
+        }
+    }
+    if (D.api_listen == NULL) return 0;
+    D.tls_cfg.cert = cred_path(oc_kv_get(&D.kv, "api_cert"), cert, sizeof(cert));
+    D.tls_cfg.key = cred_path(oc_kv_get(&D.kv, "api_key"), key, sizeof(key));
+    D.tls_cfg.ca = cred_path(oc_kv_get(&D.kv, "api_ca"), ca, sizeof(ca));
+    D.tls_cfg.alpn = "oc-admin/1";
+    D.tls_cfg.role = OC_TLS_ROLE_PORTAL;
+    D.tls = oc_tls_new(&D.tls_cfg, err, sizeof(err));
+    if (D.tls == NULL) {
+        oc_log(OC_LOG_ERR, "admin API: %s", err);
+        return -1;
+    }
+    if (oc_apisrv_open(&D.apisrv, D.api_listen, D.tls, &D.api, mono_us, err, sizeof(err)) != 0) {
+        oc_log(OC_LOG_ERR, "config: %s", err);
+        return -1;
     }
     return 0;
 }
@@ -533,10 +636,12 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     if (D.cell_l < 0) goto out;
     D.admin_l = listen_on(D.admin_sock, oc_kv_get(&D.kv, "admin_group"));
     if (D.admin_l < 0) goto out;
-    oc_log(OC_LOG_NOTICE, "oc-core %s: core %u, key %u, %u blocks, db %s (v%d), cells on %s, admin on %s", OC_VERSION,
-           D.cfg.core_id, D.cfg.key_id, D.route.n, D.db, oc_sql_version(D.sql), D.cell_sock, D.admin_sock);
+    if (api_start() != 0) goto out;
+    oc_log(OC_LOG_NOTICE, "oc-core %s: core %u (%s), key %u, %u blocks, db %s (v%d), cells on %s, admin on %s, API %s",
+           OC_VERSION, D.cfg.core_id, D.name, D.cfg.key_id, D.route.n, D.db, oc_sql_version(D.sql), D.cell_sock,
+           D.admin_sock, D.api_listen != NULL ? D.api_listen : "off");
     while (!g_stop) {
-        struct pollfd p[2 + OC_CORE_LINKS];
+        struct pollfd p[2 + OC_CORE_LINKS + 1 + OC_APISRV_CONNS];
         dlink_t *who[2 + OC_CORE_LINKS];
         nfds_t np = 0;
         p[np] = (struct pollfd){ D.cell_l, POLLIN, 0 };
@@ -549,7 +654,11 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
             p[np] = (struct pollfd){ l->c.fd, (short)(POLLIN | (l->c.tn > 0 ? POLLOUT : 0)), 0 };
             who[np++] = l;
         }
-        int r = poll(p, np, 100); /* oc_core_tick at least every 100 ms (CELL_CFG retries, PING, timers) */
+        int timeout = 100; /* oc_core_tick at least every 100 ms (CELL_CFG retries, PING, timers) */
+        nfds_t api_at = np;
+        unsigned api_n = oc_apisrv_fds(&D.apisrv, p + np, &timeout);
+        np += api_n;
+        int r = poll(p, np, timeout);
         if (r < 0 && errno != EINTR) {
             oc_log(OC_LOG_ERR, "poll: %s", strerror(errno));
             break;
@@ -557,7 +666,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
         if (r > 0) {
             if (p[0].revents & POLLIN) accept_cell();
             if (p[1].revents & POLLIN) serve_admin();
-            for (nfds_t i = 2; i < np; i++) {
+            for (nfds_t i = 2; i < api_at; i++) {
                 dlink_t *l = who[i];
                 if (!l->used || l->dead) continue; /* oc_core dropped it, or a send failed, meanwhile */
                 if ((p[i].revents & POLLOUT) && oc_conn_flush(&l->c) != 0) {
@@ -572,12 +681,18 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
                 }
             }
         }
+        if (r < 0) {
+            for (nfds_t i = api_at; i < np; i++) p[i].revents = 0;
+        }
+        oc_apisrv_serve(&D.apisrv, p + api_at, api_n); /* deadlines too, so every turn */
         oc_core_tick(&D.core, mono_us());
+        oc_api_tick(&D.api);
         for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
             if (D.link[i].used && D.link[i].dead) link_lost(&D.link[i]);
         }
     }
     oc_log(OC_LOG_NOTICE, "oc-core: stopping");
+    oc_apisrv_close(&D.apisrv);
     links_down();
     rc = 0;
 out:
@@ -592,6 +707,8 @@ out:
         close(D.admin_l);
         unlink(D.admin_sock);
     }
+    oc_apisrv_close(&D.apisrv);
+    oc_tls_free(D.tls);
     if (D.sql != NULL) oc_sql_close(D.sql);
     oc_sig_wipe(D.key, sizeof(D.key));
     return rc;

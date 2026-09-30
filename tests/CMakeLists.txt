@@ -51,3 +51,12 @@ add_executable(test_oc_tls test_oc_tls.c)
 target_link_libraries(test_oc_tls PRIVATE oc_net unity)
 add_test(NAME test_oc_tls COMMAND test_oc_tls ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_tls PROPERTIES FIXTURES_REQUIRED pki)
+
+# oc-core's admin API as a process, with a TLS client (tool_oc_api) and a
+# bare cell beside it.
+add_executable(tool_oc_api tool_oc_api.c)
+target_link_libraries(tool_oc_api PRIVATE oc_net)
+add_test(NAME test_oc_api_proc
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_api_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_api>
+                 $<TARGET_FILE:tool_oc_hello> ${CMAKE_BINARY_DIR}/pki)
+set_tests_properties(test_oc_api_proc PROPERTIES FIXTURES_REQUIRED pki)

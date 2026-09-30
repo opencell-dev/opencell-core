@@ -10,3 +10,16 @@ cell_socket = /run/opencell/core.sock
 cell_group = oc-cell
 admin_socket = /run/opencell/admin.sock
 admin_group = oc-admin
+# The core's name in core.status (default oc-core-<core_id>)
+#name = oc-core-1
+# The admin API (portal spec §7): TLS 1.3 on a private address only. The
+# portal's client certificate must chain to api_ca, carry the portal role
+# and be pinned here (oc-ca fpr portal.crt; up to 4 lines, for a rotation).
+# A value with no '/' is a systemd credential (LoadCredential=NAME:PATH).
+#api_listen = 10.0.0.60:7444
+#api_cert = /etc/opencell/tls/core.crt
+#api_key = api.key
+#api_ca = /etc/opencell/tls/ca.crt
+#api_portal_fpr = <64 hex digits>
+# Per-operation rate limits (OP PER_HOUR BURST); the defaults are in oc_api.c
+#api_rate = sub.disable 30 10

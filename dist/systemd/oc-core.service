@@ -14,6 +14,12 @@
 # record; a daemon older than that (v0.1.0) answers it with usage, and the
 # client asks again without it, so a client ahead of the running daemon
 # (installed, not yet restarted) still works, audited as plain u0.
+# The admin API's key (api_key = api.key in oc-core.conf) comes the same way
+# as the master key, by a drop-in on the hosts that listen, sorting after any
+# drop-in that resets LoadCredential= (oc-core-1: tls-key.conf, its key on
+# the key disk):
+#   [Service]
+#   LoadCredential=api.key:/srv/oc-core-key/api.key
 [Unit]
 Description=OpenCell network core (oc-core)
 After=network.target
@@ -37,9 +43,9 @@ UMask=0077
 LimitCORE=0
 NoNewPrivileges=yes
 CapabilityBoundingSet=
-# Unix sockets only (the cell and admin sockets, NSS): plan 9 adds AF_INET
-# and AF_INET6 for the cells' TLS links.
-RestrictAddressFamilies=AF_UNIX
+# The cell and admin sockets (Unix), and the admin API's TCP listener
+# (api_listen, portal plan P4; plan 9's cell links later).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
 ProtectSystem=strict

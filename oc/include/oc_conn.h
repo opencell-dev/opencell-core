@@ -56,8 +56,17 @@ void oc_conn_close(oc_conn_t *c);
  * given mode and, if group is not NULL, that group. Non-blocking,
  * close-on-exec. The fd, or -1 with errno set. */
 int      oc_unix_listen(const char *path, unsigned mode, const char *group);
-/* A connected, non-blocking client socket, or -1 with errno set. */
+/* A dial that never blocks (a daemon's poll loop dials with it): a
+ * non-blocking, close-on-exec client socket, or -1 with errno set - ENOENT
+ * or ECONNREFUSED (nobody listening), EAGAIN (the listener's backlog is
+ * full: alive but not accepting), or another error. A Unix socket connects
+ * at once; should connect() answer EINPROGRESS (plan 9's TCP will), the fd
+ * is returned pending: the caller waits for POLLOUT and reads SO_ERROR. */
 int      oc_unix_connect(const char *path);
+/* For a client that may wait (oc-core admin, test tools): the same, but a
+ * full backlog or a pending connect is waited out for up to timeout_ms;
+ * then -1 with ETIMEDOUT. The fd is connected (and non-blocking). */
+int      oc_unix_connect_wait(const char *path, int timeout_ms);
 /* The next reconnect delay: 1 s, then doubling up to 30 s. */
 uint32_t oc_backoff_next(uint32_t prev_ms);
 

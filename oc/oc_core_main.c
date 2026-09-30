@@ -697,7 +697,11 @@ static int admin_client(const char *sock, int argc, char **argv)
         fprintf(stderr, "a command of at most %d words and %u bytes\n", ADMIN_ARGS_MAX, ADMIN_REQ_MAX);
         return 2;
     }
-    int fd = oc_unix_connect(sock);
+    int fd = oc_unix_connect_wait(sock, CLIENT_WAIT_S * 1000); /* a busy daemon's full backlog is waited out */
+    if (fd < 0 && errno == ETIMEDOUT) {
+        fprintf(stderr, "oc-core is not accepting on %s (running but stuck?)\n", sock);
+        return 1;
+    }
     if (fd < 0) {
         fprintf(stderr, "oc-core is not running (%s: %s); for a stopped core: oc-core admin --offline ...\n", sock,
                 strerror(errno));

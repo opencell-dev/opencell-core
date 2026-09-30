@@ -4,11 +4,15 @@
 #include "unity.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "oc_conn.h"
@@ -253,6 +257,60 @@ static void test_unix_listen_and_connect(void)
     TEST_ASSERT_EQUAL_INT(ENOENT, errno);
 }
 
+static long ms_since(const struct timespec *t0)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (t.tv_sec - t0->tv_sec) * 1000L + (t.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+/* A core that is alive but not accepting (wedged, or stopped by a
+ * debugger): once its backlog is full a dial fails at once (EAGAIN) instead
+ * of blocking the cell's poll loop; oc_unix_connect_wait waits, bounded,
+ * and connects as soon as there is room. */
+static void test_a_dial_never_blocks(void)
+{
+    char path[] = "/tmp/oc_conn_test_XXXXXX";
+    int tmp = mkstemp(path);
+    TEST_ASSERT_TRUE(tmp >= 0);
+    close(tmp);
+    unlink(path);
+    int l = oc_unix_listen(path, 0600, NULL);
+    TEST_ASSERT_TRUE(l >= 0);
+    int fds[128], n = 0;
+    alarm(5); /* a blocking connect ends the test here */
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (; n < 128; n++) {
+        fds[n] = oc_unix_connect(path);
+        if (fds[n] < 0) break;
+        struct pollfd p = { fds[n], POLLOUT, 0 };
+        TEST_ASSERT_EQUAL_INT(1, poll(&p, 1, 0)); /* connected: writable */
+    }
+    TEST_ASSERT_TRUE_MESSAGE(n > 0 && n < 128, "the backlog filled");
+    TEST_ASSERT_EQUAL_INT(EAGAIN, errno);
+    TEST_ASSERT_TRUE_MESSAGE(ms_since(&t0) < 500, "prompt");
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    TEST_ASSERT_EQUAL_INT(-1, oc_unix_connect_wait(path, 200));
+    TEST_ASSERT_EQUAL_INT(ETIMEDOUT, errno);
+    long waited = ms_since(&t0);
+    TEST_ASSERT_TRUE(waited >= 190 && waited < 1000);
+    int s = accept(l, NULL, NULL); /* room for one */
+    TEST_ASSERT_TRUE(s >= 0);
+    int w = oc_unix_connect_wait(path, 1000);
+    TEST_ASSERT_TRUE(w >= 0);
+    TEST_ASSERT_TRUE(fcntl(w, F_GETFL) & O_NONBLOCK);
+    TEST_ASSERT_TRUE(fcntl(w, F_GETFD) & FD_CLOEXEC);
+    alarm(0);
+    close(w);
+    close(s);
+    for (int i = 0; i < n; i++) close(fds[i]);
+    close(l);
+    unlink(path);
+    TEST_ASSERT_EQUAL_INT(-1, oc_unix_connect_wait(path, 100)); /* nobody there: at once */
+    TEST_ASSERT_EQUAL_INT(ENOENT, errno);
+}
+
 static void test_backoff(void)
 {
     uint32_t d = oc_backoff_next(0);
@@ -304,6 +362,7 @@ int main(void)
     RUN_TEST(test_frames_are_wiped_once_done);
     RUN_TEST(test_a_log_line_cannot_be_split);
     RUN_TEST(test_unix_listen_and_connect);
+    RUN_TEST(test_a_dial_never_blocks);
     RUN_TEST(test_backoff);
     RUN_TEST(test_kv);
     return UNITY_END();

@@ -42,7 +42,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: tool_oc_hello SOCKET CELL_ID BOOT_ID HOLD_S\n");
         return 2;
     }
-    int fd = oc_unix_connect(argv[1]);
+    int fd = oc_unix_connect_wait(argv[1], 10000);
     if (fd < 0) {
         perror(argv[1]);
         return 1;

@@ -47,7 +47,7 @@ static void blocking(int fd)
 
 static int connect_blocking(const char *path)
 {
-    int fd = oc_unix_connect(path);
+    int fd = oc_unix_connect_wait(path, 10000);
     if (fd < 0) {
         perror(path);
         exit(1);
@@ -59,7 +59,7 @@ static int connect_blocking(const char *path)
 static int drip(int argc, char **argv)
 {
     if (argc != 4) return 2;
-    int fd = oc_unix_connect(argv[1]);
+    int fd = oc_unix_connect_wait(argv[1], 10000);
     if (fd < 0) {
         perror(argv[1]);
         return 1;

@@ -286,6 +286,10 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
                                     NULL);
         }
         oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, NULL);
+    } else if (res == OC_SIG_ACT_AGAIN) {
+        /* the bound terminal asking again (its ACT_ACK was lost): nothing
+         * changes, but the answer it gets is on record */
+        oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, "again");
     }
     oc_core_send(k, cell, &r);
 done:

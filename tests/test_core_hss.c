@@ -310,13 +310,23 @@ static void test_activation_binds_and_confirms(void)
     TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &tok));
     TEST_ASSERT_NOT_EQUAL(0, tok.used_at);
     TEST_ASSERT_EQUAL_HEX32(TMID, tok.used_by_tmid);
-    TEST_ASSERT_NOT_NULL(oc_core_mem_audit(&MEM, OC_CORE_AUDIT_ACTIVATE));
+    const oc_core_audit_t *a = oc_core_mem_audit(&MEM, OC_CORE_AUDIT_ACTIVATE);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_STRING("", a->detail);
+    uint32_t cell = a->cell_id;
 
-    unsigned commits = MEM.commits;
+    unsigned commits = MEM.commits, naudit = MEM.d.naudit;
     r = activate(10, &t); /* its ACT_ACK was lost: the same answer, nothing changes */
     TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, r->u.act_res.msg.type);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(conf, r->u.act_res.msg.u.act_ack.confirm, 8);
     TEST_ASSERT_EQUAL_UINT(commits, MEM.commits);
+    /* ...but the answer is audited: an ACTIVATE marked "again" */
+    TEST_ASSERT_EQUAL_UINT(naudit + 1u, MEM.d.naudit);
+    a = oc_core_mem_audit(&MEM, OC_CORE_AUDIT_ACTIVATE);
+    TEST_ASSERT_EQUAL_STRING("again", a->detail);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(qr.number, a->number, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_HEX32(TMID, a->tmid);
+    TEST_ASSERT_EQUAL_UINT32(cell, a->cell_id);
 }
 
 /* Review Focus 4: the store fails in the middle of an activation: no answer

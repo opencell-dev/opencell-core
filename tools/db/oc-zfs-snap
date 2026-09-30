@@ -1,0 +1,55 @@
+#!/bin/bash
+# oc-zfs-snap: snapshots of the pgBackRest repository's dataset (postgres-ha
+# spec §10.2), run daily by a timer on the host that owns the dataset
+# (pvelondon), outside the container: a compromised database host can ask
+# pgBackRest to expire backups, but it cannot touch these.
+#
+#   oc-zfs-snap DATASET [--daily N] [--monthly M] [--dry-run]
+#
+# Takes DATASET@oc-daily-YYYYMMDD (UTC) once a day and, on the 1st of a month,
+# DATASET@oc-monthly-YYYYMM; then destroys the oldest of each kind beyond the
+# newest N daily (default 30) and M monthly (default 6). It only ever creates or
+# destroys snapshots named oc-daily-<digits> or oc-monthly-<digits> of DATASET
+# itself (never -r, never the dataset). OC_ZFS and OC_TODAY (YYYYMMDD) are for
+# the tests.
+set -euo pipefail
+usage() { echo "usage: oc-zfs-snap DATASET [--daily N] [--monthly M] [--dry-run]" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+DS=$1
+shift
+DAILY=30 MONTHLY=6 DRY=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        --daily) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; DAILY=$2; shift 2 ;;
+        --monthly) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; MONTHLY=$2; shift 2 ;;
+        --dry-run) DRY=1; shift ;;
+        *) usage ;;
+    esac
+done
+[[ $DS =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$ ]] || { echo "oc-zfs-snap: '$DS' is not a child dataset" >&2; exit 2; }
+ZFS=${OC_ZFS:-zfs}
+TODAY=${OC_TODAY:-$(date -u +%Y%m%d)}
+run() { if [ "$DRY" = 1 ]; then echo "would run: zfs $*"; else "$ZFS" "$@"; fi; }
+
+"$ZFS" list -H -o name "$DS" >/dev/null
+snaps=$("$ZFS" list -H -t snapshot -o name -s creation -d 1 "$DS" | sed -n "s|^$DS@||p")
+has() { grep -qx "$1" <<<"$snaps"; }
+
+new=()
+has "oc-daily-$TODAY" || new+=("oc-daily-$TODAY")
+[ "${TODAY:6:2}" != 01 ] || has "oc-monthly-${TODAY:0:6}" || new+=("oc-monthly-${TODAY:0:6}")
+for s in "${new[@]}"; do
+    run snapshot "$DS@$s"
+    snaps=$(printf '%s\n%s' "$snaps" "$s")
+done
+
+prune() { # KIND KEEP: the list is oldest first
+    local kind=$1 keep=$2 list n
+    list=$(grep -E "^oc-$kind-[0-9]+$" <<<"$snaps" | sort || true)
+    n=$(grep -c . <<<"$list" || true)
+    [ "$n" -gt "$keep" ] || return 0
+    head -n $((n - keep)) <<<"$list" | while read -r s; do run destroy "$DS@$s"; done
+}
+prune daily "$DAILY"
+prune monthly "$MONTHLY"
+echo "oc-zfs-snap $DS: $(grep -cE '^oc-daily-' <<<"$snaps" || true) daily, $(grep -cE '^oc-monthly-' <<<"$snaps" || true) monthly before pruning to $DAILY and $MONTHLY${new:+; made ${new[*]}}"

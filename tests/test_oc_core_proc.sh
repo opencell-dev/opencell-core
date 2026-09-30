@@ -50,9 +50,29 @@ out=$("${ADM[@]}" sub add +883-1-606-555-01234 2>&1) || fail "sub add: $out"
 expect "$out" "+883160655501234"
 [ -e "$T/elsewhere.db" ] && fail "--db did not override the config's db"
 # First setup on a fresh machine: the database's directory is made (0700).
-out=$("$OC" admin --offline --config "$T/oc-core.conf" --key-file "$T/key" --db "$T/fresh/core/core.db" net init 2>&1) ||
-    fail "net init in a missing directory: $out"
+# Under root's umask 077 too: the parents it makes stay reachable (0755).
+out=$(umask 077; "$OC" admin --offline --config "$T/oc-core.conf" --key-file "$T/key" --db "$T/fresh/core/core.db" \
+      net init 2>&1) || fail "net init in a missing directory: $out"
 [ "$(stat -c %a "$T/fresh/core")" = 700 ] || fail "made the database directory $(stat -c %a "$T/fresh/core")"
+[ "$(stat -c %a "$T/fresh")" = 755 ] || fail "made its parent $(stat -c %a "$T/fresh") under umask 077"
+
+# The client counts the answer against its head ("RC BYTES\n"): a cut one fails.
+client_vs() {
+    "$DRIP" --serve "$T/fake.sock" "$1" &
+    local fpid=$!
+    for _ in $(seq 50); do [ -S "$T/fake.sock" ] && break; sleep 0.05; done
+    out=$("$OC" admin --socket "$T/fake.sock" status 2>&1); rc=$?
+    wait "$fpid"
+}
+client_vs $'0 100\nshort\n'
+[ "$rc" = 1 ] || fail "a cut answer exited $rc: $out"
+expect "$out" "answer cut short"
+client_vs $'0 6\nhello\n'
+[ "$rc" = 0 ] || fail "a whole answer exited $rc: $out"
+expect "$out" "^hello$"
+client_vs $'0\nhello\n'
+[ "$rc" = 1 ] || fail "an answer with no count exited $rc: $out"
+expect "$out" "no answer from oc-core"
 
 start() {
     "$OC" --config "$T/oc-core.conf" --db "$T/core.db" "$@" 2>>"$T/log" &
@@ -102,7 +122,21 @@ ms=$(ms_since "$t0")
 [ "$ms" -lt 3000 ] || fail "status waited $ms ms behind a slow admin peer"
 wait "$DPID"; DPID=
 expect "$(cat "$T/drip")" "closed after"
-grep -q 'admin (uid [0-9]*): the request took more than 2 s: dropped' "$T/log" || fail "the slow peer was not logged"
+grep -q 'admin (uid [0-9]*): the request was dropped: it took more than 2 s' "$T/log" || fail "the slow peer was not logged"
+
+# An answer bigger than the socket takes, to a peer that doesn't read it:
+# dropped when its 2 s are up, and the peer can tell it is cut. The real
+# client takes the same answer whole.
+out=$("$DRIP" --flood "$T/admin.sock" 4000 "a-command-that-is-not-one-but-is-audited-all-the-same") || fail "flood: $out"
+out=$("$OC" admin --socket "$T/admin.sock" audit 10000 2>/dev/null) || fail "audit 10000 failed"
+[ "$(wc -c <<<"$out")" -gt 300000 ] || fail "audit 10000 is only $(wc -c <<<"$out") bytes"
+out=$("$DRIP" --late-read "$T/admin.sock" 3 audit 10000) || fail "late read: $out"
+expect "$out" "^cut$"
+grep -q 'admin (uid [0-9]*): the answer was dropped: it took more than 2 s' "$T/log" || fail "the slow reader was not logged"
+"$DRIP" --hang-up "$T/admin.sock" audit 10000 || fail "hang-up"
+for _ in $(seq 30); do grep -q 'the answer was dropped: the peer closed its connection' "$T/log" && break; sleep 0.1; done
+grep -q 'admin (uid [0-9]*): the answer was dropped: the peer closed its connection' "$T/log" ||
+    fail "a peer that hung up was not logged as such"
 
 # A peer's words must not become lines of their own in the journal.
 out=$("$OC" admin --socket "$T/admin.sock" $'status\n<3>oc-core: forged' 2>&1); [ $? = 2 ] || fail "forged: $out"
@@ -124,7 +158,7 @@ else
     echo "note: no setfacl or no ACLs here: the credential is tried without its ACL"
 fi
 CREDENTIALS_DIRECTORY="$T/cred" start
-out=$("$OC" admin --socket "$T/admin.sock" audit 20 2>&1) || fail "audit: $out"
+out=$("$OC" admin --socket "$T/admin.sock" audit 10000 2>&1) || fail "audit: $out"
 expect "$out" "ADMIN .* u$ME net init"
 expect "$out" "ADMIN .* u$ME cell mode 1 part97"
 expect "$out" "CELL_REJECT"
@@ -140,6 +174,8 @@ for _ in $(seq 40); do kill -0 "$PID" 2>/dev/null || break; sleep 0.05; done
 ms=$(ms_since "$t0")
 kill -0 "$PID" 2>/dev/null && fail "SIGTERM held by a slow admin peer ($ms ms)"
 [ "$ms" -lt 1000 ] || fail "SIGTERM took $ms ms with a slow admin peer"
+grep -q 'admin (uid [0-9]*): the request was dropped: oc-core is stopping' "$T/log" ||
+    fail "the peer dropped at SIGTERM was not logged as such"
 wait "$PID"; rc=$?; PID=
 [ "$rc" = 0 ] || fail "exit status $rc after SIGTERM"
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=

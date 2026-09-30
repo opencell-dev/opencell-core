@@ -11,7 +11,8 @@
  * with SQLite on the same thread. Cells connect to cell_socket (the §6
  * Unix socket); `oc-core admin` talks to admin_socket, one command per
  * connection: the client sends its words, each ending in a NUL, and shuts
- * its side; the daemon answers "<status>\n" and the command's output. The
+ * its side; the daemon answers "<status> <bytes>\n" and the command's
+ * output, which the client counts (a cut answer is a failure). The
  * master key comes from --key-file or the systemd credential master.key
  * ($CREDENTIALS_DIRECTORY). Logs go to stderr with journald priorities.
  *
@@ -301,32 +302,57 @@ static void accept_cell(void)
 
 /* ---- the admin socket ---- */
 
-/* Waits for fd to be ready for ev: 1, or 0 at the deadline (mono_us) or
- * once SIGTERM has come (the poll is interrupted, and the stop wins). */
+/* Why an admin peer's I/O stopped. */
+enum { AIO_OK = 0, AIO_LATE, AIO_STOP, AIO_CLOSED, AIO_ERROR };
+
+static const char *aio_why(int why, int err, char *buf, size_t cap)
+{
+    switch (why) {
+    case AIO_LATE: snprintf(buf, cap, "it took more than %d s", ADMIN_IO_S); break;
+    case AIO_STOP: snprintf(buf, cap, "oc-core is stopping"); break;
+    case AIO_CLOSED: snprintf(buf, cap, "the peer closed its connection"); break;
+    default: snprintf(buf, cap, "%s", strerror(err)); break;
+    }
+    return buf;
+}
+
+/* Waits for fd to be ready for ev: AIO_OK, AIO_LATE at the deadline
+ * (mono_us), AIO_STOP once SIGTERM has come (the poll is interrupted, and
+ * the stop wins), or AIO_ERROR with errno. */
 static int admin_wait(int fd, short ev, uint64_t deadline)
 {
     for (;;) {
         uint64_t now = mono_us();
-        if (g_stop || now >= deadline) return 0;
+        if (g_stop) return AIO_STOP;
+        if (now >= deadline) return AIO_LATE;
         struct pollfd p = { fd, ev, 0 };
         int r = poll(&p, 1, (int)((deadline - now + 999u) / 1000u));
-        if (r > 0) return 1;
-        if (r < 0 && errno != EINTR) return 0;
+        if (r > 0) return AIO_OK;
+        if (r < 0 && errno != EINTR) return AIO_ERROR;
     }
 }
 
-/* All of p to the admin peer before the deadline: 0 or -1. */
-static int admin_send(int fd, const char *p, size_t n, uint64_t deadline)
+/* All of p to the admin peer before the deadline: AIO_OK, or why not
+ * (*err: the errno of AIO_ERROR). */
+static int admin_send(int fd, const char *p, size_t n, uint64_t deadline, int *err)
 {
     while (n > 0) {
-        if (!admin_wait(fd, POLLOUT, deadline)) return -1;
+        int why = admin_wait(fd, POLLOUT, deadline);
+        if (why != AIO_OK) {
+            *err = errno;
+            return why;
+        }
         ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
         if (w < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-        if (w <= 0) return -1;
+        if (w < 0 && (errno == EPIPE || errno == ECONNRESET)) return AIO_CLOSED;
+        if (w <= 0) {
+            *err = w < 0 ? errno : EIO;
+            return AIO_ERROR;
+        }
         p += w;
         n -= (size_t)w;
     }
-    return 0;
+    return AIO_OK;
 }
 
 static void serve_admin(void)
@@ -341,10 +367,12 @@ static void serve_admin(void)
     uint64_t deadline = mono_us() + ADMIN_IO_S * 1000000ull;
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) != 0) cr.uid = (uid_t)-1;
     for (;;) {
-        if (!admin_wait(fd, POLLIN, deadline)) {
-            /* Too slow, or oc-core is stopping: dropped unanswered, nothing run. */
-            if (!g_stop) oc_log(OC_LOG_WARNING, "admin (uid %u): the request took more than %d s: dropped",
-                               (unsigned)cr.uid, ADMIN_IO_S);
+        int why = admin_wait(fd, POLLIN, deadline);
+        if (why != AIO_OK) {
+            /* Too slow, oc-core is stopping, or poll failed: dropped unanswered, nothing run. */
+            char b[80];
+            oc_log(why == AIO_STOP ? OC_LOG_INFO : OC_LOG_WARNING, "admin (uid %u): the request was dropped: %s",
+                   (unsigned)cr.uid, aio_why(why, errno, b, sizeof(b)));
             oc_sig_wipe(req, sizeof(req));
             close(fd);
             return;
@@ -391,15 +419,19 @@ static void serve_admin(void)
     }
     oc_log_clean(what); /* the peer's words: no line of their own in the journal */
     oc_log(OC_LOG_INFO, "admin (uid %u): %s -> %d%s", (unsigned)cr.uid, what, rc, out.err ? " (output cut)" : "");
-    char head[8];
-    int hn = snprintf(head, sizeof(head), "%d\n", rc);
-    /* rc is 1 when the output could not be made whole (oc_admin.h): what
-     * there is goes out, marked failed. */
+    /* The head carries the answer's size, so a peer can tell a cut one (a
+     * drop at the deadline) from a whole one. rc is 1 when the output could
+     * not be made whole (oc_admin.h): what there is goes out, marked failed. */
+    size_t len = out.p != NULL ? out.n : 0;
+    char head[32];
+    int hn = snprintf(head, sizeof(head), "%d %zu\n", rc, len);
     deadline = mono_us() + ADMIN_IO_S * 1000000ull; /* the answer's own budget */
-    if (admin_send(fd, head, (size_t)hn, deadline) != 0 ||
-        (out.p != NULL && admin_send(fd, out.p, out.n, deadline) != 0)) {
-        oc_log(OC_LOG_WARNING, "admin (uid %u): the answer was not taken within %d s: dropped", (unsigned)cr.uid,
-               ADMIN_IO_S);
+    int err = 0, why = admin_send(fd, head, (size_t)hn, deadline, &err);
+    if (why == AIO_OK && len > 0) why = admin_send(fd, out.p, len, deadline, &err);
+    if (why != AIO_OK) {
+        char b[80];
+        oc_log(why == AIO_STOP ? OC_LOG_INFO : OC_LOG_WARNING, "admin (uid %u): the answer was dropped: %s",
+               (unsigned)cr.uid, aio_why(why, err, b, sizeof(b)));
     }
     oc_buf_free(&out);        /* wiped */
     oc_sig_wipe(req, sizeof(req)); /* the words (an import path, a number) */
@@ -524,11 +556,32 @@ static int drop_to_db_owner(void)
     return 0;
 }
 
+/* A directory made here, given its mode (and owner) through an fd opened
+ * without following a symlink, so a link put in its place can't redirect
+ * the chmod or chown. 0 made, 1 there already, -1 failed (logged). */
+static int make_dir(int parent, const char *path, const char *name, mode_t mode, uid_t uid, gid_t gid)
+{
+    if (mkdirat(parent, name, 0700) != 0) {
+        if (errno == EEXIST) return 1;
+        oc_log(OC_LOG_ERR, "%s: %s", path, strerror(errno));
+        return -1;
+    }
+    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || fchmod(fd, mode) != 0 || (uid != (uid_t)-1 && fchown(fd, uid, gid) != 0)) {
+        oc_log(OC_LOG_ERR, "%s: %s", path, strerror(errno));
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
 /* First setup on a fresh machine: the database's directory (the unit's
  * StateDirectory, which systemd makes only when the unit first starts) is
  * made if missing - 0700, and as root owned by DAEMON_USER, as systemd
- * would make it; missing parents 0755. An existing directory is left as it
- * is. 0 or -1. */
+ * would make it; missing parents 0755 whatever the umask (a root umask of
+ * 077 must not leave the daemon unable to reach its directory). An
+ * existing directory is left as it is. 0 or -1. */
 static int make_db_dir(void)
 {
     char buf[512];
@@ -540,31 +593,46 @@ static int make_db_dir(void)
         oc_log(OC_LOG_ERR, "%s: %s", dir, strerror(errno));
         return -1;
     }
-    for (char *p = dir + 1; *p != '\0'; p++) { /* the parents */
-        if (*p != '/') continue;
-        *p = '\0';
-        int r = mkdir(dir, 0755);
-        *p = '/';
-        if (r != 0 && errno != EEXIST) {
-            oc_log(OC_LOG_ERR, "%.*s: %s", (int)(p - dir), dir, strerror(errno));
-            return -1;
-        }
-    }
-    if (mkdir(dir, 0700) != 0 || chmod(dir, 0700) != 0) {
-        oc_log(OC_LOG_ERR, "%s: %s", dir, strerror(errno));
-        return -1;
-    }
+    uid_t uid = (uid_t)-1;
+    gid_t gid = (gid_t)-1;
     if (geteuid() == 0) {
         struct passwd *pw = getpwnam(DAEMON_USER);
         if (pw == NULL) {
-            oc_log(OC_LOG_WARNING, "%s made, root's: there is no user %s to give it to", dir, DAEMON_USER);
-        } else if (chown(dir, pw->pw_uid, pw->pw_gid) != 0) {
-            oc_log(OC_LOG_ERR, "%s: can't give it to %s: %s", dir, DAEMON_USER, strerror(errno));
-            return -1;
+            oc_log(OC_LOG_WARNING, "%s: there is no user %s: made root's", dir, DAEMON_USER);
+        } else {
+            uid = pw->pw_uid;
+            gid = pw->pw_gid;
         }
     }
-    oc_log(OC_LOG_NOTICE, "%s made (0700)", dir);
-    return 0;
+    /* Walk it from the top (or from "."), each step from its parent's fd. */
+    int at = open(dir[0] == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (at < 0) {
+        oc_log(OC_LOG_ERR, "%s: %s", dir, strerror(errno));
+        return -1;
+    }
+    int rc = -1;
+    char walk[512], *save = NULL;
+    snprintf(walk, sizeof(walk), "%s", dir);
+    for (char *name = strtok_r(walk, "/", &save); name != NULL;) {
+        char *next_name = strtok_r(NULL, "/", &save);
+        int last = next_name == NULL;
+        if (make_dir(at, dir, name, last ? 0700 : 0755, last ? uid : (uid_t)-1, last ? gid : (gid_t)-1) < 0) break;
+        if (last) { /* made, or made meanwhile by someone else: left as it is */
+            rc = 0;
+            break;
+        }
+        int next = openat(at, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC); /* an existing parent may be a link */
+        if (next < 0) {
+            oc_log(OC_LOG_ERR, "%s: %s", dir, strerror(errno));
+            break;
+        }
+        close(at);
+        at = next;
+        name = next_name;
+    }
+    close(at);
+    if (rc == 0) oc_log(OC_LOG_NOTICE, "%s made (0700)", dir);
+    return rc;
 }
 
 /* Under sudo, the operator behind uid 0 (sudo sets SUDO_UID); 0: none. */
@@ -655,15 +723,34 @@ static int admin_client(const char *sock, int argc, char **argv)
     }
     oc_sig_wipe(buf, sizeof(buf)); /* the answer may be an activation code */
     close(fd);
-    /* r < 0: timed out or failed - what came may be cut, so none of it counts */
-    int rc = r == 0 && in.n >= 2 && in.p[1] == '\n' && in.p[0] >= '0' && in.p[0] <= '2' ? in.p[0] - '0' : -1;
+    /* "RC BYTES\n" then the answer: r < 0 (timed out or failed) or fewer
+     * bytes than the head says, and none of it counts. */
+    int rc = -1;
+    size_t body = 0;
+    unsigned long long want = 0;
+    char *nl = in.p != NULL ? memchr(in.p, '\n', in.n < 32u ? in.n : 32u) : NULL;
+    if (r == 0 && nl != NULL && nl - in.p >= 3 && in.p[0] >= '0' && in.p[0] <= '2' && in.p[1] == ' ' &&
+        in.p[2] >= '0' && in.p[2] <= '9') {
+        char *end;
+        errno = 0;
+        want = strtoull(in.p + 2, &end, 10);
+        if (errno == 0 && end == nl) {
+            rc = in.p[0] - '0';
+            body = (size_t)(nl + 1 - in.p);
+        }
+    }
     if (rc < 0 || in.err) {
         fprintf(stderr, in.err ? "out of memory reading oc-core's answer\n" : "no answer from oc-core\n");
         oc_buf_free(&in);
         return 1;
     }
-    write_all(rc == 0 ? STDOUT_FILENO : STDERR_FILENO, in.p + 2, in.n - 2u);
-    if (rc == 0 && argc >= 2 && strcmp(argv[0], "sub") == 0 && strcmp(argv[1], "issue") == 0) draw_qr(in.p + 2);
+    if (in.n - body != want) {
+        fprintf(stderr, "answer cut short (%zu of %llu bytes): try again\n", in.n - body, want);
+        oc_buf_free(&in);
+        return 1;
+    }
+    write_all(rc == 0 ? STDOUT_FILENO : STDERR_FILENO, in.p + body, in.n - body);
+    if (rc == 0 && argc >= 2 && strcmp(argv[0], "sub") == 0 && strcmp(argv[1], "issue") == 0) draw_qr(in.p + body);
     oc_buf_free(&in); /* wiped */
     return rc;
 }

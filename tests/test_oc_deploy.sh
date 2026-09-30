@@ -28,6 +28,11 @@ cleanup() {
             command -p sleep 0.1
         done
     done
+    # A toy build's leftover sleeper, by its PID (only if it is still a sleep).
+    local p
+    for p in $(cat "$T/sleepers" 2>/dev/null); do
+        [ "$(cat "/proc/$p/comm" 2>/dev/null)" != sleep ] || kill "$p" 2>/dev/null
+    done
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -62,7 +67,9 @@ SH
 # systemctl for OC_DEPLOY_LOCAL=$FAKE_ROOT: a restart "starts" the build
 # current points to as a new PID, whose $FAKE_ROOT/proc/PID/exe is that
 # build's binary. restart-fail-for (a tag) makes its restart fail;
-# unhealthy-for (a tag) makes the unit inactive while that build runs.
+# unhealthy-for (a tag) makes the unit inactive while that build runs;
+# slow-restart (seconds) makes a restart take that long; kill-on-restart
+# kills the host side (its parent, by PID) as if the machine went down.
 cat >"$T/bin/systemctl" <<'SH'
 #!/bin/bash
 sd=$FAKE_SD
@@ -83,6 +90,8 @@ is-active)
 restart)
     ver=$(basename "$(readlink -f "$FAKE_ROOT/lib/opencell/$2/current")")
     echo "restart $2 $ver" >>"$sd/calls"
+    [ ! -f "$sd/kill-on-restart" ] || kill -KILL "$PPID"
+    [ ! -f "$sd/slow-restart" ] || command -p sleep "$(cat "$sd/slow-restart")"
     [ "$ver" != "$(cat "$sd/restart-fail-for" 2>/dev/null)" ] || { echo "fake: $2 failed to start" >&2; exit 1; }
     n=$(($(cat "$sd/lastpid" 2>/dev/null || echo 100) + 1))
     echo "$n" >"$sd/lastpid"
@@ -101,7 +110,8 @@ SH
 #                  DROP_DELAY s) and the shim returns 255 at once, as ssh does
 #                  when the connection dies while the remote side goes on;
 #                  the run's stdout and stderr are a pipe nobody reads, and
-#                  0.3 s in, its process group gets SIGHUP.
+#                  0.3 s in, its process group gets SIGHUP. DROP_NORUN=1:
+#                  the script never arrives (nothing runs).
 #  ssh-shim-cut    a deploy or rollback script arrives without its last line.
 cat >"$T/bin/ssh-shim" <<'SH'
 #!/bin/bash
@@ -123,6 +133,7 @@ if [ "$2" = "bash -s" ]; then
     s=$(mktemp "$TMPDIR/shim.XXXXXX") || exit 1
     cat >"$s"
     if grep -qE '^OC_ARGS=\(.* (deploy|rollback) ' "$s"; then
+        [ -z "${DROP_NORUN:-}" ] || { rm -f "$s"; exit 255; }
         (
             command -p sleep "${DROP_DELAY:-0}"
             { setsid bash -s <"$s" 2>&1 & echo $! >"$s.pid"; } | true
@@ -181,6 +192,11 @@ cp "$T/main.good" oc/oc_core_main.c && g commit -qam "good again"
 for t in v0.0.5 v0.0.6 v0.0.7 v0.0.8 v0.0.9; do g tag "$t"; done
 echo "this is not C" >>oc/oc_core_main.c && g commit -qam broken && g tag v0.1.0
 cp "$T/main.good" oc/oc_core_main.c && echo "/* not tagged */" >>oc/oc_core_main.c && g commit -qam untagged
+# v0.2.0: its configure step leaves a process running (a real sleep, its PID
+# kept for the cleanup)
+printf 'setsid %s 15 >/dev/null 2>&1 </dev/null &\necho $! >>%q\n' "$(command -p -v sleep)" "$T/sleepers" >sleeper.sh
+echo 'execute_process(COMMAND sh ${CMAKE_SOURCE_DIR}/sleeper.sh)' >>CMakeLists.txt
+g add . && g commit -qm sleeper && g tag v0.2.0
 cd / || fail "cd /"
 
 # ---- the host side here, no systemd ----
@@ -347,8 +363,10 @@ expect "$out" "host recorded exit 1"
 refute "$out" "re-run"
 [ "$(cur)" = v0.0.7 ] && [ "$(prev)" = v0.0.6 ] || fail "after a dropped unhealthy deploy: $(ls -l "$D")"
 rm "$FAKE_SD/unhealthy-for"
-# the host outlasts the laptop's wait: it says so, and not to run it again
-out=$(DROP_DELAY=2 OC_DEPLOY_POLL_BUDGET=1 "$DEPLOY" rollback somehost oc-core 2>&1) && fail "an unknown outcome was a success"
+# the host outlasts the laptop's wait (a restart taking 3 s): it says so,
+# and not to run it again
+echo 3 >"$FAKE_SD/slow-restart"
+out=$(OC_DEPLOY_POLL_BUDGET=1 "$DEPLOY" rollback somehost oc-core 2>&1) && fail "an unknown outcome was a success"
 expect "$out" "no status recorded yet"
 expect "$out" "oc-deploy status somehost"
 expect "$out" "do not just run deploy or rollback again"
@@ -358,14 +376,54 @@ WAIT_RUNS=$id
 for ((i = 0; i < 100; i++)); do [ -f "$R2/var/lib/oc-deploy/status/$id" ] && break; command -p sleep 0.1; done
 [ "$(cat "$R2/var/lib/oc-deploy/status/$id" 2>/dev/null)" = 0 ] || fail "the detached rollback did not finish"
 [ "$(cur)" = v0.0.6 ] && [ "$(prev)" = v0.0.7 ] || fail "after the detached rollback: $(ls -l "$D")"
+rm "$FAKE_SD/slow-restart"
+# a run that never began: the wait ends at the first look 5 s on, not after
+# the whole budget, without claiming anything changed or not
+t0=$(date +%s)
+out=$(DROP_NORUN=1 "$DEPLOY" deploy "$T/top" v0.0.9 somehost 2>&1) && fail "a run that never began was a success: $out"
+expect "$out" "no sign of run"
+expect "$out" "oc-deploy status somehost"
+refute "$out" "changed nothing"
+[ $(($(date +%s) - t0)) -lt 12 ] || fail "waited $(($(date +%s) - t0)) s for a run that never began"
+[ "$(cur)" = v0.0.6 ] || fail "a run that never began changed current"
 unset OC_DEPLOY_POLL_INTERVAL OC_DEPLOY_POLL_BUDGET
 # ssh exiting 0 is no proof: a script cut before its last line does nothing
 export OC_DEPLOY_SSH="$T/bin/ssh-shim-cut"
 out=$("$DEPLOY" deploy "$T/top" v0.0.9 somehost 2>&1) && fail "a cut script was a success: $out"
 expect "$out" "recorded no status"
 [ "$(cur)" = v0.0.6 ] || fail "a cut script changed current"
-echo "ok   dropped connection, unknown outcome, cut script"
-unset OC_DEPLOY_SSH OC_DEPLOY_SYSTEMD
+unset OC_DEPLOY_SSH
+# The upload the never-begun run left is swept by the next deploy once an
+# hour old (a younger one is not); a run killed after it began says so
+# ("recorded no status" would claim it changed nothing).
+left=$(find "$T/tmp" -maxdepth 1 -name 'oc-deploy.*')
+[ "$(wc -w <<<"$left")" = 1 ] || fail "the never-begun run left: $(ls -A "$T/tmp")"
+touch -d '2 hours ago' "$left"
+mkdir "$T/tmp/oc-deploy.Young123"
+touch "$FAKE_SD/kill-on-restart"
+out=$("$DEPLOY" deploy "$T/top" v0.0.9 somehost 2>&1) && fail "a killed run was a success: $out"
+expect "$out" "began but recorded no status"
+expect "$out" "oc-deploy status somehost"
+refute "$out" "changed nothing"
+rm "$FAKE_SD/kill-on-restart"
+[ ! -e "$left" ] || fail "the hour-old upload was not swept"
+[ -d "$T/tmp/oc-deploy.Young123" ] || fail "a young upload was swept"
+rm -rf "$T"/tmp/oc-deploy.*
+echo "ok   dropped connection, unknown outcome, never begun, cut script, killed run, sweep"
+unset OC_DEPLOY_SYSTEMD
+
+# ---- a build that leaves a process behind does not keep the host's lock ----
+export OC_DEPLOY_LOCAL=$T/root3
+out=$("$DEPLOY" deploy "$T/top" v0.2.0 somehost 2>&1) || fail "deploy v0.2.0: $out"
+[ -s "$T/sleepers" ] && kill -0 "$(tail -1 "$T/sleepers")" || fail "the toy build left no sleeper"
+out=$("$DEPLOY" deploy "$T/top" v0.0.5 somehost 2>&1) || fail "the lock outlived a run: $out"
+expect "$out" "installed (previous: v0.2.0)"
+# rollback without a current build is refused, not "back to X (previous: )"
+rm "$T/root3/lib/opencell/oc-core/current"
+out=$("$DEPLOY" rollback somehost oc-core 2>&1) && fail "rolled back from no current build: $out"
+expect "$out" "no current build of oc-core"
+[ ! -e "$T/root3/lib/opencell/oc-core/current" ] || fail "a refused rollback made a current"
+echo "ok   leftover processes, rollback without current"
 
 # ---- the real transport's command line (a fake ssh records it) ----
 unset OC_DEPLOY_LOCAL

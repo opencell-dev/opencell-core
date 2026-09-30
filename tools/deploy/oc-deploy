@@ -122,10 +122,10 @@ host_state() {
 
 # The upload directory: the SSH user's (the builder's), made by mktemp.
 host_upload() { # DIR
-    local up=$1 uid
+    local up=$1
     if ! [[ $up =~ ^/[A-Za-z0-9._/-]*/oc-deploy\.[A-Za-z0-9]{8}$ ]] || [[ $up == *..* ]]; then host_bad; fi
-    if [ -n "$BUILDER" ]; then uid=$(id -u -- "$BUILDER"); else uid=$(id -u); fi
-    if [ -L "$up" ] || [ ! -d "$up" ] || [ "$(stat -c %u -- "$up")" != "$uid" ]; then
+    if [ -n "$BUILDER" ]; then OC_UID=$(id -u -- "$BUILDER"); else OC_UID=$(id -u); fi
+    if [ -L "$up" ] || [ ! -d "$up" ] || [ "$(stat -c %u -- "$up")" != "$OC_UID" ]; then
         echo "oc-deploy on the host: $up is not the upload" >&2
         exit 1
     fi
@@ -138,12 +138,18 @@ host_link() { # TARGET LINK
     ln -sfn -- "$1" "$2.new" && mv -Tf -- "$2.new" "$2"
 }
 
-# The build runs as the SSH user, not root.
+# The build, and every read of what the builder unpacked, runs as the SSH
+# user, not root. Hygiene, not a security boundary: that user has
+# passwordless sudo. Without fd 9: a process a build leaves behind must not
+# hold the host's deploy lock. Builds inherit HUP and PIPE ignored (SIG_IGN
+# survives exec): a write to a closed pipe in a build step fails with EPIPE,
+# which make and the compilers report as an error, instead of killing the
+# writer.
 as_builder() {
     if [ -n "$BUILDER" ]; then
-        runuser -u "$BUILDER" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$OC_UP" LC_ALL=C.UTF-8 "$@"
+        runuser -u "$BUILDER" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$OC_UP" LC_ALL=C.UTF-8 "$@" 9>&-
     else
-        "$@"
+        "$@" 9>&-
     fi
 }
 
@@ -159,11 +165,12 @@ host_exit() {
 
 # Healthy: the unit active with the build's binary as its main process, the
 # same process through 5 checks in a row, and for oc-core its admin socket
-# answering (`oc-core admin status`). One check a second, at most 30.
+# answering (`oc-core admin status`, at most 5 s a try). One check a second,
+# at most 30 checks, all within 30 s.
 host_healthy() { # NAME TAG
-    local name=$1 tag=$2 want pid exe out last="" stable=0 i
+    local name=$1 tag=$2 want pid exe out last="" stable=0 i left end=$((SECONDS + 30))
     want=$(readlink -f -- "$PREFIX/lib/opencell/$name/$tag/bin/$name")
-    for ((i = 0; i < 30; i++)); do
+    for ((i = 0; i < 30 && SECONDS < end; i++)); do
         sleep 1
         if systemctl is-active -q "$name"; then
             pid=$(systemctl show -p MainPID --value "$name" 2>/dev/null || true)
@@ -179,7 +186,10 @@ host_healthy() { # NAME TAG
             echo "$name $tag is healthy: active, pid $pid"
             return 0
         fi
-        if out=$(timeout 10 "$PREFIX/bin/oc-core" admin status 2>&1); then
+        left=$((end - SECONDS))
+        [ "$left" -le 5 ] || left=5
+        [ "$left" -ge 1 ] || break
+        if out=$(timeout "$left" "$PREFIX/bin/oc-core" admin status 2>&1 9>&-); then
             echo "$name $tag is healthy: active, pid $pid, admin status:"
             printf '%s\n' "$out"
             return 0
@@ -279,10 +289,14 @@ host_deploy() { # NAME TAG UPLOAD HOSTNAME
             exit 1
         }
     done
+    # Uploads of runs that never began (a dropped connection, a script cut
+    # short) are left behind: the builder's own, swept once an hour old.
+    as_builder find "${up%/*}" -mindepth 1 -maxdepth 1 -type d -name 'oc-deploy.????????' -uid "$OC_UID" \
+        -mmin +60 -exec rm -rf -- {} + 2>/dev/null || true
     echo "building $name $tag as ${BUILDER:-$(id -un)}"
     as_builder mkdir -- "$up/src"
     as_builder tar -xzf "$up/src.tgz" -C "$up/src"
-    if [ ! -f "$up/src/dist/systemd/$name.service" ]; then
+    if ! as_builder test -f "$up/src/dist/systemd/$name.service"; then
         echo "$tag has no dist/systemd/$name.service"
         exit 1
     fi
@@ -294,7 +308,7 @@ host_deploy() { # NAME TAG UPLOAD HOSTNAME
     # Installed into a fresh directory, renamed into place only when whole.
     OC_NEW=$d/.new-$tag-$RUNID
     rm -rf -- "$OC_NEW"
-    cmake --install "$up/build" --prefix "$OC_NEW" >/dev/null
+    cmake --install "$up/build" --prefix "$OC_NEW" >/dev/null 9>&-
     if [ ! -x "$OC_NEW/bin/$name" ]; then
         echo "the build installed no bin/$name"
         exit 1
@@ -307,7 +321,8 @@ host_deploy() { # NAME TAG UPLOAD HOSTNAME
         exit 1
         ;;
     esac
-    install -m 0644 -- "$up/src/dist/systemd/$name.service" "$OC_NEW/$name.service"
+    as_builder cat -- "$up/src/dist/systemd/$name.service" >"$OC_NEW/$name.service"
+    chmod 0644 -- "$OC_NEW/$name.service"
     rm -rf -- "${d:?}/$tag"
     mv -T -- "$OC_NEW" "$d/$tag"
     OC_NEW=""
@@ -324,6 +339,10 @@ host_rollback() { # NAME
     prev=$(host_link_of "$d/previous")
     if [ -z "$prev" ] || [ ! -d "$d/$prev" ]; then
         echo "no previous build of $name to go back to"
+        exit 1
+    fi
+    if [ -z "$cur" ]; then
+        echo "no current build of $name: nothing to roll back from (current is missing; ls -l $d)"
         exit 1
     fi
     host_trust "$PREFIX/lib/opencell"
@@ -401,7 +420,7 @@ host_main() { # MODE ROOT PREFIX SYSTEMD RUN_ID ACTION ARGS...
     ROOT=$2 PREFIX=$3 SYSTEMD=$4 RUNID=$5 ACTION=$6
     shift 6
     STATE=$ROOT/var/lib/oc-deploy LOG=$ROOT/var/lib/oc-deploy/deploy.log
-    BUILDER="" OC_UP="" OC_NEW="" STARTED=0
+    BUILDER="" OC_UP="" OC_NEW="" OC_UID="" STARTED=0
     [[ $RUNID =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || host_bad
     [[ $SYSTEMD =~ ^[01]$ ]] || host_bad
     case "$mode" in
@@ -606,6 +625,7 @@ fetch_once() {
     body=${body%$'\n'}
     shown=$(cat "$TMP/shown")
     if [ -n "$body" ]; then
+        touch "$TMP/began" # the slice starts at the run's start marker
         total=$(printf '%s\n' "$body" | wc -l)
         if [ "$total" -gt "$shown" ]; then
             printf '%s\n' "$body" | tail -n "+$((shown + 1))"
@@ -617,14 +637,20 @@ fetch_once() {
 }
 
 # Fetches every INTERVAL s until the run has a status (0), or STOP_FLAG
-# appears (one last fetch first) or DEADLINE (epoch s, 0 = none) passes (1).
-follow_log() { # INTERVAL STOP_FLAG DEADLINE
-    local interval=$1 stop=$2 deadline=$3 last=0
+# appears (one last fetch first) or DEADLINE (epoch s, 0 = none) passes (1),
+# or - with NO_SIGN_AFTER (s, 0 = never) - a fetch that long after the start
+# shows neither the run's log nor its status (2).
+follow_log() { # INTERVAL STOP_FLAG DEADLINE [NO_SIGN_AFTER]
+    local interval=$1 stop=$2 deadline=$3 nosign=${4:-0} last=0 asked t0
+    t0=$(date +%s)
     while :; do
         pause "$interval" "$stop"
         if [ -n "$stop" ] && [ -f "$stop" ]; then last=1; fi
-        fetch_once || true
+        asked=0
+        if fetch_once; then asked=1; fi
         [ ! -s "$TMP/status" ] || return 0
+        if [ "$nosign" -gt 0 ] && [ "$asked" = 1 ] && [ ! -e "$TMP/began" ] &&
+            [ $(($(date +%s) - t0)) -ge "$nosign" ]; then return 2; fi
         [ "$last" = 0 ] || return 1
         if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then return 1; fi
     done
@@ -651,7 +677,15 @@ run_tracked() { # ACTION ARGS...
     set -e
     if [ ! -s "$TMP/status" ] && [ "$rc" = 255 ]; then
         echo "ssh exited 255 (the connection may have dropped); run $RUN_ID goes on on $HOST by itself - following it every ${interval}s for up to ${budget}s" >&2
-        follow_log "$interval" "" $(($(date +%s) + budget)) || true
+        # A run that began has written its start marker within moments: no
+        # sign of it 5 s on (at the first fetch, at the default interval)
+        # means it most likely never began.
+        st=0
+        follow_log "$interval" "" $(($(date +%s) + budget)) "$STREAM_INTERVAL" || st=$?
+        if [ "$st" = 2 ]; then
+            echo "no sign of run $RUN_ID on $HOST since the connection dropped (no log, no status): it most likely never began. Check with 'oc-deploy status $HOST' before running deploy or rollback again" >&2
+            return 1
+        fi
         if [ ! -s "$TMP/status" ]; then
             echo "no status recorded yet for run $RUN_ID: it may still be running. Check with 'oc-deploy status $HOST' (do not just run deploy or rollback again)" >&2
             return 1
@@ -669,7 +703,9 @@ run_tracked() { # ACTION ARGS...
         done
     fi
     if [ ! -s "$TMP/status" ]; then
-        if [ "$asked" = 1 ]; then
+        if [ "$asked" = 1 ] && [ -e "$TMP/began" ]; then
+            echo "run $RUN_ID began but recorded no status (ssh exited $rc): it was cut off before it finished. Check with 'oc-deploy status $HOST' (do not just run deploy or rollback again)" >&2
+        elif [ "$asked" = 1 ]; then
             echo "the host recorded no status for run $RUN_ID (ssh exited $rc): it was refused before it began (see above) or the script never arrived whole; this run changed nothing" >&2
             if [ -n "$UP" ]; then on_host 0 discard "$UP" >/dev/null 2>&1 || true; fi
         else

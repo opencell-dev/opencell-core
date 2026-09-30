@@ -136,6 +136,12 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         }
     }
     int moved = had && (old.cell_id != cell || old.tmid != tmid);
+    /* REGISTER is audited when the location changes: the first one, a move
+     * or a new binding, or one that had lapsed (a new boot purged it, or it
+     * expired). A refresh from the same cell with the same binding - the
+     * replay a cell sends after every HELLO_ACK (§7.10), a re-registration
+     * there - changes nothing worth a record. */
+    int changed = !had || moved || old.expires <= oc_core_unix(k);
     memset(&l, 0, sizeof(l));
     memcpy(l.number, num, OC_SIG_NUMBER_LEN);
     l.cell_id = cell;
@@ -162,7 +168,7 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     /* §7.8, naming the registration it cancels: if the terminal has since
      * registered there again (a LOC_UPDATE still on its way), that one stays */
     if (moved) oc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, OC_CORE_CANCEL_MOVED, old.rand, NULL);
-    oc_core_audit(k, OC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
+    if (changed) oc_core_audit(k, OC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
 done:
     oc_sig_wipe(a.xres, sizeof(a.xres));
     oc_sig_wipe(s.k, sizeof(s.k));

@@ -1,0 +1,117 @@
+#!/bin/bash
+# oc-ca: the OpenCell CA (network-core spec §17 decision 6, §18.4; portal
+# spec §7, §8.1). Run on the laptop, where the root key lives (and its
+# copy on the Proxmox host, root only); never on a core or the portal.
+#
+#   oc-ca init DIR                          the root CA: DIR/ca.key (0600), DIR/ca.crt (10 years)
+#   oc-ca sign DIR ROLE CSR OUT NAME [--dns NAME]... [--ip ADDR]...
+#                                           a certificate for a key made elsewhere (its CSR):
+#                                           written to OUT, a copy kept in DIR/issued/; prints
+#                                           "fingerprint <sha256>" for the pin
+#   oc-ca fpr CERT                          a certificate's SHA-256 (64 lowercase hex digits):
+#                                           what a core pins (api_portal_fpr, cell cert_fpr)
+#
+# Roles (a policy OID under OpenCell's arc, 2.25.<UUID>, plus an extended
+# key usage), subject CN=NAME, ECDSA P-256 keys only, SHA-256:
+#   core    ARC.1.1  serverAuth  730 days (§17.6)  --dns/--ip: at least one (the names clients dial)
+#   portal  ARC.1.2  clientAuth  365 days (§7)     the portal's admin-API client certificate
+#   cell    ARC.1.3  clientAuth  730 days (§17.6)  a cell's (plan 9 checks it; P3's intermediate
+#                                                  CA issues them online later)
+# The root is CA:TRUE with pathlen 1 (room for P3's intermediate, §18.4).
+# The CSR's own subject and extensions are ignored: the role decides.
+set -euo pipefail
+umask 077
+
+ARC=2.25.39025894690731581968303886031091540846
+TMP=""
+trap '[ -z "$TMP" ] || rm -rf "$TMP"' EXIT
+die() { echo "oc-ca: $*" >&2; exit 1; }
+usage() {
+    echo "usage: oc-ca init DIR | sign DIR ROLE CSR OUT NAME [--dns NAME]... [--ip ADDR]... | fpr CERT" >&2
+    exit 2
+}
+
+fpr() {
+    openssl x509 -in "$1" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f'
+}
+
+cmd_init() {
+    [ $# -eq 1 ] || usage
+    local dir=$1
+    [ ! -e "$dir/ca.key" ] || die "$dir/ca.key exists: one root per directory"
+    mkdir -p "$dir/issued"
+    chmod 700 "$dir"
+    openssl ecparam -name prime256v1 -genkey -noout -out "$dir/ca.key"
+    chmod 600 "$dir/ca.key"
+    cat > "$dir/ca.cnf" <<EOF
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+O = OpenCell
+CN = OpenCell Root CA
+[root]
+basicConstraints = critical, CA:TRUE, pathlen:1
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+    openssl req -x509 -new -key "$dir/ca.key" -sha256 -days 3650 -config "$dir/ca.cnf" -extensions root \
+        -set_serial "0x$(openssl rand -hex 15)" -out "$dir/ca.crt"
+    chmod 644 "$dir/ca.crt"
+    echo "root CA made: $dir/ca.crt (fingerprint $(fpr "$dir/ca.crt")); keep $dir/ca.key offline"
+}
+
+cmd_sign() {
+    [ $# -ge 5 ] || usage
+    local dir=$1 role=$2 csr=$3 out=$4 name=$5
+    shift 5
+    local san=() policy eku days
+    case $role in
+        core) policy=$ARC.1.1; eku=serverAuth; days=730 ;;
+        portal) policy=$ARC.1.2; eku=clientAuth; days=365 ;;
+        cell) policy=$ARC.1.3; eku=clientAuth; days=730 ;;
+        *) die "role '$role': core, portal or cell" ;;
+    esac
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --dns) [ $# -ge 2 ] && [[ $2 =~ ^[A-Za-z0-9.-]+$ ]] || die "--dns needs a host name"; san+=("DNS:$2"); shift 2 ;;
+            --ip) [ $# -ge 2 ] && [[ $2 =~ ^[0-9A-Fa-f.:]+$ ]] || die "--ip needs an address"; san+=("IP:$2"); shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    [[ $name =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "name '$name': 1-64 of [A-Za-z0-9._-]"
+    [ -r "$dir/ca.key" ] && [ -r "$dir/ca.crt" ] || die "$dir: no root CA here (oc-ca init)"
+    [ "$role" != core ] || [ ${#san[@]} -gt 0 ] || die "a core certificate needs --dns or --ip (the names clients dial)"
+    [ "$role" = core ] || [ ${#san[@]} -eq 0 ] || die "only a core certificate carries names"
+    openssl req -in "$csr" -noout -verify >/dev/null 2>&1 || die "$csr: not a CSR, or its signature does not verify"
+    openssl req -in "$csr" -noout -text | grep -q 'ASN1 OID: prime256v1' || die "$csr: the key must be ECDSA P-256"
+    TMP=$(mktemp -d)
+    local ext=$TMP/ext.cnf
+    {
+        echo "[role]"
+        echo "basicConstraints = critical, CA:FALSE"
+        echo "keyUsage = critical, digitalSignature"
+        echo "extendedKeyUsage = $eku"
+        echo "certificatePolicies = $policy"
+        echo "subjectKeyIdentifier = hash"
+        echo "authorityKeyIdentifier = keyid"
+        if [ ${#san[@]} -gt 0 ]; then (IFS=,; echo "subjectAltName = ${san[*]}"); fi
+    } > "$ext"
+    openssl x509 -req -in "$csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" -sha256 -days "$days" \
+        -set_serial "0x$(openssl rand -hex 15)" -subj "/O=OpenCell/CN=$name" -extfile "$ext" -extensions role \
+        -out "$out" 2>/dev/null || die "signing failed"
+    chmod 644 "$out"
+    mkdir -p "$dir/issued"
+    cp "$out" "$dir/issued/$role-$name-$(date -u +%Y%m%dT%H%M%SZ).crt"
+    echo "fingerprint $(fpr "$out")"
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case $cmd in
+    init) cmd_init "$@" ;;
+    sign) cmd_sign "$@" ;;
+    fpr) [ $# -eq 1 ] || usage; fpr "$1" ;;
+    *) usage ;;
+esac

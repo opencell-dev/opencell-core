@@ -42,3 +42,8 @@ add_test(NAME test_oc_core_proc
 # tools/deploy/oc-deploy with its host side run here (OC_DEPLOY_LOCAL) on a
 # toy repository; fake ssh, sudo and systemctl.
 add_test(NAME test_oc_deploy COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_deploy.sh ${PROJECT_SOURCE_DIR}/tools/deploy/oc-deploy)
+
+# tools/ca/oc-ca, and the test PKI (build/pki) the TLS tests use.
+add_test(NAME test_oc_ca COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_ca.sh ${PROJECT_SOURCE_DIR}/tools/ca/oc-ca
+                                 ${CMAKE_BINARY_DIR}/pki)
+set_tests_properties(test_oc_ca PROPERTIES FIXTURES_SETUP pki)

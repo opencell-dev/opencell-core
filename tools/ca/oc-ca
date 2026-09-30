@@ -17,6 +17,9 @@
 #   portal  ARC.1.2  clientAuth  365 days (§7)     the portal's admin-API client certificate
 #   cell    ARC.1.3  clientAuth  730 days (§17.6)  a cell's (plan 9 checks it; P3's intermediate
 #                                                  CA issues them online later)
+#   db      ARC.1.4  serverAuth, 730 days          a database or witness host (postgres-ha spec
+#                    clientAuth                    §9.2): Postgres, Patroni, etcd, pgBackRest, one
+#                                                  per host; --dns/--ip: at least one
 # The root is CA:TRUE with pathlen 1 (room for P3's intermediate, §18.4).
 # The CSR's own subject and extensions are ignored: the role decides.
 set -euo pipefail
@@ -70,7 +73,8 @@ cmd_sign() {
         core) policy=$ARC.1.1; eku=serverAuth; days=730 ;;
         portal) policy=$ARC.1.2; eku=clientAuth; days=365 ;;
         cell) policy=$ARC.1.3; eku=clientAuth; days=730 ;;
-        *) die "role '$role': core, portal or cell" ;;
+        db) policy=$ARC.1.4; eku=serverAuth,clientAuth; days=730 ;;
+        *) die "role '$role': core, portal, cell or db" ;;
     esac
     while [ $# -gt 0 ]; do
         case $1 in
@@ -81,8 +85,10 @@ cmd_sign() {
     done
     [[ $name =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "name '$name': 1-64 of [A-Za-z0-9._-]"
     [ -r "$dir/ca.key" ] && [ -r "$dir/ca.crt" ] || die "$dir: no root CA here (oc-ca init)"
-    [ "$role" != core ] || [ ${#san[@]} -gt 0 ] || die "a core certificate needs --dns or --ip (the names clients dial)"
-    [ "$role" = core ] || [ ${#san[@]} -eq 0 ] || die "only a core certificate carries names"
+    case $role in
+        core | db) [ ${#san[@]} -gt 0 ] || die "a $role certificate needs --dns or --ip (the names clients dial)" ;;
+        *) [ ${#san[@]} -eq 0 ] || die "only a core or db certificate carries names" ;;
+    esac
     openssl req -in "$csr" -noout -verify >/dev/null 2>&1 || die "$csr: not a CSR, or its signature does not verify"
     openssl req -in "$csr" -noout -text | grep -q 'ASN1 OID: prime256v1' || die "$csr: the key must be ECDSA P-256"
     TMP=$(mktemp -d)

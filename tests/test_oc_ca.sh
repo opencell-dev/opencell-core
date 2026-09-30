@@ -9,6 +9,7 @@
 #   cell.key/.crt, cell.fpr                role cell (clientAuth, wrong role for the API)
 #   rogue.key/.crt                         role portal from another root
 #   core-client.fpr                        core.crt's fingerprint (serverAuth only)
+#   db.key/.crt                            role db, oc-db-1 (serverAuth and clientAuth)
 # usage: test_oc_ca.sh OC_CA OUT
 set -euo pipefail
 OC_CA=$1
@@ -77,6 +78,16 @@ key_csr cell
 check "a cell certificate carries the cell role" bash -c "openssl x509 -in cell.crt -noout -text | grep -q '$ARC.1.3'"
 "$OC_CA" fpr cell.crt > cell.fpr
 "$OC_CA" fpr core.crt > core-client.fpr
+
+key_csr db
+check "a db certificate" "$OC_CA" sign ca db db.csr db.crt oc-db-1 --dns oc-db-1.wg.opencell.k4ozi.com --ip 10.99.0.4 --ip 10.0.0.62
+check "it chains to the root, for a server" openssl verify -CAfile ca.crt -purpose sslserver db.crt
+check "...and for a client (etcd peers, replication, pgBackRest)" openssl verify -CAfile ca.crt -purpose sslclient db.crt
+check "it carries the db role" bash -c "openssl x509 -in db.crt -noout -text | grep -q '$ARC.1.4'"
+check "its names, in order" bash -c "openssl x509 -in db.crt -noout -ext subjectAltName | grep -q 'DNS:oc-db-1.wg.opencell.k4ozi.com, IP Address:10.99.0.4, IP Address:10.0.0.62'"
+check "its subject is the host (pg_ident maps the CN)" bash -c "openssl x509 -in db.crt -noout -subject | grep -q 'CN=oc-db-1\$'"
+check "valid 730 days" bash -c "openssl x509 -in db.crt -noout -checkend $((729 * 86400)) && ! openssl x509 -in db.crt -noout -checkend $((731 * 86400))"
+refuse "a db certificate needs a name" "$OC_CA" sign ca db db.csr x.crt oc-db-1
 
 key_csr rsa rsa
 refuse "an RSA key is refused" "$OC_CA" sign ca portal rsa.csr x.crt p

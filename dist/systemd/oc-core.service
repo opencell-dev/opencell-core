@@ -32,6 +32,9 @@ StateDirectoryMode=0700
 Restart=on-failure
 RestartSec=2
 UMask=0077
+# The master key lives in its memory: no core dumps (oc-core also sets
+# itself non-dumpable, which covers a pipe core_pattern).
+LimitCORE=0
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 # Unix sockets only (the cell and admin sockets, NSS): plan 9 adds AF_INET

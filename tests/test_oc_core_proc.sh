@@ -99,6 +99,12 @@ stop() {
 }
 
 start --key-file "$T/key"
+# It holds the master key for life: no core dump, no ptrace by its user.
+# A process that is not dumpable has its /proc/PID files owned by root.
+if [ "$ME" != 0 ]; then
+    [ "$(stat -c %u "/proc/$PID/status")" = 0 ] || fail "the daemon is dumpable (/proc/$PID is uid $ME's)"
+fi
+grep -qx 'LimitCORE=0' "$(dirname "$0")/../dist/systemd/oc-core.service" || fail "the unit has no LimitCORE=0"
 out=$("$OC" admin --socket "$T/admin.sock" status 2>&1) || fail "status: $out"
 expect "$out" "running"
 expect "$out" "subscribers 1"

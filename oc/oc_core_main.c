@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -123,6 +124,17 @@ static int write_all(int fd, const char *p, size_t n)
         n -= (size_t)w;
     }
     return 0;
+}
+
+/* The daemon holds the master key for life, and --offline holds it too:
+ * no core dump (systemd-coredump, a pipe core_pattern, which ignores
+ * RLIMIT_CORE) and no ptrace by the same user. Before the key is read.
+ * The unit adds LimitCORE=0. */
+static void no_core_dumps(void)
+{
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) {
+        oc_log(OC_LOG_WARNING, "prctl(PR_SET_DUMPABLE): %s: a core dump could hold the master key", strerror(errno));
+    }
 }
 
 /* ---- configuration ---- */
@@ -606,6 +618,7 @@ static int drop_to_db_owner(void)
         oc_log(OC_LOG_ERR, "can't become the database's owner (uid %u)", (unsigned)st.st_uid);
         return -1;
     }
+    no_core_dumps(); /* the uid change set dumpable back to fs.suid_dumpable */
     return 0;
 }
 
@@ -877,11 +890,13 @@ int main(int argc, char **argv)
         sa.sa_handler = on_signal;
         sigaction(SIGTERM, &sa, NULL);
         sigaction(SIGINT, &sa, NULL);
+        no_core_dumps();
         return run_daemon(config, key_file, db);
     }
     if (i == argc) return usage();
     if (offline) {
         if (sock != NULL) return usage();
+        no_core_dumps();
         return admin_offline(config, key_file, db, argc - i, argv + i);
     }
     if (key_file != NULL || db != NULL) return usage(); /* the daemon has its own */

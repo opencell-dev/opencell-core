@@ -30,6 +30,8 @@ systemctl enable --now oc-core
 oc-core admin sub add +883-1-606-555-01234 && oc-core admin sub issue +883-1-606-555-01234
 ~~~
 
+Schema upgrades: the daemon migrates its database at start (`PRAGMA user_version`), after a `.backup` next to it (`core.db.v1.<time>`). Schema v2 (v0.2.0, the admin API) only adds four indexes, so rolling back to v0.1.x needs no restore and loses nothing written since: stop `oc-core`, run `sqlite3 /var/lib/opencell/core/core.db "DROP INDEX audit_number; DROP INDEX cdr_caller; DROP INDEX cdr_called; DROP INDEX token_unused_expiry; PRAGMA user_version = 1;"` (`OC_SQL_V2_TO_V1` in `oc/include/oc_sql.h`, pinned by `test_oc_sql`), then start the old build. Keep the backup for a damaged database.
+
 The running daemon takes `oc-core admin ...` over a local Unix socket (`/run/opencell/admin.sock`, group `oc-admin`); every admin command is audited. A single site's cells connect to `/run/opencell/core.sock` (group `oc-cell`) on the same host. On the bench, the core instead runs on a separate VM: the Pi reaches it by holding a persistent SSH forward of that socket (`oc-core-link.service`, see [opencell-pi](https://github.com/opencell-dev/opencell-pi)'s README and `docs/bench/network-core-bench.md` there) — plan 9 replaces this with a TCP/TLS link the cell dials directly.
 
 Design: `docs/superpowers/specs/2026-09-27-network-core-design.md` (§17 for these programs). Plans: `docs/superpowers/plans/2026-09-27-net-core-1-lc-core.md` (the libraries) and `docs/superpowers/plans/2026-09-28-oc-core-oc-cell-bench.md` (the programs, on the Pi bench).

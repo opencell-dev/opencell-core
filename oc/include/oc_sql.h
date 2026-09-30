@@ -35,6 +35,13 @@
 
 #define OC_SQL_VERSION 2 /* the schema this build writes */
 
+/* A rollback past v0.2.0 without restoring the backup: v2 is indexes only,
+ * so with oc-core stopped, `sqlite3 core.db "<this>"` gives back the exact
+ * v1 schema v0.1.x opens, and keeps everything written since (README). */
+#define OC_SQL_V2_TO_V1                                                                                        \
+    "DROP INDEX audit_number; DROP INDEX cdr_caller; DROP INDEX cdr_called; DROP INDEX token_unused_expiry;" \
+    " PRAGMA user_version = 1;"
+
 typedef struct oc_sql oc_sql_t;
 
 typedef struct {

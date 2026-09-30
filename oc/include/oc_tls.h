@@ -5,8 +5,9 @@
  * tools/ca/oc-ca) and whose SHA-256 is pinned in the core's config; and its
  * connections, non-blocking, stepped from the daemon's poll loop (no call
  * here ever waits). No session tickets or resumption: every connection
- * shows its certificate, so a pin removed from the config takes effect at
- * the next connection. */
+ * shows its certificate, so once the pins change (a new oc_tls_t: for
+ * oc-core, a restart, as its config is read at start) no connection gets
+ * in on an old one. */
 #ifndef OC_TLS_H
 #define OC_TLS_H
 

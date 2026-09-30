@@ -760,6 +760,46 @@ static void test_a_v1_database_migrates_to_v2(void)
     rm_dir();
 }
 
+/* sqlite_master, as one string: what a build that opens the file sees. */
+static void schema_of(sqlite3 *h, char *out, size_t cap)
+{
+    sqlite3_stmt *q;
+    size_t n = 0;
+    out[0] = '\0';
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(h, "SELECT type, name, tbl_name, coalesce(sql, '') FROM"
+                                                           " sqlite_master ORDER BY type, name", -1, &q, NULL));
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        for (int c = 0; c < 4; c++) {
+            int w = snprintf(out + n, cap - n, "%s|", (const char *)sqlite3_column_text(q, c));
+            TEST_ASSERT_TRUE(w > 0 && (size_t)w < cap - n);
+            n += (size_t)w;
+        }
+    }
+    sqlite3_finalize(q);
+}
+
+/* Rolling back past v0.2.0 needs no restore: v2 is indexes only, and
+ * OC_SQL_V2_TO_V1 (the README's rollback, with oc-core stopped) leaves
+ * exactly the v1 schema v0.1.x made, every row kept. */
+static void test_v2_rolls_back_to_v1_by_dropping_its_indexes(void)
+{
+    static char want[16384], got[16384];
+    char err[256];
+    const char *v1[] = { oc_sql_migration(0) };
+    oc_sql_t *s = open_db(":memory:", KEY, v1, 1, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    schema_of(oc_sql_db(s), want, sizeof(want));
+    oc_sql_close(s);
+    s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    TEST_ASSERT_EQUAL_INT(2, oc_sql_version(s));
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), OC_SQL_V2_TO_V1, NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(1, oc_sql_version(s));
+    schema_of(oc_sql_db(s), got, sizeof(got));
+    TEST_ASSERT_EQUAL_STRING(want, got);
+    oc_sql_close(s);
+}
+
 /* The two reads and the one write the admin API adds beside the store. */
 static void test_cert_pins_and_the_expiry_scan(void)
 {
@@ -857,6 +897,7 @@ int main(void)
     RUN_TEST(test_the_last_list_version_outlives_a_malformed_row);
     RUN_TEST(test_sqn_rises_across_a_core_restart);
     RUN_TEST(test_a_v1_database_migrates_to_v2);
+    RUN_TEST(test_v2_rolls_back_to_v1_by_dropping_its_indexes);
     RUN_TEST(test_cert_pins_and_the_expiry_scan);
     return UNITY_END();
 }

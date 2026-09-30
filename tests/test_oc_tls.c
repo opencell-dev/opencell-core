@@ -198,6 +198,21 @@ static void test_a_pinned_certificate_without_the_portal_role_is_refused(void)
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "client certificate refused"), why);
 }
 
+/* An expired certificate is refused by the chain check, even pinned (a
+ * forgotten pin outlives its certificate). */
+static void test_an_expired_certificate_is_refused_even_pinned(void)
+{
+    oc_tls_cfg_t cfg = server_cfg();
+    client_t cl = PORTAL;
+    char why[160];
+    cl.cert = "expired.crt";
+    cl.key = "expired.key";
+    read_fpr("expired.fpr", cfg.pin[1]);
+    cfg.npin = 2;
+    TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &cl, why, sizeof(why)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "expired"), why);
+}
+
 static void test_the_wrong_alpn_or_none_is_refused(void)
 {
     oc_tls_cfg_t cfg = server_cfg();
@@ -251,6 +266,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_another_roots_certificate_is_refused);
     RUN_TEST(test_a_good_certificate_not_pinned_is_refused);
     RUN_TEST(test_a_pinned_certificate_without_the_portal_role_is_refused);
+    RUN_TEST(test_an_expired_certificate_is_refused_even_pinned);
     RUN_TEST(test_the_wrong_alpn_or_none_is_refused);
     RUN_TEST(test_tls_1_2_is_refused);
     RUN_TEST(test_a_server_that_cant_start_says_why);

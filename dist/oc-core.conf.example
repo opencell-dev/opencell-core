@@ -15,11 +15,17 @@ admin_group = oc-admin
 # The admin API (portal spec §7): TLS 1.3 on a private address only. The
 # portal's client certificate must chain to api_ca, carry the portal role
 # and be pinned here (oc-ca fpr portal.crt; up to 4 lines, for a rotation).
+# The config is read at start: a pin added or removed (a rotation, a stolen
+# certificate) takes effect at `systemctl restart oc-core`, which also
+# drops the cells' links for a moment (they reconnect).
 # A value with no '/' is a systemd credential (LoadCredential=NAME:PATH).
+# api_listen may name an address that is not up yet (at boot): the core
+# starts, and the API answers once the address is there.
 #api_listen = 10.0.0.60:7444
 #api_cert = /etc/opencell/tls/core.crt
 #api_key = api.key
 #api_ca = /etc/opencell/tls/ca.crt
 #api_portal_fpr = <64 hex digits>
-# Per-operation rate limits (OP PER_HOUR BURST); the defaults are in oc_api.c
+# Per-operation rate limits (OP PER_HOUR BURST); the defaults are in oc_api.c.
+# "unknown" is op 0 and any operation the core does not have.
 #api_rate = sub.disable 30 10

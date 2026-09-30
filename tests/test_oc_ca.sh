@@ -5,6 +5,7 @@
 #   core.key/.crt                          role core, localhost + 127.0.0.1
 #   portal.key/.crt, portal.fpr            role portal (pinned by the tests)
 #   other.key/.crt                         role portal, not pinned
+#   expired.key/.crt, expired.fpr          role portal, expired in 2025
 #   cell.key/.crt, cell.fpr                role cell (clientAuth, wrong role for the API)
 #   rogue.key/.crt                         role portal from another root
 #   core-client.fpr                        core.crt's fingerprint (serverAuth only)
@@ -63,6 +64,14 @@ refuse "a portal certificate carries no names" "$OC_CA" sign ca portal portal.cs
 
 key_csr other
 "$OC_CA" sign ca portal other.csr other.crt oc-portal-2 >/dev/null
+# An expired portal certificate from our root (the TLS tests pin it: the
+# chain check must refuse it anyway). oc-ca never backdates: openssl here.
+key_csr expired
+printf '[e]\nbasicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = clientAuth\ncertificatePolicies = %s.1.2\n' \
+    "$ARC" > expired.ext
+check "an expired portal certificate, for the TLS tests" openssl x509 -req -in expired.csr -CA ca/ca.crt -CAkey ca/ca.key \
+    -sha256 -not_before 20250101000000Z -not_after 20250102000000Z -extfile expired.ext -extensions e -out expired.crt
+"$OC_CA" fpr expired.crt > expired.fpr
 key_csr cell
 "$OC_CA" sign ca cell cell.csr cell.crt cell-7 >/dev/null
 check "a cell certificate carries the cell role" bash -c "openssl x509 -in cell.crt -noout -text | grep -q '$ARC.1.3'"

@@ -142,6 +142,9 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
      * proving SQN rises: a re-registration there, periodic or not). A
      * replay of a proof already on record - the one a cell sends after
      * every HELLO_ACK (§7.10), or an older one - writes none. */
+    /* `moved` is belt and braces, unreachable today: a move always raises
+     * the SQN (the floor above), and a new binding follows a re-activation,
+     * which deletes the location. */
     int changed = !had || moved || old.expires <= oc_core_unix(k) || a.sqn > old.sqn;
     memset(&l, 0, sizeof(l));
     memcpy(l.number, num, OC_SIG_NUMBER_LEN);

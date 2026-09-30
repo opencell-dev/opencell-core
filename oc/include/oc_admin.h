@@ -87,8 +87,12 @@ int oc_admin_run(oc_admin_t *a, int argc, char **argv, oc_buf_t *out);
  * well-formed field from a root peer, *sudo_uid set; -1, a word starting
  * with "--" that is not a well-formed field (1 to 10 digits, no leading
  * zero, 1 to 2^32 - 1), or a field from a peer that is not root: the
- * request is refused, nothing run. Only root (and oc-admin) can connect, so
- * the uid is root's claim, as SUDO_UID is offline. */
+ * request is refused, nothing run (and audited: "refused: --word from
+ * u<uid>"). Only root (and oc-admin) can connect, so the uid is root's
+ * claim, as SUDO_UID is offline. The field needs a daemon from commit
+ * "oc-core admin: `sudo oc-core admin` over the socket records the sudo
+ * user" on (after v0.1.0); an older one answers it with usage (2), and the
+ * client then asks again without it, once. */
 #define OC_ADMIN_SUDO_FIELD "--sudo-uid="
 int oc_admin_sudo_field(const char *word, uint32_t peer_uid, uint32_t *sudo_uid);
 

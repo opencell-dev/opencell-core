@@ -432,13 +432,22 @@ static void serve_admin(void)
         snprintf(who, sizeof(who), "uid %u", (unsigned)cr.uid);
     }
     if (bad_sudo) {
-        /* A sudo uid is root's claim; from anyone else, or malformed, the
-         * request is refused whole. */
+        /* A leading --word is only ever root's sudo field; from anyone else,
+         * or malformed, the request is refused whole, nothing run - and,
+         * a security event, written to the audit log. */
         rc = 2;
-        snprintf(what, sizeof(what), "(a request with a bad sudo field)");
+        snprintf(what, sizeof(what), "(a request with a bad --word)");
         oc_log(OC_LOG_WARNING, "admin (%s): %s: refused", who,
-               cr.uid == 0 ? "a malformed sudo field" : "a sudo uid from a peer that is not root");
-        oc_buf_printf(&out, "the request's sudo field is malformed, or its peer is not root\n");
+               cr.uid == 0 ? "a malformed sudo field or unknown --word" : "a --word from a peer that is not root");
+        oc_buf_printf(&out, "the request's leading --word is not a sudo field, or its peer is not root\n");
+        oc_core_audit_t r;
+        memset(&r, 0, sizeof(r));
+        r.ts = (uint32_t)time(NULL);
+        r.event = OC_CORE_AUDIT_ADMIN;
+        snprintf(r.detail, sizeof(r.detail), "refused: %s--word from u%u", cr.uid == 0 ? "bad " : "",
+                 (unsigned)cr.uid);
+        oc_core_store_t st = oc_sql_store(D.sql);
+        if (st.audit_add(st.ctx, &r) != 0) oc_log(OC_LOG_ERR, "admin: audit write FAILED");
     } else if (cut) {
         /* Never run part of a command: its first words may be another one. */
         rc = 2;
@@ -733,20 +742,11 @@ static void draw_qr(const char *text)
     oc_sig_wipe(line, sizeof(line));
 }
 
-static int admin_client(const char *sock, int argc, char **argv)
+/* One request (field first unless ""), its answer written out: the
+ * command's rc, 1 when there is no whole answer, or 3 - nothing written -
+ * for a usage answer (2) to a request that carried the sudo field. */
+static int admin_once(const char *sock, const char *field, int argc, char **argv)
 {
-    /* As root under sudo, the operator behind it goes first (oc_admin.h),
-     * for the audit record. */
-    char field[sizeof(OC_ADMIN_SUDO_FIELD) + 10];
-    uint32_t su = sudo_uid(geteuid());
-    field[0] = '\0';
-    if (su != 0) snprintf(field, sizeof(field), OC_ADMIN_SUDO_FIELD "%u", (unsigned)su);
-    size_t need = field[0] != '\0' ? strlen(field) + 1u : 0;
-    for (int i = 0; i < argc; i++) need += strlen(argv[i]) + 1u;
-    if (argc > ADMIN_ARGS_MAX || need > ADMIN_REQ_MAX) {
-        fprintf(stderr, "a command of at most %d words and %u bytes\n", ADMIN_ARGS_MAX, ADMIN_REQ_MAX);
-        return 2;
-    }
     int fd = oc_unix_connect_wait(sock, CLIENT_WAIT_S * 1000); /* a busy daemon's full backlog is waited out */
     if (fd < 0 && errno == ETIMEDOUT) {
         fprintf(stderr, "oc-core is not accepting on %s (running but stuck?)\n", sock);
@@ -808,10 +808,36 @@ static int admin_client(const char *sock, int argc, char **argv)
         oc_buf_free(&in);
         return 1;
     }
+    if (rc == 2 && field[0] != '\0') { /* maybe a daemon older than the field: asked again without it */
+        oc_buf_free(&in);
+        return 3;
+    }
     write_all(rc == 0 ? STDOUT_FILENO : STDERR_FILENO, in.p + body, in.n - body);
     if (rc == 0 && argc >= 2 && strcmp(argv[0], "sub") == 0 && strcmp(argv[1], "issue") == 0) draw_qr(in.p + body);
     oc_buf_free(&in); /* wiped */
     return rc;
+}
+
+static int admin_client(const char *sock, int argc, char **argv)
+{
+    /* As root under sudo, the operator behind it goes first (oc_admin.h),
+     * for the audit record. */
+    char field[sizeof(OC_ADMIN_SUDO_FIELD) + 10];
+    uint32_t su = sudo_uid(geteuid());
+    field[0] = '\0';
+    if (su != 0) snprintf(field, sizeof(field), OC_ADMIN_SUDO_FIELD "%u", (unsigned)su);
+    size_t need = field[0] != '\0' ? strlen(field) + 1u : 0;
+    for (int i = 0; i < argc; i++) need += strlen(argv[i]) + 1u;
+    if (argc > ADMIN_ARGS_MAX || need > ADMIN_REQ_MAX) {
+        fprintf(stderr, "a command of at most %d words and %u bytes\n", ADMIN_ARGS_MAX, ADMIN_REQ_MAX);
+        return 2;
+    }
+    /* A daemon older than the sudo field (before it came in: v0.1.0) takes
+     * it for a command and answers usage (2): the request goes again
+     * without it, once. A 2 from a daemon that knows the field means the
+     * command is not one: asking again costs a second usage record. */
+    int rc = admin_once(sock, field, argc, argv);
+    return rc == 3 ? admin_once(sock, "", argc, argv) : rc;
 }
 
 static int usage(void)

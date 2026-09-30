@@ -10,6 +10,10 @@
 # database's directory, /var/lib/opencell/core, oc-core's and 0700, if the
 # unit has not run yet):
 #   sudo oc-core admin --offline --key-file /etc/opencell/master.key net init
+# `sudo oc-core admin ...` sends the operator's SUDO_UID for the audit
+# record; a daemon older than that (v0.1.0) answers it with usage, and the
+# client asks again without it, so a client ahead of the running daemon
+# (installed, not yet restarted) still works, audited as plain u0.
 [Unit]
 Description=OpenCell network core (oc-core)
 After=network.target

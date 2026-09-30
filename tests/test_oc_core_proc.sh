@@ -62,7 +62,7 @@ out=$(umask 077; "$OC" admin --offline --config "$T/oc-core.conf" --key-file "$T
 
 # The client counts the answer against its head ("RC BYTES\n"): a cut one fails.
 client_vs() {
-    "$DRIP" --serve "$T/fake.sock" "$1" &
+    "$DRIP" --serve "$T/fake.sock" "$1" >"$T/serve" &
     local fpid=$!
     for _ in $(seq 50); do [ -S "$T/fake.sock" ] && break; sleep 0.05; done
     out=$("$OC" admin --socket "$T/fake.sock" status 2>&1); rc=$?
@@ -77,6 +77,11 @@ expect "$out" "^hello$"
 client_vs $'0\nhello\n'
 [ "$rc" = 1 ] || fail "an answer with no count exited $rc: $out"
 expect "$out" "no answer from oc-core"
+# rc 2 with no sudo field sent (not root): the answer stands, no retry.
+client_vs $'2 6\nusage\n'
+[ "$rc" = 2 ] || fail "a usage answer exited $rc: $out"
+expect "$out" "^usage$"
+expect "$(cat "$T/serve")" "^request: status$"
 
 DB=$T/core.db
 start() {
@@ -207,6 +212,8 @@ grep -q 'call 00000042/[0-9a-f]* ended, cause 5' "$T/log" || fail "the call was 
 start --key-file "$T/key"
 out=$("$OC" admin --socket "$T/admin.sock" cdr 2>&1) || fail "cdr after the restart: $out"
 expect "$out" "^#1 +883160655501234 -> +883160655500100  cells 1 -> 0  answered, [0-9]* s, cause 5$"
+out=$("$OC" admin --socket "$T/admin.sock" loc 2>&1) || fail "loc after the restart: $out"
+expect "$out" "^+883160655501234  cell 1  tmid 76ad0488  expires in [0-9]* s$" # the stop left locations alone
 stop
 DB=$T/core.db
 
@@ -218,31 +225,50 @@ start --key-file "$T/key"
 out=$(SUDO_UID=4242 "$OC" admin --socket "$T/admin.sock" status 2>&1) || fail "status with SUDO_UID: $out"
 out=$("$DRIP" --late-read "$T/admin.sock" 0 --sudo-uid=4242 status) || fail "sudo field: $out"
 expect "$out" "^rc 2$"
-grep -q "admin (uid $ME): a sudo uid from a peer that is not root: refused" "$T/log" ||
-    fail "a sudo uid from a peer that is not root was not logged"
-out=$("$OC" admin --socket "$T/admin.sock" audit 2 2>&1) || fail "audit: $out"
+grep -q "admin (uid $ME): a --word from a peer that is not root: refused" "$T/log" ||
+    fail "a --word from a peer that is not root was not logged"
+out=$("$DRIP" --late-read "$T/admin.sock" 0 --frob status) || fail "--frob: $out"
+expect "$out" "^rc 2$"
+out=$("$OC" admin --socket "$T/admin.sock" audit 3 2>&1) || fail "audit: $out"
 expect "$out" "ADMIN .* u$ME status"
+[ "$(grep -c "ADMIN .* refused: --word from u$ME\$" <<<"$out")" = 2 ] ||
+    fail "the refused --words are not audited (a security event): $out"
 grep -q "4242" <<<"$out" && fail "a sudo uid was recorded for a peer that is not root: $out"
 stop
 # As root in a user namespace (the daemon too, so the peer is uid 0 to it).
 if unshare -r true 2>/dev/null; then
     timeout 30 unshare -r bash -c '
-        OC=$1 T=$2
+        OC=$1 T=$2 DRIP=$3
         "$OC" --config "$T/oc-core.conf" --db "$T/core.db" --key-file "$T/key" 2>>"$T/log" &
         pid=$!
         trap "kill $pid 2>/dev/null" EXIT
         for _ in $(seq 50); do [ -S "$T/admin.sock" ] && break; sleep 0.1; done
         SUDO_UID=4242 "$OC" admin --socket "$T/admin.sock" status >/dev/null || echo "status failed"
         SUDO_UID=12x "$OC" admin --socket "$T/admin.sock" cell list >/dev/null || echo "cell list failed"
-        "$OC" admin --socket "$T/admin.sock" audit 3
+        "$DRIP" --late-read "$T/admin.sock" 0 --sudo-uid=01 status | grep -q "^rc 2$" || echo "01 not refused"
+        "$OC" admin --socket "$T/admin.sock" audit 4
         kill -TERM $pid
         wait $pid || echo "exit status $?"
-    ' _ "$OC" "$T" >"$T/userns" 2>&1
+        # A daemon older than the field (v0.1.0) takes it for a command and
+        # answers usage: the client asks once more without it.
+        nl=$(printf "\nx") && nl=${nl%x}
+        "$DRIP" --serve "$T/fake.sock" "2 6${nl}usage${nl}" "0 3${nl}ok${nl}" >"$T/serve" &
+        fpid=$!
+        for _ in $(seq 50); do [ -S "$T/fake.sock" ] && break; sleep 0.05; done
+        SUDO_UID=4242 "$OC" admin --socket "$T/fake.sock" status || echo "old daemon: failed"
+        wait $fpid || echo "fake daemon: exit status $?"
+    ' _ "$OC" "$T" "$DRIP" >"$T/userns" 2>&1
     out=$(cat "$T/userns")
-    grep -q "failed\|exit status" <<<"$out" && fail "as root in a user namespace: $out"
+    grep -q "failed\|exit status\|not refused" <<<"$out" && fail "as root in a user namespace: $out"
     expect "$out" "ADMIN .* u0 (sudo u4242) status"
     expect "$out" "ADMIN .* u0 cell list" # SUDO_UID not a number: no claim sent
+    expect "$out" "ADMIN .* refused: bad --word from u0$"
     grep -q 'admin (uid 0, sudo u4242): status -> 0' "$T/log" || fail "the sudo uid is not in the log line"
+    grep -q 'admin (uid 0): a malformed sudo field or unknown --word: refused' "$T/log" ||
+        fail "a root peer's bad --word was not logged"
+    expect "$out" "^ok$"
+    expect "$(cat "$T/serve")" "^request: --sudo-uid=4242 status$"
+    expect "$(cat "$T/serve")" "^request: status$"
 else
     echo "note: no user namespaces here: the root client's sudo uid is not tried"
 fi

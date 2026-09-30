@@ -15,9 +15,10 @@
  *       G < E.
  *   tool_oc_drip --hang-up SOCKET WORD...
  *       Sends a request and closes at once, taking no answer.
- *   tool_oc_drip --serve SOCKET ANSWER
- *       A stand-in daemon: takes one connection, reads its request to the
- *       end, answers ANSWER as it is, and closes. */
+ *   tool_oc_drip --serve SOCKET ANSWER...
+ *       A stand-in daemon: takes one connection per ANSWER, reads its
+ *       request to the end, prints "request: WORDS" (its NULs as spaces),
+ *       answers ANSWER as it is, and closes. */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -160,25 +161,40 @@ static int hang_up(int argc, char **argv)
 
 static int serve(int argc, char **argv)
 {
-    if (argc != 4) return 2;
+    if (argc < 4) return 2;
     int l = oc_unix_listen(argv[2], 0600, NULL);
     if (l < 0) {
         perror(argv[2]);
         return 1;
     }
-    struct pollfd p = { l, POLLIN, 0 };
-    if (poll(&p, 1, 10000) <= 0) return 1;
-    int fd = accept(l, NULL, NULL);
-    if (fd < 0) return 1;
-    blocking(fd);
-    char b[4096];
-    while (recv(fd, b, sizeof(b), 0) > 0) {
+    int rc = 0;
+    for (int i = 3; i < argc && rc == 0; i++) {
+        struct pollfd p = { l, POLLIN, 0 };
+        int fd = poll(&p, 1, 10000) > 0 ? accept(l, NULL, NULL) : -1;
+        if (fd < 0) {
+            rc = 1;
+            break;
+        }
+        blocking(fd);
+        char b[4096];
+        size_t n = 0;
+        ssize_t r;
+        while ((r = recv(fd, b + n, sizeof(b) - 1u - n, 0)) > 0) {
+            n += (size_t)r;
+            if (n == sizeof(b) - 1u) n = 0; /* only a short request is shown */
+        }
+        for (size_t j = 0; j + 1u < n; j++) {
+            if (b[j] == '\0') b[j] = ' ';
+        }
+        b[n] = '\0';
+        printf("request: %s\n", b);
+        fflush(stdout);
+        send(fd, argv[i], strlen(argv[i]), MSG_NOSIGNAL);
+        close(fd);
     }
-    send(fd, argv[3], strlen(argv[3]), MSG_NOSIGNAL);
-    close(fd);
     close(l);
     unlink(argv[2]);
-    return 0;
+    return rc;
 }
 
 int main(int argc, char **argv)
@@ -193,7 +209,7 @@ int main(int argc, char **argv)
     if (rc == 2) {
         fprintf(stderr, "usage: tool_oc_drip SOCKET INTERVAL_MS HOLD_S | --flood SOCKET N WORD\n"
                         "     | --late-read SOCKET PAUSE_S WORD... | --hang-up SOCKET WORD...\n"
-                        "     | --serve SOCKET ANSWER\n");
+                        "     | --serve SOCKET ANSWER...\n");
     }
     return rc;
 }

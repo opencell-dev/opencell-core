@@ -3,20 +3,24 @@
 # first setup offline, the daemon on its sockets, admin over the socket, the
 # lock against --offline while it runs, a cell's HELLO, a clean stop on
 # SIGTERM, data kept across a restart, the key from a systemd credential
-# directory, and a wrong or exposed master key refused.
-#   test_oc_core_proc.sh OC_CORE TOOL_OC_HELLO TOOL_OC_DRIP
+# directory, a wrong or exposed master key refused, and a call that is up
+# when the daemon stops ended with its CDR written.
+#   test_oc_core_proc.sh OC_CORE TOOL_OC_HELLO TOOL_OC_DRIP TOOL_OC_CALL
 # Everything it makes is in one temp directory, removed on exit; the
 # processes it starts are stopped by PID.
 set -u
 OC=$1
 HELLO=$2
 DRIP=$3
+CALL=$4
 T=$(mktemp -d /tmp/oc_core_proc_XXXXXX) || exit 1
 PID=
 HPID=
 DPID=
+CPID=
 cleanup() {
     [ -n "$HPID" ] && kill "$HPID" 2>/dev/null
+    [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
     [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
     [ -n "$PID" ] && kill "$PID" 2>/dev/null && wait "$PID" 2>/dev/null
     rm -rf "$T"
@@ -74,8 +78,9 @@ client_vs $'0\nhello\n'
 [ "$rc" = 1 ] || fail "an answer with no count exited $rc: $out"
 expect "$out" "no answer from oc-core"
 
+DB=$T/core.db
 start() {
-    "$OC" --config "$T/oc-core.conf" --db "$T/core.db" "$@" 2>>"$T/log" &
+    "$OC" --config "$T/oc-core.conf" --db "$DB" "$@" 2>>"$T/log" &
     PID=$!
     for _ in $(seq 50); do [ -S "$T/admin.sock" ] && return 0; sleep 0.1; done
     fail "the admin socket did not appear"
@@ -179,6 +184,31 @@ grep -q 'admin (uid [0-9]*): the request was dropped: oc-core is stopping' "$T/l
 wait "$PID"; rc=$?; PID=
 [ "$rc" = 0 ] || fail "exit status $rc after SIGTERM"
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=
+
+# A call that is up when oc-core stops ends there (cause 5, spec §7.6 and
+# §7.10), and its CDR is written before the database closes (§3: a CDR per
+# call attempt): the restarted core lists it.
+DB=$T/call.db
+CADM=("$OC" admin --offline --config "$T/oc-core.conf" --key-file "$T/key" --db "$DB")
+"$CALL" hss "$T/hss.txt" || fail "tool_oc_call hss"
+out=$("${CADM[@]}" import-ocb-hss "$T/hss.txt" 2>&1) || fail "import: $out"
+out=$("${CADM[@]}" cell add 1 bench 2>&1) || fail "cell add: $out"
+start --key-file "$T/key"
+"$CALL" "$T/core.sock" 1 7 >"$T/call" &
+CPID=$!
+for _ in $(seq 100); do grep -q answered "$T/call" && break; sleep 0.1; done
+grep -q answered "$T/call" || fail "the echo call was not answered: $(cat "$T/call")"
+out=$("$OC" admin --socket "$T/admin.sock" cdr 2>&1) || fail "cdr: $out"
+[ -z "$out" ] || fail "a CDR before the call ended: $out"
+stop
+wait "$CPID"; CPID=
+expect "$(cat "$T/call")" "closed"
+grep -q 'call 00000042/[0-9a-f]* ended, cause 5' "$T/log" || fail "the call was not ended at the stop"
+start --key-file "$T/key"
+out=$("$OC" admin --socket "$T/admin.sock" cdr 2>&1) || fail "cdr after the restart: $out"
+expect "$out" "^#1 +883160655501234 -> +883160655500100  cells 1 -> 0  answered, [0-9]* s, cause 5$"
+stop
+DB=$T/core.db
 
 out=$(env -u CREDENTIALS_DIRECTORY "$OC" --config "$T/oc-core.conf" --db "$T/core.db" 2>&1) && fail "started with no key"
 expect "$out" "no master key"

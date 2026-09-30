@@ -19,6 +19,8 @@
  * Links: the daemon closes a link oc_core drops (io.close); a link whose
  * peer vanished, or whose send or read failed, is marked dead and oc_core
  * hears of it (oc_core_link_down) once the call in progress has returned.
+ * On a stop every link goes down the same way before the database closes,
+ * so the calls in progress end with their CDRs.
  * Reconnect backoff is the cell's business (oc_core.h, oc_core_tick): no
  * state here outlives a link. */
 #include <errno.h>
@@ -282,6 +284,21 @@ static void drop_cell(void *ctx, uint32_t cell_id)
     }
 }
 
+/* Stopping: every live link goes down in oc_core while the store is still
+ * open, so each call in progress ends (cause 5, network-core spec §7.6,
+ * §7.10) and its CDR is written (§3); a CALL_RELEASE this queues for a
+ * leg on another link goes out if the socket takes it now. The links are
+ * closed after. */
+static void links_down(void)
+{
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
+        if (D.link[i].used) oc_core_link_down(&D.core, D.link[i].id, mono_us());
+    }
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
+        if (D.link[i].used && !D.link[i].dead) oc_conn_flush(&D.link[i].c);
+    }
+}
+
 static void accept_cell(void)
 {
     int fd = accept4(D.cell_l, NULL, NULL, SOCK_CLOEXEC);
@@ -514,6 +531,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
         }
     }
     oc_log(OC_LOG_NOTICE, "oc-core: stopping");
+    links_down();
     rc = 0;
 out:
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {

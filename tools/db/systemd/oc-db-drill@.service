@@ -1,0 +1,10 @@
+# The monthly restore drill of one stanza (postgres-ha spec §10.5), on oc-ldn-1.
+[Unit]
+Description=Restore drill of %i
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oc-db-drill %i
+StateDirectory=oc-db-drill
+TimeoutStartSec=3h

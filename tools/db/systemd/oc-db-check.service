@@ -1,0 +1,14 @@
+# oc-db-check: the database layer's checks and alerts (postgres-ha spec §14),
+# on oc-ldn-1, oc-db-1 and oc-core-2; /etc/opencell/db-check.conf says which role.
+[Unit]
+Description=OpenCell database checks and alerts
+After=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oc-db-check
+StateDirectory=oc-db-check
+TimeoutStartSec=55
+Nice=5
+ProtectSystem=full
+PrivateTmp=true

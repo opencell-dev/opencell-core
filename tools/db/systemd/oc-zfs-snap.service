@@ -1,0 +1,8 @@
+# Snapshots of the pgBackRest repository's dataset (postgres-ha spec §10.2),
+# on pvelondon itself: the container cannot touch them.
+[Unit]
+Description=Snapshots of esas/opencell-pgbackrest
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oc-zfs-snap esas/opencell-pgbackrest

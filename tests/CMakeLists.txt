@@ -24,6 +24,7 @@ oc_test(test_oc_conn oc_util)
 oc_test(test_oc_seal oc_store)
 oc_test(test_oc_sql oc_store)
 oc_test(test_oc_admin oc_store)
+oc_test(test_oc_api oc_store)
 
 # oc-core as a process, with a bare cell (tool_oc_hello) to speak HELLO, a
 # cell with a terminal in a call (tool_oc_call) and a slow admin peer

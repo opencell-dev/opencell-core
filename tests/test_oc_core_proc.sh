@@ -4,17 +4,20 @@
 # lock against --offline while it runs, a cell's HELLO, a clean stop on
 # SIGTERM, data kept across a restart, the key from a systemd credential
 # directory, and a wrong or exposed master key refused.
-#   test_oc_core_proc.sh OC_CORE TOOL_OC_HELLO
+#   test_oc_core_proc.sh OC_CORE TOOL_OC_HELLO TOOL_OC_DRIP
 # Everything it makes is in one temp directory, removed on exit; the
 # processes it starts are stopped by PID.
 set -u
 OC=$1
 HELLO=$2
+DRIP=$3
 T=$(mktemp -d /tmp/oc_core_proc_XXXXXX) || exit 1
 PID=
 HPID=
+DPID=
 cleanup() {
     [ -n "$HPID" ] && kill "$HPID" 2>/dev/null
+    [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
     [ -n "$PID" ] && kill "$PID" 2>/dev/null && wait "$PID" 2>/dev/null
     rm -rf "$T"
 }
@@ -22,6 +25,7 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*"; echo "--- daemon log"; cat "$T/log" 2>/dev/null; exit 1; }
 expect() { grep -q -- "$2" <<<"$1" || fail "expected '$2' in: $1"; }
 ME=$(id -u)
+ms_since() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
 
 head -c 32 /dev/urandom >"$T/key" && chmod 0400 "$T/key"
 cat >"$T/oc-core.conf" <<EOF
@@ -45,6 +49,10 @@ out=$("${ADM[@]}" cell add 1 bench 2>&1) || fail "cell add: $out"
 out=$("${ADM[@]}" sub add +883-1-606-555-01234 2>&1) || fail "sub add: $out"
 expect "$out" "+883160655501234"
 [ -e "$T/elsewhere.db" ] && fail "--db did not override the config's db"
+# First setup on a fresh machine: the database's directory is made (0700).
+out=$("$OC" admin --offline --config "$T/oc-core.conf" --key-file "$T/key" --db "$T/fresh/core/core.db" net init 2>&1) ||
+    fail "net init in a missing directory: $out"
+[ "$(stat -c %a "$T/fresh/core")" = 700 ] || fail "made the database directory $(stat -c %a "$T/fresh/core")"
 
 start() {
     "$OC" --config "$T/oc-core.conf" --db "$T/core.db" "$@" 2>>"$T/log" &
@@ -83,6 +91,19 @@ expect "$(cat "$T/hello")" "closed"
 out=$("$HELLO" "$T/core.sock" 9 7 1)
 expect "$out" "HELLO_NAK reason 1"
 
+# A slow admin peer holds the daemon ADMIN_IO_S (2 s) at most, however it
+# spaces its bytes: then it is dropped and the next command is served.
+"$DRIP" "$T/admin.sock" 1000 20 >"$T/drip" &
+DPID=$!
+sleep 0.3
+t0=$(date +%s%N)
+out=$("$OC" admin --socket "$T/admin.sock" status 2>&1) || fail "status behind a slow peer: $out"
+ms=$(ms_since "$t0")
+[ "$ms" -lt 3000 ] || fail "status waited $ms ms behind a slow admin peer"
+wait "$DPID"; DPID=
+expect "$(cat "$T/drip")" "closed after"
+grep -q 'admin (uid [0-9]*): the request took more than 2 s: dropped' "$T/log" || fail "the slow peer was not logged"
+
 # A peer's words must not become lines of their own in the journal.
 out=$("$OC" admin --socket "$T/admin.sock" $'status\n<3>oc-core: forged' 2>&1); [ $? = 2 ] || fail "forged: $out"
 grep -q '^<3>oc-core: forged' "$T/log" && fail "an admin peer wrote a line of its own into the log"
@@ -109,7 +130,19 @@ expect "$out" "ADMIN .* u$ME cell mode 1 part97"
 expect "$out" "CELL_REJECT"
 out=$("$OC" admin --socket "$T/admin.sock" cell list 2>&1)
 expect "$out" 'cell 1 "bench": part97'
-stop
+# SIGTERM while a slow admin peer is being served: out within a second.
+"$DRIP" "$T/admin.sock" 1000 20 >/dev/null &
+DPID=$!
+sleep 0.3
+t0=$(date +%s%N)
+kill -TERM "$PID"
+for _ in $(seq 40); do kill -0 "$PID" 2>/dev/null || break; sleep 0.05; done
+ms=$(ms_since "$t0")
+kill -0 "$PID" 2>/dev/null && fail "SIGTERM held by a slow admin peer ($ms ms)"
+[ "$ms" -lt 1000 ] || fail "SIGTERM took $ms ms with a slow admin peer"
+wait "$PID"; rc=$?; PID=
+[ "$rc" = 0 ] || fail "exit status $rc after SIGTERM"
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=
 
 out=$(env -u CREDENTIALS_DIRECTORY "$OC" --config "$T/oc-core.conf" --db "$T/core.db" 2>&1) && fail "started with no key"
 expect "$out" "no master key"

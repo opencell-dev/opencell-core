@@ -25,6 +25,7 @@
 #include <grp.h>
 #include <libgen.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,9 +51,14 @@
 
 #define DEFAULT_CONFIG "/etc/opencell/oc-core.conf"
 #define DEFAULT_ADMIN  "/run/opencell/admin.sock"
+#define DAEMON_USER    "oc-core" /* the unit's User= */
 #define ADMIN_REQ_MAX  4096u /* one command's words, NULs included */
 #define ADMIN_ARGS_MAX 32
-#define ADMIN_IO_S     2  /* the daemon waits this long on an admin peer (it serves nothing else meanwhile) */
+/* An admin peer has this long, in all, to send its request, and again to
+ * take its answer; then it is dropped. The daemon serves nothing else
+ * meanwhile (no tick, no cell), so the budget is per connection, not per
+ * read or write: a peer dripping a byte at a time can't stretch it. */
+#define ADMIN_IO_S     2
 #define CLIENT_WAIT_S  30 /* the client waits this long for the answer */
 
 typedef struct {
@@ -295,24 +301,57 @@ static void accept_cell(void)
 
 /* ---- the admin socket ---- */
 
+/* Waits for fd to be ready for ev: 1, or 0 at the deadline (mono_us) or
+ * once SIGTERM has come (the poll is interrupted, and the stop wins). */
+static int admin_wait(int fd, short ev, uint64_t deadline)
+{
+    for (;;) {
+        uint64_t now = mono_us();
+        if (g_stop || now >= deadline) return 0;
+        struct pollfd p = { fd, ev, 0 };
+        int r = poll(&p, 1, (int)((deadline - now + 999u) / 1000u));
+        if (r > 0) return 1;
+        if (r < 0 && errno != EINTR) return 0;
+    }
+}
+
+/* All of p to the admin peer before the deadline: 0 or -1. */
+static int admin_send(int fd, const char *p, size_t n, uint64_t deadline)
+{
+    while (n > 0) {
+        if (!admin_wait(fd, POLLOUT, deadline)) return -1;
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+        if (w < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (w <= 0) return -1;
+        p += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
 static void serve_admin(void)
 {
-    int fd = accept4(D.admin_l, NULL, NULL, SOCK_CLOEXEC);
+    int fd = accept4(D.admin_l, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
     if (fd < 0) return;
     struct ucred cr;
     socklen_t cl = sizeof(cr);
-    struct timeval tv = { ADMIN_IO_S, 0 };
     char req[ADMIN_REQ_MAX + 1], what[48];
     size_t n = 0;
     int rc, cut = 0;
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    uint64_t deadline = mono_us() + ADMIN_IO_S * 1000000ull;
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) != 0) cr.uid = (uid_t)-1;
     for (;;) {
-        ssize_t r = read(fd, req + n, ADMIN_REQ_MAX + 1u - n);
-        if (r < 0 && errno == EINTR) continue;
-        if (r < 0) cut = 1; /* timed out: the words may be incomplete */
+        if (!admin_wait(fd, POLLIN, deadline)) {
+            /* Too slow, or oc-core is stopping: dropped unanswered, nothing run. */
+            if (!g_stop) oc_log(OC_LOG_WARNING, "admin (uid %u): the request took more than %d s: dropped",
+                               (unsigned)cr.uid, ADMIN_IO_S);
+            oc_sig_wipe(req, sizeof(req));
+            close(fd);
+            return;
+        }
+        ssize_t r = recv(fd, req + n, ADMIN_REQ_MAX + 1u - n, 0);
+        if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (r < 0) cut = 1; /* a read error: the words may be incomplete */
         if (r <= 0) break;
         n += (size_t)r;
         if (n > ADMIN_REQ_MAX) {
@@ -356,7 +395,12 @@ static void serve_admin(void)
     int hn = snprintf(head, sizeof(head), "%d\n", rc);
     /* rc is 1 when the output could not be made whole (oc_admin.h): what
      * there is goes out, marked failed. */
-    if (write_all(fd, head, (size_t)hn) == 0 && out.p != NULL) write_all(fd, out.p, out.n);
+    deadline = mono_us() + ADMIN_IO_S * 1000000ull; /* the answer's own budget */
+    if (admin_send(fd, head, (size_t)hn, deadline) != 0 ||
+        (out.p != NULL && admin_send(fd, out.p, out.n, deadline) != 0)) {
+        oc_log(OC_LOG_WARNING, "admin (uid %u): the answer was not taken within %d s: dropped", (unsigned)cr.uid,
+               ADMIN_IO_S);
+    }
     oc_buf_free(&out);        /* wiped */
     oc_sig_wipe(req, sizeof(req)); /* the words (an import path, a number) */
     close(fd);
@@ -384,7 +428,8 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     oc_core_store_t st = oc_sql_store(D.sql);
     const oc_core_io_t io = { NULL, k_send, k_close, k_random, k_unix, oc_log_line };
     if (oc_core_init(&D.core, &io, &st, &D.route, &D.cfg) != 0) {
-        oc_log(OC_LOG_ERR, "network key %u can't be read from %s: if it was never made, run `oc-core admin --offline net init`",
+        oc_log(OC_LOG_ERR,
+               "network key %u can't be read from %s: if it was never made, run `oc-core admin --offline net init`",
                D.cfg.key_id, D.db);
         goto out;
     }
@@ -479,6 +524,49 @@ static int drop_to_db_owner(void)
     return 0;
 }
 
+/* First setup on a fresh machine: the database's directory (the unit's
+ * StateDirectory, which systemd makes only when the unit first starts) is
+ * made if missing - 0700, and as root owned by DAEMON_USER, as systemd
+ * would make it; missing parents 0755. An existing directory is left as it
+ * is. 0 or -1. */
+static int make_db_dir(void)
+{
+    char buf[512];
+    struct stat st;
+    snprintf(buf, sizeof(buf), "%s", D.db);
+    char *dir = dirname(buf);
+    if (stat(dir, &st) == 0) return 0;
+    if (errno != ENOENT) {
+        oc_log(OC_LOG_ERR, "%s: %s", dir, strerror(errno));
+        return -1;
+    }
+    for (char *p = dir + 1; *p != '\0'; p++) { /* the parents */
+        if (*p != '/') continue;
+        *p = '\0';
+        int r = mkdir(dir, 0755);
+        *p = '/';
+        if (r != 0 && errno != EEXIST) {
+            oc_log(OC_LOG_ERR, "%.*s: %s", (int)(p - dir), dir, strerror(errno));
+            return -1;
+        }
+    }
+    if (mkdir(dir, 0700) != 0 || chmod(dir, 0700) != 0) {
+        oc_log(OC_LOG_ERR, "%s: %s", dir, strerror(errno));
+        return -1;
+    }
+    if (geteuid() == 0) {
+        struct passwd *pw = getpwnam(DAEMON_USER);
+        if (pw == NULL) {
+            oc_log(OC_LOG_WARNING, "%s made, root's: there is no user %s to give it to", dir, DAEMON_USER);
+        } else if (chown(dir, pw->pw_uid, pw->pw_gid) != 0) {
+            oc_log(OC_LOG_ERR, "%s: can't give it to %s: %s", dir, DAEMON_USER, strerror(errno));
+            return -1;
+        }
+    }
+    oc_log(OC_LOG_NOTICE, "%s made (0700)", dir);
+    return 0;
+}
+
 /* Under sudo, the operator behind uid 0 (sudo sets SUDO_UID); 0: none. */
 static uint32_t sudo_uid(uid_t uid)
 {
@@ -501,7 +589,7 @@ static int admin_offline(const char *config, const char *key_file, const char *d
         oc_sig_wipe(D.key, sizeof(D.key));
         return 1;
     }
-    if (drop_to_db_owner() != 0 || open_db() != 0) {
+    if (make_db_dir() != 0 || drop_to_db_owner() != 0 || open_db() != 0) {
         oc_sig_wipe(D.key, sizeof(D.key));
         return 1;
     }
@@ -563,7 +651,7 @@ static int admin_client(const char *sock, int argc, char **argv)
     char buf[4096];
     ssize_t r;
     while ((r = read(fd, buf, sizeof(buf))) > 0 || (r < 0 && errno == EINTR)) {
-        if (r > 0) oc_buf_printf(&in, "%.*s", (int)r, buf);
+        if (r > 0) oc_buf_add(&in, buf, (size_t)r); /* bytes as they come: a NUL does not end them */
     }
     oc_sig_wipe(buf, sizeof(buf)); /* the answer may be an activation code */
     close(fd);

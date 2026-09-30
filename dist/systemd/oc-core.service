@@ -6,7 +6,9 @@
 # and oc_key_load takes either). Group oc-admin may use the admin socket;
 # group oc-cell the cell socket (a single site runs oc-cell on the same
 # machine). Plan 9 (the VM, TLS) drops oc-cell from SupplementaryGroups
-# there. First setup, with the service stopped:
+# there. First setup, with the service stopped (--offline makes the
+# database's directory, /var/lib/opencell/core, oc-core's and 0700, if the
+# unit has not run yet):
 #   sudo oc-core admin --offline --key-file /etc/opencell/master.key net init
 [Unit]
 Description=OpenCell network core (oc-core)
@@ -25,11 +27,31 @@ StateDirectory=opencell/core
 StateDirectoryMode=0700
 Restart=on-failure
 RestartSec=2
+UMask=0077
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+# Unix sockets only (the cell and admin sockets, NSS): plan 9 adds AF_INET
+# and AF_INET6 for the cells' TLS links.
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RemoveIPC=yes
 
 [Install]
 WantedBy=multi-user.target

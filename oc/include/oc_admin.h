@@ -45,6 +45,8 @@ typedef struct {
 } oc_buf_t;
 
 void oc_buf_printf(oc_buf_t *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* n bytes as they are (NULs too); p stays NUL-terminated after them. */
+void oc_buf_add(oc_buf_t *b, const void *data, size_t n);
 void oc_buf_free(oc_buf_t *b);
 
 typedef struct {

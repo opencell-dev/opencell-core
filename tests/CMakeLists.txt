@@ -25,8 +25,12 @@ oc_test(test_oc_seal oc_store)
 oc_test(test_oc_sql oc_store)
 oc_test(test_oc_admin oc_store)
 
-# oc-core as a process, with a bare cell (tool_oc_hello) to speak HELLO.
+# oc-core as a process, with a bare cell (tool_oc_hello) to speak HELLO and a
+# slow admin peer (tool_oc_drip).
 add_executable(tool_oc_hello tool_oc_hello.c)
 target_link_libraries(tool_oc_hello PRIVATE oc_util)
+add_executable(tool_oc_drip tool_oc_drip.c)
+target_link_libraries(tool_oc_drip PRIVATE oc_util)
 add_test(NAME test_oc_core_proc
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_core_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_hello>)
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_core_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_hello>
+                 $<TARGET_FILE:tool_oc_drip>)

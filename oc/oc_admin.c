@@ -16,23 +16,20 @@
 
 /* ---- output ---- */
 
-void oc_buf_printf(oc_buf_t *b, const char *fmt, ...)
+/* Room for n more bytes and a NUL: 0, or -1 with b->err set. */
+static int buf_room(oc_buf_t *b, size_t n)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-    if (n < 0 || (size_t)n > SIZE_MAX / 4u - b->n) {
+    if (n > SIZE_MAX / 4u - b->n) {
         b->err = 1;
-        return;
+        return -1;
     }
-    if (b->n + (size_t)n + 1u > b->cap) {
+    if (b->n + n + 1u > b->cap) {
         size_t cap = (b->cap == 0 ? 1024u : b->cap);
-        while (cap < b->n + (size_t)n + 1u) cap *= 2u;
+        while (cap < b->n + n + 1u) cap *= 2u;
         char *p = malloc(cap); /* not realloc: the old buffer (an activation code, say) is wiped first */
         if (p == NULL) {
             b->err = 1; /* the caller must not take a cut output for a whole one */
-            return;
+            return -1;
         }
         if (b->p != NULL) {
             memcpy(p, b->p, b->n + 1u);
@@ -42,10 +39,32 @@ void oc_buf_printf(oc_buf_t *b, const char *fmt, ...)
         b->p = p;
         b->cap = cap;
     }
+    return 0;
+}
+
+void oc_buf_printf(oc_buf_t *b, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        b->err = 1;
+        return;
+    }
+    if (buf_room(b, (size_t)n) != 0) return;
     va_start(ap, fmt);
     vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
     va_end(ap);
     b->n += (size_t)n;
+}
+
+void oc_buf_add(oc_buf_t *b, const void *data, size_t n)
+{
+    if (buf_room(b, n) != 0) return;
+    memcpy(b->p + b->n, data, n);
+    b->n += n;
+    b->p[b->n] = '\0';
 }
 
 void oc_buf_free(oc_buf_t *b)

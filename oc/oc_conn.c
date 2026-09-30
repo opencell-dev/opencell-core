@@ -52,12 +52,11 @@ int oc_conn_read(oc_conn_t *c, oc_conn_rx_fn cb, void *ctx)
             if (len == 0 || len + 2u > OC_CORE_FRAME_MAX) return -1; /* the stream is broken */
             if (c->rn - off < len + 2u) break;
             oc_core_msg_t m;
-            if (oc_core_decode(c->rx + off, len + 2u, &m) == 0) {
-                cb(ctx, &m);
-                if (c->fd < 0) return -1; /* cb closed it */
-            } else {
-                c->bad++;
-            }
+            int ok = oc_core_decode(c->rx + off, len + 2u, &m) == 0;
+            if (ok) cb(ctx, &m);
+            oc_sig_wipe(&m, sizeof(m)); /* an AV_RES's CK and IK (oc-cell's side) */
+            if (!ok) c->bad++;
+            else if (c->fd < 0) return -1; /* cb closed it */
             off += len + 2u;
         }
         memmove(c->rx, c->rx + off, c->rn - off);

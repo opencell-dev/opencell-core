@@ -527,6 +527,23 @@ static void test_audit_names_the_operator_behind_sudo(void)
     done();
 }
 
+/* The admin client collects the daemon's answer as bytes: a NUL in it
+ * doesn't end it, and it grows past the first allocation. */
+static void test_buf_add_takes_raw_bytes(void)
+{
+    oc_buf_t b = { 0 };
+    static const char chunk[] = { 'a', '\0', 'b' };
+    for (int i = 0; i < 1000; i++) oc_buf_add(&b, chunk, sizeof(chunk));
+    TEST_ASSERT_EQUAL_INT(0, b.err);
+    TEST_ASSERT_EQUAL_size_t(3000, b.n);
+    TEST_ASSERT_EQUAL_MEMORY(chunk, b.p + 2997, 3);
+    TEST_ASSERT_EQUAL_CHAR('\0', b.p[3000]);
+    oc_buf_printf(&b, "%s", "z");
+    TEST_ASSERT_EQUAL_size_t(3001, b.n);
+    TEST_ASSERT_EQUAL_CHAR('z', b.p[3000]);
+    oc_buf_free(&b);
+}
+
 static void write_raw(const char *data, size_t n)
 {
     strcpy(hss, "/tmp/oc_admin_hss_XXXXXX");
@@ -663,6 +680,7 @@ int main(void)
     RUN_TEST(test_an_allocation_failure_is_a_failure);
     RUN_TEST(test_audit_detail_drops_c1_controls);
     RUN_TEST(test_audit_names_the_operator_behind_sudo);
+    RUN_TEST(test_buf_add_takes_raw_bytes);
     RUN_TEST(test_import_parser_cases);
     RUN_TEST(test_import_takes_the_write_lock_first);
     RUN_TEST(test_first_setup_and_subscribers);

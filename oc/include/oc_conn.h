@@ -10,8 +10,9 @@
  * bad number) is dropped and counted in bad, and the link stays up.
  *
  * Bytes are wiped once done with (oc_sig_wipe): a frame's encoding once
- * queued, queued bytes once sent, read bytes once handed on, and both
- * buffers at close - the transport's part of oc_core.h's rule for AV_RES
+ * queued, queued bytes once sent, read bytes and the decoded message once
+ * handed on (the callback must copy what it keeps), and both buffers at
+ * close - the transport's part of oc_core.h's rule for AV_RES
  * frames (CK, IK). */
 #ifndef OC_CONN_H
 #define OC_CONN_H

@@ -10,8 +10,9 @@
  * One thread: a poll() loop feeds oc_core the cells' frames and tick(now),
  * with SQLite on the same thread. Cells connect to cell_socket (the §6
  * Unix socket); `oc-core admin` talks to admin_socket, one command per
- * connection: the client sends its words, each ending in a NUL, and shuts
- * its side; the daemon answers "<status> <bytes>\n" and the command's
+ * connection: the client sends its words, each ending in a NUL (as root
+ * under sudo, led by its SUDO_UID: oc_admin_sudo_field), and shuts its
+ * side; the daemon answers "<status> <bytes>\n" and the command's
  * output, which the client counts (a cut answer is a failure). The
  * master key comes from --key-file or the systemd credential master.key
  * ($CREDENTIALS_DIRECTORY). Logs go to stderr with journald priorities.
@@ -404,9 +405,19 @@ static void serve_admin(void)
             break;
         }
     }
+    /* A root client under sudo leads with its SUDO_UID (oc_admin.h): not
+     * one of the command's words. */
+    uint32_t sudo = 0;
+    int bad_sudo = 0;
+    size_t start = 0;
+    if (!cut && n > 0 && memchr(req, '\0', n) != NULL) {
+        int f = oc_admin_sudo_field(req, (uint32_t)cr.uid, &sudo);
+        bad_sudo = f < 0;
+        if (f == 1) start = strlen(req) + 1u;
+    }
     char *argv[ADMIN_ARGS_MAX];
     int argc = 0;
-    for (size_t i = 0; !cut && i < n; i += strlen(req + i) + 1u) {
+    for (size_t i = start; !cut && !bad_sudo && i < n; i += strlen(req + i) + 1u) {
         if (argc == ADMIN_ARGS_MAX || memchr(req + i, '\0', n - i) == NULL) {
             cut = 1; /* too many words, or the last without its NUL */
             break;
@@ -414,7 +425,21 @@ static void serve_admin(void)
         argv[argc++] = req + i;
     }
     oc_buf_t out = { 0 };
-    if (cut) {
+    char who[48];
+    if (sudo != 0) {
+        snprintf(who, sizeof(who), "uid %u, sudo u%u", (unsigned)cr.uid, (unsigned)sudo);
+    } else {
+        snprintf(who, sizeof(who), "uid %u", (unsigned)cr.uid);
+    }
+    if (bad_sudo) {
+        /* A sudo uid is root's claim; from anyone else, or malformed, the
+         * request is refused whole. */
+        rc = 2;
+        snprintf(what, sizeof(what), "(a request with a bad sudo field)");
+        oc_log(OC_LOG_WARNING, "admin (%s): %s: refused", who,
+               cr.uid == 0 ? "a malformed sudo field" : "a sudo uid from a peer that is not root");
+        oc_buf_printf(&out, "the request's sudo field is malformed, or its peer is not root\n");
+    } else if (cut) {
         /* Never run part of a command: its first words may be another one. */
         rc = 2;
         snprintf(what, sizeof(what), "(a request that is cut short or too long)");
@@ -431,11 +456,12 @@ static void serve_admin(void)
         a.now_us = mono_us;
         a.drop_cell = drop_cell;
         a.uid = (uint32_t)cr.uid;
+        a.sudo_uid = sudo;
         rc = oc_admin_run(&a, argc, argv, &out); /* audited there, the words cleaned */
         snprintf(what, sizeof(what), "%s%s", argc > 0 ? argv[0] : "", argc > 1 ? " ..." : "");
     }
     oc_log_clean(what); /* the peer's words: no line of their own in the journal */
-    oc_log(OC_LOG_INFO, "admin (uid %u): %s -> %d%s", (unsigned)cr.uid, what, rc, out.err ? " (output cut)" : "");
+    oc_log(OC_LOG_INFO, "admin (%s): %s -> %d%s", who, what, rc, out.err ? " (output cut)" : "");
     /* The head carries the answer's size, so a peer can tell a cut one (a
      * drop at the deadline) from a whole one. rc is 1 when the output could
      * not be made whole (oc_admin.h): what there is goes out, marked failed. */
@@ -447,8 +473,8 @@ static void serve_admin(void)
     if (why == AIO_OK && len > 0) why = admin_send(fd, out.p, len, deadline, &err);
     if (why != AIO_OK) {
         char b[80];
-        oc_log(why == AIO_STOP ? OC_LOG_INFO : OC_LOG_WARNING, "admin (uid %u): the answer was dropped: %s",
-               (unsigned)cr.uid, aio_why(why, err, b, sizeof(b)));
+        oc_log(why == AIO_STOP ? OC_LOG_INFO : OC_LOG_WARNING, "admin (%s): the answer was dropped: %s", who,
+               aio_why(why, err, b, sizeof(b)));
     }
     oc_buf_free(&out);        /* wiped */
     oc_sig_wipe(req, sizeof(req)); /* the words (an import path, a number) */
@@ -709,7 +735,13 @@ static void draw_qr(const char *text)
 
 static int admin_client(const char *sock, int argc, char **argv)
 {
-    size_t need = 0;
+    /* As root under sudo, the operator behind it goes first (oc_admin.h),
+     * for the audit record. */
+    char field[sizeof(OC_ADMIN_SUDO_FIELD) + 10];
+    uint32_t su = sudo_uid(geteuid());
+    field[0] = '\0';
+    if (su != 0) snprintf(field, sizeof(field), OC_ADMIN_SUDO_FIELD "%u", (unsigned)su);
+    size_t need = field[0] != '\0' ? strlen(field) + 1u : 0;
     for (int i = 0; i < argc; i++) need += strlen(argv[i]) + 1u;
     if (argc > ADMIN_ARGS_MAX || need > ADMIN_REQ_MAX) {
         fprintf(stderr, "a command of at most %d words and %u bytes\n", ADMIN_ARGS_MAX, ADMIN_REQ_MAX);
@@ -729,6 +761,11 @@ static int admin_client(const char *sock, int argc, char **argv)
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (field[0] != '\0' && write_all(fd, field, strlen(field) + 1u) != 0) {
+        fprintf(stderr, "%s: %s\n", sock, strerror(errno));
+        close(fd);
+        return 1;
+    }
     for (int i = 0; i < argc; i++) {
         if (write_all(fd, argv[i], strlen(argv[i]) + 1u) != 0) {
             fprintf(stderr, "%s: %s\n", sock, strerror(errno));

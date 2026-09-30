@@ -64,9 +64,10 @@ typedef struct {
      * process becomes the database's owner. Recorded only:
      * nothing here grants or refuses by it. */
     uint32_t uid;
-    /* offline as root under sudo: SUDO_UID, the operator behind uid 0,
-     * recorded as "u0 (sudo u<N>)"; 0: none. As the environment claims it:
-     * recorded only. */
+    /* as root under sudo: SUDO_UID, the operator behind uid 0, recorded as
+     * "u0 (sudo u<N>)"; 0: none. Offline, from the environment; over the
+     * socket, the root client's claim (oc_admin_sudo_field). Recorded only,
+     * as claimed by root. */
     uint32_t sudo_uid;
     /* private */
     oc_core_t own;
@@ -78,6 +79,18 @@ typedef struct {
  * 0 done, 1 refused or failed (out says why), 2 not a command (out has the
  * usage). */
 int oc_admin_run(oc_admin_t *a, int argc, char **argv, oc_buf_t *out);
+
+/* Over the admin socket, a root client under sudo (euid 0, SUDO_UID set)
+ * sends OC_ADMIN_SUDO_FIELD<SUDO_UID> as its request's first word, ahead
+ * of the command's (no command word starts with "--"). The daemon checks it
+ * with this: 0, word is not such a field (the command starts there); 1, a
+ * well-formed field from a root peer, *sudo_uid set; -1, a word starting
+ * with "--" that is not a well-formed field (1 to 10 digits, no leading
+ * zero, 1 to 2^32 - 1), or a field from a peer that is not root: the
+ * request is refused, nothing run. Only root (and oc-admin) can connect, so
+ * the uid is root's claim, as SUDO_UID is offline. */
+#define OC_ADMIN_SUDO_FIELD "--sudo-uid="
+int oc_admin_sudo_field(const char *word, uint32_t peer_uid, uint32_t *sudo_uid);
 
 /* "917.25,922.25:fixed" (MHz on the 915 grid, at most OC_SIG_CHAN_MAX, no
  * spaces), or "" / "none" for an empty list. 0, or -1 with err set. */

@@ -527,6 +527,36 @@ static void test_audit_names_the_operator_behind_sudo(void)
     done();
 }
 
+/* Over the socket under sudo: the client, running as root, sends
+ * OC_ADMIN_SUDO_FIELD<SUDO_UID> as its request's first word. The daemon takes
+ * it only from a root peer and only well formed (1-10 digits, no leading
+ * zero, at most 2^32 - 1); anything else starting with "--" refuses the
+ * request. No command starts with "--". */
+static void test_the_sudo_field_is_strict_and_root_only(void)
+{
+    uint32_t su = 7;
+    TEST_ASSERT_EQUAL_INT(1, oc_admin_sudo_field(OC_ADMIN_SUDO_FIELD "1000", 0, &su));
+    TEST_ASSERT_EQUAL_UINT32(1000, su);
+    TEST_ASSERT_EQUAL_INT(1, oc_admin_sudo_field(OC_ADMIN_SUDO_FIELD "4294967295", 0, &su));
+    TEST_ASSERT_EQUAL_UINT32(4294967295u, su);
+    su = 7;
+    TEST_ASSERT_EQUAL_INT(0, oc_admin_sudo_field("status", 0, &su)); /* a command: no field */
+    TEST_ASSERT_EQUAL_INT(0, oc_admin_sudo_field("status", 1000, &su));
+    TEST_ASSERT_EQUAL_INT(0, oc_admin_sudo_field("", 0, &su));
+    TEST_ASSERT_EQUAL_UINT32(7, su);
+    TEST_ASSERT_EQUAL_INT(-1, oc_admin_sudo_field(OC_ADMIN_SUDO_FIELD "1000", 1000, &su)); /* not root's */
+    static const char *const bad[] = { OC_ADMIN_SUDO_FIELD, OC_ADMIN_SUDO_FIELD "0", OC_ADMIN_SUDO_FIELD "01000",
+                                       OC_ADMIN_SUDO_FIELD "4294967296", OC_ADMIN_SUDO_FIELD "12345678901",
+                                       OC_ADMIN_SUDO_FIELD "10a", OC_ADMIN_SUDO_FIELD "+10",
+                                       OC_ADMIN_SUDO_FIELD " 10", OC_ADMIN_SUDO_FIELD "10 ", OC_ADMIN_SUDO_FIELD "-1",
+                                       "--sudo-uid", "--sudo-uid:10", "--other=10", "--", "--status" };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        su = 7;
+        TEST_ASSERT_EQUAL_INT_MESSAGE(-1, oc_admin_sudo_field(bad[i], 0, &su), bad[i]);
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(7, su, bad[i]);
+    }
+}
+
 /* The admin client collects the daemon's answer as bytes: a NUL in it
  * doesn't end it, and it grows past the first allocation. */
 static void test_buf_add_takes_raw_bytes(void)
@@ -680,6 +710,7 @@ int main(void)
     RUN_TEST(test_an_allocation_failure_is_a_failure);
     RUN_TEST(test_audit_detail_drops_c1_controls);
     RUN_TEST(test_audit_names_the_operator_behind_sudo);
+    RUN_TEST(test_the_sudo_field_is_strict_and_root_only);
     RUN_TEST(test_buf_add_takes_raw_bytes);
     RUN_TEST(test_import_parser_cases);
     RUN_TEST(test_import_takes_the_write_lock_first);

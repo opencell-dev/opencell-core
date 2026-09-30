@@ -210,6 +210,43 @@ expect "$out" "^#1 +883160655501234 -> +883160655500100  cells 1 -> 0  answered,
 stop
 DB=$T/core.db
 
+# `sudo oc-core admin ...` over the socket: the client, as root, sends its
+# SUDO_UID and the daemon records the claim as "u0 (sudo uN)". Not as root,
+# the client sends none, and a peer that is not root sending one is refused,
+# nothing run.
+start --key-file "$T/key"
+out=$(SUDO_UID=4242 "$OC" admin --socket "$T/admin.sock" status 2>&1) || fail "status with SUDO_UID: $out"
+out=$("$DRIP" --late-read "$T/admin.sock" 0 --sudo-uid=4242 status) || fail "sudo field: $out"
+expect "$out" "^rc 2$"
+grep -q "admin (uid $ME): a sudo uid from a peer that is not root: refused" "$T/log" ||
+    fail "a sudo uid from a peer that is not root was not logged"
+out=$("$OC" admin --socket "$T/admin.sock" audit 2 2>&1) || fail "audit: $out"
+expect "$out" "ADMIN .* u$ME status"
+grep -q "4242" <<<"$out" && fail "a sudo uid was recorded for a peer that is not root: $out"
+stop
+# As root in a user namespace (the daemon too, so the peer is uid 0 to it).
+if unshare -r true 2>/dev/null; then
+    timeout 30 unshare -r bash -c '
+        OC=$1 T=$2
+        "$OC" --config "$T/oc-core.conf" --db "$T/core.db" --key-file "$T/key" 2>>"$T/log" &
+        pid=$!
+        trap "kill $pid 2>/dev/null" EXIT
+        for _ in $(seq 50); do [ -S "$T/admin.sock" ] && break; sleep 0.1; done
+        SUDO_UID=4242 "$OC" admin --socket "$T/admin.sock" status >/dev/null || echo "status failed"
+        SUDO_UID=12x "$OC" admin --socket "$T/admin.sock" cell list >/dev/null || echo "cell list failed"
+        "$OC" admin --socket "$T/admin.sock" audit 3
+        kill -TERM $pid
+        wait $pid || echo "exit status $?"
+    ' _ "$OC" "$T" >"$T/userns" 2>&1
+    out=$(cat "$T/userns")
+    grep -q "failed\|exit status" <<<"$out" && fail "as root in a user namespace: $out"
+    expect "$out" "ADMIN .* u0 (sudo u4242) status"
+    expect "$out" "ADMIN .* u0 cell list" # SUDO_UID not a number: no claim sent
+    grep -q 'admin (uid 0, sudo u4242): status -> 0' "$T/log" || fail "the sudo uid is not in the log line"
+else
+    echo "note: no user namespaces here: the root client's sudo uid is not tried"
+fi
+
 out=$(env -u CREDENTIALS_DIRECTORY "$OC" --config "$T/oc-core.conf" --db "$T/core.db" 2>&1) && fail "started with no key"
 expect "$out" "no master key"
 head -c 32 /dev/urandom >"$T/key2" && chmod 0400 "$T/key2"

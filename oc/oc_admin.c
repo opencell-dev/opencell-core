@@ -747,6 +747,24 @@ static void audit(oc_admin_t *a, int argc, char **argv, int rc, oc_buf_t *out)
     }
 }
 
+int oc_admin_sudo_field(const char *word, uint32_t peer_uid, uint32_t *sudo_uid)
+{
+    static const char F[] = OC_ADMIN_SUDO_FIELD;
+    if (strncmp(word, "--", 2) != 0) return 0;
+    if (strncmp(word, F, sizeof(F) - 1u) != 0 || peer_uid != 0) return -1;
+    const char *d = word + sizeof(F) - 1u;
+    size_t n = strlen(d);
+    if (n < 1u || n > 10u || d[0] == '0') return -1;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (d[i] < '0' || d[i] > '9') return -1;
+        v = v * 10u + (uint64_t)(d[i] - '0');
+    }
+    if (v > 0xffffffffu) return -1;
+    *sudo_uid = (uint32_t)v;
+    return 1;
+}
+
 int oc_admin_run(oc_admin_t *a, int argc, char **argv, oc_buf_t *out)
 {
     int rc = 2;

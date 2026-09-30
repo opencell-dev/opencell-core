@@ -10,8 +10,9 @@
  *       in full (each leaves an audit record). Prints "flooded N".
  *   tool_oc_drip --late-read SOCKET PAUSE_S WORD...
  *       Sends a request at once, reads nothing for PAUSE_S, then reads the
- *       answer. Prints "expected E got G" (E from the answer's head
- *       "RC BYTES\n", G the bytes after it), and "cut" if G < E.
+ *       answer. Prints "rc RC" and "expected E got G" (RC and E from the
+ *       answer's head "RC BYTES\n", G the bytes after it), and "cut" if
+ *       G < E.
  *   tool_oc_drip --hang-up SOCKET WORD...
  *       Sends a request and closes at once, taking no answer.
  *   tool_oc_drip --serve SOCKET ANSWER
@@ -139,6 +140,7 @@ static int late_read(int argc, char **argv)
         }
     }
     close(fd);
+    printf("rc %.*s\n", (int)strcspn(head, " "), head);
     printf("expected %llu got %zu\n", expected, got);
     if (got < expected) printf("cut\n");
     return 0;

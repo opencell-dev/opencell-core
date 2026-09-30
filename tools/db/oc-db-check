@@ -231,15 +231,30 @@ HANDOFF_PREFIXES = ("no-leader", "leader-away", "not-sync", "lag", "slot", "arch
                     "member", "etcd", "etcd-quorum")
 
 
-def drop_handoff_conditions(state):
+def is_handoff_key(key, clusters):
+    """True for a key evaluate() only raises while covering for a silent London
+    (review M10, N4): the fixed prefixes, and collect:<cluster>:... for a
+    cluster this host actually watches (collect:etcd, collect:wireguard, ... are
+    host-level and never dropped -- only a cluster-scoped collect: failure, such
+    as "cannot query the primary as oc_monitor", is the witness's to re-raise)."""
+    prefix, _, rest = key.partition(":")
+    if prefix in HANDOFF_PREFIXES:
+        return True
+    if prefix == "collect":
+        cluster, _, _ = rest.partition(":")
+        return cluster in clusters
+    return False
+
+
+def drop_handoff_conditions(state, clusters):
     """Called once London is reachable again on a role=member run: silently forget
     any cluster conditions raised while this host was covering, without a "clear"
     event (no CLEARED mail for a fault that has simply changed owners)."""
     conds = state.get("conditions", {})
     pending = state.get("pending", [])
-    for key in [k for k in conds if k.split(":", 1)[0] in HANDOFF_PREFIXES]:
+    for key in [k for k in conds if is_handoff_key(k, clusters)]:
         del conds[key]
-    pending[:] = [p for p in pending if p[2].split(":", 1)[0] not in HANDOFF_PREFIXES]
+    pending[:] = [p for p in pending if not is_handoff_key(p[2], clusters)]
     return state
 
 
@@ -320,9 +335,12 @@ def rest_get(url, cfg):
 
 def psql(host, port, db, user, sql, cfg):
     ca, crt, key = tls_files(cfg)
-    # statement_timeout (review I1): a heartbeat insert waiting on a stalled sync
-    # standby must not be free to run the full subprocess timeout -- oc-db-check's
-    # own systemd budget (TimeoutStartSec) has to add up across every call it makes.
+    # statement_timeout bounds the read-only queries (PRIMARY_SQL) so a stalled
+    # planner/lock wait cannot run free. It does NOT bound the heartbeat INSERT on
+    # oc-east: Postgres disables statement_timeout for the synchronous-replication
+    # wait during commit (finish_xact_command, review N3), so that call is bounded
+    # only by the subprocess timeout below -- which is why that timeout, not this
+    # setting, is what the systemd unit's TimeoutStartSec budget is built from.
     conn = (f"host={host} port={port} dbname={db} user={user} sslmode=verify-full sslrootcert={ca} "
             f"sslcert={crt} sslkey={key} connect_timeout=5 application_name=oc-db-check "
             f"options='-c statement_timeout=8000'")
@@ -516,7 +534,7 @@ def main(argv):
     # (evaluate() below) -- drop what it raised while covering without a CLEARED
     # mail, so the witness (which re-checks on its own hold) is the one voice.
     if cfg["role"] == "member" and cfg["london_etcd"] and london_is_ok(facts, cfg):
-        state = drop_handoff_conditions(state)
+        state = drop_handoff_conditions(state, cfg["clusters"])
     current = evaluate(facts, cfg, now)
     state, events = update_state(state, current, now)
     state["archive_failed"] = {}

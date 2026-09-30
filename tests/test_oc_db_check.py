@@ -276,6 +276,8 @@ class Parse(unittest.TestCase):
 
 
 class Handoff(unittest.TestCase):
+    CLUSTERS = ("oc-east", "oc-west")
+
     def test_drop_handoff_conditions_removes_only_cluster_keys(self):
         # review M10
         state = {"conditions": {
@@ -284,9 +286,27 @@ class Handoff(unittest.TestCase):
             "wg:oc-core-2": {"first": NOW - 1000, "raised": True, "message": "m2",
                               "level": "warning", "absent_since": None}},
             "pending": [["raise", "critical", "no-leader:oc-east", "m1"]]}
-        chk.drop_handoff_conditions(state)
+        chk.drop_handoff_conditions(state, self.CLUSTERS)
         self.assertNotIn("no-leader:oc-east", state["conditions"])
         self.assertIn("wg:oc-core-2", state["conditions"])  # not a cluster-check key: untouched
+        self.assertEqual(state["pending"], [])
+
+    def test_drop_handoff_conditions_removes_cluster_scoped_collect_keys(self):
+        # review N4: collect:oc-east:primary is cluster-scoped (evaluate() only
+        # raises it while covering) and must drop; collect:etcd and
+        # collect:wireguard are host-level and must not.
+        state = {"conditions": {
+            "collect:oc-east:primary": {"first": NOW - 1000, "raised": True, "message": "m1",
+                                         "level": "warning", "absent_since": None},
+            "collect:etcd": {"first": NOW - 1000, "raised": True, "message": "m2",
+                              "level": "warning", "absent_since": None},
+            "collect:wireguard": {"first": NOW - 1000, "raised": True, "message": "m3",
+                                   "level": "warning", "absent_since": None}},
+            "pending": [["raise", "warning", "collect:oc-east:primary", "m1"]]}
+        chk.drop_handoff_conditions(state, self.CLUSTERS)
+        self.assertNotIn("collect:oc-east:primary", state["conditions"])
+        self.assertIn("collect:etcd", state["conditions"])
+        self.assertIn("collect:wireguard", state["conditions"])
         self.assertEqual(state["pending"], [])
 
     def test_london_return_drops_member_conditions_without_a_clear(self):
@@ -299,11 +319,28 @@ class Handoff(unittest.TestCase):
             "no-leader:oc-east": {"first": NOW - 1000, "raised": True, "message": "old",
                                    "level": "critical", "absent_since": None}},
             "pending": []}
-        state = chk.drop_handoff_conditions(state)
+        state = chk.drop_handoff_conditions(state, cfg("member")["clusters"])
         current = chk.evaluate(f, cfg("member"), NOW)  # london_ok in f/cfg(): etcd all healthy
         state, ev = chk.update_state(state, current, NOW)
         self.assertEqual(ev, [])  # no CLEARED mail
         self.assertNotIn("no-leader:oc-east", state["conditions"])
+
+    def test_london_return_drops_collect_condition_without_a_clear(self):
+        # review N4, end to end: a role=member run raised collect:oc-east:primary
+        # while covering (cannot reach the primary as oc_monitor); London
+        # returns, and the same silent-drop applies to it.
+        f = healthy()
+        f["clusters"]["oc-east"]["primary"] = None
+        f["clusters"]["oc-east"]["primary_error"] = "connection refused"
+        state = {"conditions": {
+            "collect:oc-east:primary": {"first": NOW - 1000, "raised": True, "message": "old",
+                                         "level": "warning", "absent_since": None}},
+            "pending": []}
+        state = chk.drop_handoff_conditions(state, cfg("member")["clusters"])
+        current = chk.evaluate(f, cfg("member"), NOW)
+        state, ev = chk.update_state(state, current, NOW)
+        self.assertEqual(ev, [])
+        self.assertNotIn("collect:oc-east:primary", state["conditions"])
 
 
 class Main(unittest.TestCase):

@@ -54,6 +54,9 @@ add_test(NAME test_oc_db_check COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test_
                                        ${PROJECT_SOURCE_DIR}/tools/db/oc-db-check)
 add_test(NAME test_oc_db_tools COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_db_tools.sh ${PROJECT_SOURCE_DIR}/tools/db
                                        ${CMAKE_BINARY_DIR}/db-tools)
+# the OnFailure= mailer's rate-limit stamp and backend selection (review N1, N2, N5)
+add_test(NAME test_oc_db_alert_mail COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_db_alert_mail.py
+                                       ${PROJECT_SOURCE_DIR}/tools/db/oc-db-alert-mail)
 add_executable(test_oc_tls test_oc_tls.c)
 target_link_libraries(test_oc_tls PRIVATE oc_net unity)
 add_test(NAME test_oc_tls COMMAND test_oc_tls ${CMAKE_BINARY_DIR}/pki)

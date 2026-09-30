@@ -3,20 +3,25 @@
 [Unit]
 Description=OpenCell database checks and alerts
 After=network-online.target wg-quick@wg0.service
-# I1/M2: mail (same env file as oc-db-check's own alerts) when systemd itself
-# kills or fails a run -- the one case oc-db-check cannot report on itself.
+# I1/M2/N1: the rate-limited mailer (oc-db-alert-mail, at most one mail per
+# hour per unit) when systemd itself kills or fails a run -- the one case
+# oc-db-check cannot report on itself.
 OnFailure=oc-db-alert-failure@%n.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/oc-db-check
 StateDirectory=oc-db-check
-# I1: worst case, sequentially: REST (4 x 5 s) + psql (4 x 15 s, each bounded
-# by its own statement_timeout) + etcdctl (15 s) + pgbackrest info (60 s,
-# witness only) + wg (10 s) is around 165 s; 180 s leaves margin so a slow but
-# live run finishes and saves state/mails instead of being killed every
-# minute (which would mean the condition's hold never elapses and no alert is
-# ever raised).
+# I1: worst case, sequentially: REST (4 x 5 s) + psql (4 x 15 s) + etcdctl
+# (15 s) + pgbackrest info (60 s, witness only) + wg (10 s) is around 165 s;
+# 180 s leaves margin so a slow but live run finishes and saves state/mails
+# instead of being killed every minute (which would mean the condition's
+# hold never elapses and no alert is ever raised). N3: psql's own 15 s
+# subprocess cap, not statement_timeout, is what actually bounds each call --
+# Postgres disables statement_timeout for the synchronous-replication wait
+# during commit (finish_xact_command), so a heartbeat INSERT stuck behind a
+# stalled sync standby is bounded only by that 15 s. Do not lower it on the
+# assumption statement_timeout alone covers it.
 TimeoutStartSec=180
 Nice=5
 ProtectSystem=full

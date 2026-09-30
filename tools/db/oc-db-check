@@ -32,6 +32,12 @@ WAL_SEGMENT = 16 * 1024 * 1024
 SPOOL_CAP = 2 * 1024 * 1024 * 1024  # archive-push-queue-max (spec §10.3)
 DAY = 86400
 
+# A raised condition clears only after being continuously absent for at least
+# this long (review I2): a condition that flaps (an async archive-push retry
+# during a London outage, a disk hovering at the 80 % line) would otherwise
+# mail a CLEARED on every run it happens to be briefly absent.
+CLEAR_HOLD_MIN = 300
+
 # key prefix: (level, seconds the condition must last) -- spec §14.2
 RULES = {
     "no-leader": ("critical", 30),
@@ -98,10 +104,14 @@ def load_config(path):
 # ---------------------------------------------------------------- evaluate (pure)
 
 
+def london_is_ok(facts, cfg):
+    return any(e.get("health") and e["endpoint"] == cfg["london_etcd"] for e in facts.get("etcd", []))
+
+
 def evaluate(facts, cfg, now):
     """facts (from collect) -> {key: message}. Levels and durations come from RULES."""
     out = {}
-    london_ok = any(e.get("health") and e["endpoint"] == cfg["london_etcd"] for e in facts.get("etcd", []))
+    london_ok = london_is_ok(facts, cfg)
     if cfg["role"] == "member" and cfg["london_etcd"] and not london_ok:
         out["london-silent:"] = "London (oc-ldn-1) does not answer: no automatic failover if a second site fails"
     # The witness checks the clusters; oc-db-1 checks them too only while London is silent
@@ -142,7 +152,10 @@ def evaluate(facts, cfg, now):
                     if (s.get("retained") or 0) > 2 * 1024 ** 3:
                         out[f"slot:{name}:{s['name']}"] = f"{name}: slot {s['name']} retains {s['retained'] // 1024 ** 2} MB of WAL (cap 4 GB: runbook R3)"
                 arch = pg.get("archiver", {})
-                prev = facts.get("prev_archive_failed", {}).get(name)
+                # Keyed on (cluster, leader) (review I2): after a failover the new
+                # primary's own failed_count must not be compared with the old
+                # leader's, which could give a false alert or hide a real one.
+                prev = facts.get("prev_archive_failed", {}).get(f"{name}:{leader}")
                 if prev is not None and arch.get("failed_count", 0) > prev:
                     out[f"archive-failing:{name}"] = f"{name}: WAL archiving to London failed {arch['failed_count'] - prev} time(s) since the last check"
                 # WAL waiting to be archived (the .ready files) is the stall; an idle
@@ -209,12 +222,41 @@ def ago(t, now, future=False):
     return f"in {s}" if future else s
 
 
+# Keys evaluate() only raises while a member is covering for a silent London
+# (review M10). When London answers again, evaluate() simply stops reporting
+# them -- that must not read as "resolved": the witness still owns them and
+# re-raises after its own hold if the fault is still there.
+HANDOFF_PREFIXES = ("no-leader", "leader-away", "not-sync", "lag", "slot", "archive-failing",
+                    "archive-stale", "archive-queue", "archive-queue-high", "heartbeat",
+                    "member", "etcd", "etcd-quorum")
+
+
+def drop_handoff_conditions(state):
+    """Called once London is reachable again on a role=member run: silently forget
+    any cluster conditions raised while this host was covering, without a "clear"
+    event (no CLEARED mail for a fault that has simply changed owners)."""
+    conds = state.get("conditions", {})
+    pending = state.get("pending", [])
+    for key in [k for k in conds if k.split(":", 1)[0] in HANDOFF_PREFIXES]:
+        del conds[key]
+    pending[:] = [p for p in pending if p[2].split(":", 1)[0] not in HANDOFF_PREFIXES]
+    return state
+
+
 # ---------------------------------------------------------------- state (pure)
 
 
 def update_state(state, current, now):
     """state + {key: message} -> (state, events). An event is (kind, level, key, message),
-    kind "raise" or "clear", still to be mailed. Mailed events are dropped by mark_sent."""
+    kind "raise" or "clear", still to be mailed. Mailed events are dropped by mark_sent.
+
+    A raised condition clears only after it has been continuously absent for at
+    least max(hold, CLEAR_HOLD_MIN) s (review I2): otherwise a condition that
+    flaps mails a CLEARED and a RAISED on alternating runs. A condition that
+    reappears before its clear hold elapses just cancels the countdown -- no
+    event either way. A condition that was never raised is forgotten the first
+    run it is absent, as before (it was never mailed, so there is nothing to
+    clear)."""
     conds = state.setdefault("conditions", {})
     pending = state.setdefault("pending", [])
     for key, msg in current.items():
@@ -223,15 +265,23 @@ def update_state(state, current, now):
         if c is None:
             c = conds[key] = {"first": now, "raised": False}
         c["message"], c["level"] = msg, level
+        c["absent_since"] = None
         if not c["raised"] and now - c["first"] >= hold:
             c["raised"] = True
             pending.append(["raise", level, key, msg])
     for key in [k for k in conds if k not in current]:
-        c = conds.pop(key)
-        if c["raised"]:
-            pending.append(["clear", c["level"], key, c["message"]])
-        else:
+        c = conds[key]
+        if not c["raised"]:
+            del conds[key]
             pending[:] = [p for p in pending if p[2] != key]
+            continue
+        if c.get("absent_since") is None:
+            c["absent_since"] = now
+            continue
+        _, hold = rule(key)
+        if now - c["absent_since"] >= max(hold, CLEAR_HOLD_MIN):
+            pending.append(["clear", c["level"], key, c["message"]])
+            del conds[key]
     return state, list(pending)
 
 
@@ -270,15 +320,19 @@ def rest_get(url, cfg):
 
 def psql(host, port, db, user, sql, cfg):
     ca, crt, key = tls_files(cfg)
+    # statement_timeout (review I1): a heartbeat insert waiting on a stalled sync
+    # standby must not be free to run the full subprocess timeout -- oc-db-check's
+    # own systemd budget (TimeoutStartSec) has to add up across every call it makes.
     conn = (f"host={host} port={port} dbname={db} user={user} sslmode=verify-full sslrootcert={ca} "
-            f"sslcert={crt} sslkey={key} connect_timeout=5 application_name=oc-db-check")
+            f"sslcert={crt} sslkey={key} connect_timeout=5 application_name=oc-db-check "
+            f"options='-c statement_timeout=8000'")
     cmd = ["psql", conn, "-XAtqc", sql]
     if os.geteuid() == 0:
         # libpq refuses a key its own user owns with group access, which a
         # root-owned 0640 key is when the caller is root: read it as postgres
         # (group oc-db-tls), the way Postgres and Patroni do.
         cmd = ["runuser", "-u", "postgres", "--"] + cmd
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"psql exit {r.returncode}")
     return r.stdout.strip()
@@ -321,14 +375,25 @@ def collect(cfg, prev_state):
                     f["heartbeat"] = {"ok": True}
                 except Exception as e:  # noqa: BLE001
                     f["heartbeat"] = {"ok": False, "error": str(e)}
-        facts["etcd"] = etcd_health(cfg)
+        # I1: a missing/hanging etcdctl must become a fact, not an uncaught
+        # exception -- oc-db-check has to reach the bottom of main() (save
+        # state, try to mail) on every run, including its worst ones.
+        try:
+            facts["etcd"] = etcd_health(cfg)
+        except Exception as e:  # noqa: BLE001
+            facts["etcd"] = []
+            facts["errors"]["etcd"] = str(e)
     if cfg["role"] == "witness":
         try:
             facts["backups"] = backup_info()
         except Exception as e:  # noqa: BLE001
             facts["backups"], facts["backups_error"] = {}, str(e)
         facts["drills"] = {n: read_json(f"{cfg['drill_dir']}/last-{n}.json") for n in cfg["clusters"]}
-    facts["wg"] = wg_handshakes(cfg, facts["errors"])
+    try:
+        facts["wg"] = wg_handshakes(cfg, facts["errors"])
+    except Exception as e:  # noqa: BLE001 -- a missing/hanging wg binary (I1)
+        facts["wg"] = {}
+        facts["errors"]["wireguard"] = str(e)
     facts["disks"] = {}
     for fs in cfg["filesystems"]:
         try:
@@ -336,7 +401,13 @@ def collect(cfg, prev_state):
             facts["disks"][fs] = 1 - st.f_bavail / st.f_blocks
         except OSError as e:
             facts["errors"][f"disk {fs}"] = str(e)
-    facts["certs"] = {p: cert_end(p) for p in cfg["certs"]}
+    facts["certs"] = {}
+    for p in cfg["certs"]:
+        try:
+            facts["certs"][p] = cert_end(p)
+        except Exception as e:  # noqa: BLE001 -- a missing openssl binary (I1)
+            facts["certs"][p] = None
+            facts["errors"][f"cert {p}"] = str(e)
     return facts
 
 
@@ -346,7 +417,7 @@ def etcd_health(cfg):
     ca, crt, key = tls_files(cfg)
     r = subprocess.run(["etcdctl", f"--endpoints={','.join(cfg['etcd'])}", f"--cacert={ca}", f"--cert={crt}",
                         f"--key={key}", "--dial-timeout=3s", "--command-timeout=5s", "endpoint", "health",
-                        "-w", "json"], capture_output=True, text=True, timeout=30)
+                        "-w", "json"], capture_output=True, text=True, timeout=15)
     try:
         seen = {e["endpoint"]: e for e in json.loads(r.stdout or "[]")}
     except ValueError:
@@ -441,10 +512,19 @@ def main(argv):
     state = read_json(a.state) or {}
     now = int(time.time())
     facts = collect(cfg, state)
+    # M10: once London answers again, a role=member run stops checking clusters
+    # (evaluate() below) -- drop what it raised while covering without a CLEARED
+    # mail, so the witness (which re-checks on its own hold) is the one voice.
+    if cfg["role"] == "member" and cfg["london_etcd"] and london_is_ok(facts, cfg):
+        state = drop_handoff_conditions(state)
     current = evaluate(facts, cfg, now)
     state, events = update_state(state, current, now)
-    state["archive_failed"] = {n: f["primary"]["archiver"]["failed_count"]
-                               for n, f in facts["clusters"].items() if f.get("primary")}
+    state["archive_failed"] = {}
+    for n, f in facts["clusters"].items():
+        leader = next((m["name"] for m in (f.get("members") or [])
+                       if m.get("role") in ("leader", "primary", "standby_leader")), None)
+        if leader and f.get("primary"):
+            state["archive_failed"][f"{n}:{leader}"] = f["primary"]["archiver"]["failed_count"]
     for key in sorted(current):
         c = state["conditions"][key]
         print(f"{'ALERT' if c['raised'] else 'pending'} {c['level']} {key}: {current[key]}")

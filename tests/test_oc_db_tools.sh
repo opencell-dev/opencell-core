@@ -52,6 +52,17 @@ expect "only single snapshots are destroyed (never -r)" bash -c "! grep -qE 'des
 snap 20260901
 expect "9 monthlies: the 3 oldest go, 6 remain" bash -c "[ \$(grep -c '^oc-monthly-' '$FAKE_ZFS') = 6 ] && ! grep -q oc-monthly-202603 '$FAKE_ZFS' && grep -q oc-monthly-202609 '$FAKE_ZFS'"
 
+# M1: a host down over the 1st's run must still get that month's snapshot
+# once it catches up, not only exactly on the 1st -- and not a second time
+# once it has one.
+: >"$FAKE_ZFS"; : >"$FAKE_ZFS.calls"
+snap 20261002
+expect "catch-up on the 2nd still takes the month's snapshot" \
+    grep -qx "snapshot esas/opencell-pgbackrest@oc-monthly-202610" "$FAKE_ZFS.calls"
+: >"$FAKE_ZFS.calls"
+snap 20261003
+expect "...but only once for the month" bash -c "! grep -q oc-monthly- '$FAKE_ZFS.calls'"
+
 : >"$FAKE_ZFS"; : >"$FAKE_ZFS.calls"
 snap 20261002 --dry-run
 expect "--dry-run changes nothing" bash -c "! grep -qE '^(snapshot|destroy)' '$FAKE_ZFS.calls' && grep -q 'would run: zfs snapshot' '$OUT/snap.out'"
@@ -65,9 +76,29 @@ cat >"$OUT/bin/pgbackrest" <<'EOF'
 echo "pgbackrest $*" >>"$FAKE_CALLS"
 [ "${FAKE_RESTORE_RC:-0}" = 0 ] || { echo "P00  ERROR: [075]: no backup set found to restore"; exit 75; }
 EOF
+# I3: pg_ctl start takes out a lock (shared across stanzas, like a real
+# postmaster's one scratch port/socket would collide) and holds it for
+# FAKE_DRILL_DELAY; a second "start" while it is held fails, the way a real
+# postmaster refuses to bind an address already in use.
 cat >"$OUT/pgbin/pg_ctl" <<'EOF'
 #!/bin/bash
 echo "pg_ctl $*" >>"$FAKE_CALLS"
+lock=${FAKE_PORTLOCK:-}
+case " $* " in
+    *" start "*)
+        if [ -n "$lock" ]; then
+            if [ -e "$lock" ]; then
+                echo "pg_ctl: another postmaster might be running; lock file \"$lock\" exists" >&2
+                exit 1
+            fi
+            : >"$lock"
+        fi
+        sleep "${FAKE_DRILL_DELAY:-0}"
+        ;;
+    *" stop "*)
+        [ -z "$lock" ] || rm -f "$lock"
+        ;;
+esac
 EOF
 cat >"$OUT/pgbin/pg_amcheck" <<'EOF'
 #!/bin/bash
@@ -93,7 +124,7 @@ expect "a good restore passes (exit 0)" test "$(cat "$OUT/drill.rc")" = 0
 expect "...and says so in last-oc-east.json" test "$(field result)" = pass
 expect "...with last_pass set" test "$(field last_pass)" = "$(field at)"
 expect "it restored to a time with the drill config and promotes" \
-    grep -q -- "--config=/etc/pgbackrest/drill.conf --stanza=oc-east --type=time --target=.* --target-action=promote" "$FAKE_CALLS"
+    grep -q -- "--config=/etc/pgbackrest/drill.conf --stanza=oc-east --pg1-path=$OUT/drill/oc-east --type=time --target=.* --target-action=promote" "$FAKE_CALLS"
 expect "it started the copy off the network, without a sync standby" \
     grep -q -- "listen_addresses='' .*synchronous_standby_names=" "$FAKE_CALLS"
 expect "it stopped the copy and deleted it" bash -c "grep -q 'pg_ctl -D $OUT/drill/oc-east -m fast' '$FAKE_CALLS' && [ ! -e '$OUT/drill/oc-east' ]"
@@ -118,6 +149,22 @@ expect "a failed restore fails, without starting anything" \
 
 drill oc-north
 expect "an unknown stanza is a usage error" test "$(cat "$OUT/drill.rc")" = 2
+
+# ---- oc-db-drill: two stanzas' drills never collide (I3) ---------------------
+: >"$FAKE_CALLS"
+export FAKE_PORTLOCK=$OUT/portlock FAKE_DRILL_DELAY=0.3
+FAKE_HB=$(($(date +%s) - 3600 - 60)) "$TOOLS/oc-db-drill" oc-east >"$OUT/east.out" 2>"$OUT/east.err" &
+p1=$!
+FAKE_HB=$(($(date +%s) - 3600 - 60)) "$TOOLS/oc-db-drill" oc-west >"$OUT/west.out" 2>"$OUT/west.err" &
+p2=$!
+rc1=0; rc2=0
+wait "$p1" || rc1=$?
+wait "$p2" || rc2=$?
+expect "two concurrent drills: oc-east passes (no port/socket collision)" test "$rc1" = 0
+expect "...oc-west passes too" test "$rc2" = 0
+expect "...both actually reached PASS (not just a nonzero rc by luck)" \
+    bash -c "grep -q 'oc-db-drill oc-east: PASS' '$OUT/east.out' && grep -q 'oc-db-drill oc-west: PASS' '$OUT/west.out'"
+unset FAKE_PORTLOCK FAKE_DRILL_DELAY
 
 # ---- oc-db-writer -------------------------------------------------------------
 cat >"$OUT/bin/fakepsql" <<'EOF'

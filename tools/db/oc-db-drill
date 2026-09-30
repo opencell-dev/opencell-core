@@ -14,6 +14,10 @@
 # oc-db-check reads ("drill" alerts): {"result", "at", "target", "detail",
 # "restore_s", "last_pass"}. Exit 0 on pass, 1 on fail, 2 on usage.
 #
+# oc-east's and oc-west's drills share this host's one scratch port and
+# socket, and their timers can fire at the same second: $OC_DRILL_DIR/.lock
+# (flock) serialises them, so a drill may wait behind the other one.
+#
 # Environment (tests override): OC_DRILL_DIR (/var/lib/oc-db-drill),
 # OC_DRILL_CONF (/etc/pgbackrest/drill.conf), OC_PG_BIN (/usr/lib/postgresql/17/bin),
 # OC_DRILL_RUNAS (postgres; empty = the calling user), OC_DRILL_PORT (5499),
@@ -83,20 +87,35 @@ trap 'finish fail "interrupted"' INT TERM
 
 mkdir -p "$DIR" "$SOCK"
 [ -z "$RUNAS" ] || chown "$RUNAS" "$DIR" "$SOCK"
+# I3: oc-east's and oc-west's drills run on independent monthly timers that
+# fire at the same second and would otherwise share this host's one scratch
+# port and socket -- serialise so only one restored copy is ever live.
+exec 9>"$DIR/.lock"
+flock 9
 rm -rf "$PGDATA" # a drill that died left its scratch copy
 as mkdir -m 0700 "$PGDATA" || finish fail "cannot make $PGDATA"
 
 t0=$(date +%s)
-as pgbackrest --config="$CONF" --stanza="$STANZA" --type=time "--target=$target" --target-action=promote \
+# --pg1-path (M3): without it, the restore target comes only from drill.conf,
+# while this script stops and deletes $PGDATA -- if the two ever diverge (an
+# OC_DRILL_DIR override, an edited drill.conf), the drill would check one
+# directory and leave a clear-text copy of a production database in the
+# other. Never run this restore without it (runbook R4).
+as pgbackrest --config="$CONF" --stanza="$STANZA" --pg1-path="$PGDATA" --type=time "--target=$target" \
+    --target-action=promote \
     "--recovery-option=restore_command=pgbackrest --config=$CONF --stanza=$STANZA archive-get %f \"%p\"" \
     restore >"$LOG" 2>&1 || finish fail "pgbackrest restore failed: $(tail -1 "$LOG")"
 restore_s=$(($(date +%s) - t0))
 
 # The restored configuration is the live member's (Patroni's): point it at this
 # copy, keep it off the network, and never wait for a synchronous standby.
+# primary_conninfo= (M3, belt-and-braces): a restored recovery.signal carries
+# no primary_conninfo (this is a --type=time/promote restore, not a standby
+# clone), but clearing it here makes "never touches production" structural
+# rather than incidental.
 opts="-c port=$PORT -c listen_addresses='' -c unix_socket_directories=$SOCK -c hba_file=$PGDATA/pg_hba.conf"
 opts="$opts -c ident_file=$PGDATA/pg_ident.conf -c archive_mode=off -c ssl=off -c shared_buffers=128MB"
-opts="$opts -c synchronous_standby_names= -c cluster_name=drill-$STANZA"
+opts="$opts -c synchronous_standby_names= -c primary_conninfo= -c cluster_name=drill-$STANZA"
 as "$BIN/pg_ctl" -D "$PGDATA" -o "$opts" -l "$LOG.pg" -w -t 1800 start >/dev/null 2>&1 ||
     finish fail "the scratch copy did not start: $(tail -1 "$LOG.pg" 2>/dev/null)"
 started=1

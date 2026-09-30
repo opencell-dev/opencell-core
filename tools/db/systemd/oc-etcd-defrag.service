@@ -3,6 +3,9 @@
 [Unit]
 Description=Defragment the OpenCell etcd members
 After=network-online.target wg-quick@wg0.service
+# I1/M2: nothing else watches this unit; mail on a failed run, same env file
+# as oc-db-check's other alerts.
+OnFailure=oc-db-alert-failure@%n.service
 
 [Service]
 Type=oneshot

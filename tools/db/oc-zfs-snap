@@ -6,8 +6,11 @@
 #
 #   oc-zfs-snap DATASET [--daily N] [--monthly M] [--dry-run]
 #
-# Takes DATASET@oc-daily-YYYYMMDD (UTC) once a day and, on the 1st of a month,
-# DATASET@oc-monthly-YYYYMM; then destroys the oldest of each kind beyond the
+# Takes DATASET@oc-daily-YYYYMMDD (UTC) once a day and, once a month,
+# DATASET@oc-monthly-YYYYMM -- whenever none exists yet for the current month,
+# not only on the 1st (review M1): a host down over the 1st's run must still
+# get that month's snapshot when it catches up, or retention quietly drops
+# below its configured span. Then destroys the oldest of each kind beyond the
 # newest N daily (default 30) and M monthly (default 6). It only ever creates or
 # destroys snapshots named oc-daily-<digits> or oc-monthly-<digits> of DATASET
 # itself (never -r, never the dataset). OC_ZFS and OC_TODAY (YYYYMMDD) are for
@@ -37,7 +40,7 @@ has() { grep -qx "$1" <<<"$snaps"; }
 
 new=()
 has "oc-daily-$TODAY" || new+=("oc-daily-$TODAY")
-[ "${TODAY:6:2}" != 01 ] || has "oc-monthly-${TODAY:0:6}" || new+=("oc-monthly-${TODAY:0:6}")
+has "oc-monthly-${TODAY:0:6}" || new+=("oc-monthly-${TODAY:0:6}")
 for s in "${new[@]}"; do
     run snapshot "$DS@$s"
     snaps=$(printf '%s\n%s' "$snaps" "$s")

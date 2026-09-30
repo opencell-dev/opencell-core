@@ -1,0 +1,10 @@
+# oc-db-alert-failure@: mails "%I failed on this host" when another oc-db-*
+# unit's OnFailure= fires (review I1, M2) -- oc-db-check.service (systemd
+# itself kills or fails a run), oc-zfs-snap.service and oc-etcd-defrag.service
+# (nothing else watches them). Triggering unit: OnFailure=oc-db-alert-failure@%n.service
+[Unit]
+Description=Mail that %I failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oc-db-alert-mail %I

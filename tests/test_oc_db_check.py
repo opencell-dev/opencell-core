@@ -4,6 +4,7 @@ usage: test_oc_db_check.py PATH_TO_OC_DB_CHECK"""
 import copy
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -51,7 +52,8 @@ def healthy():
                     for n in ("oc-east", "oc-west")},
         "drills": {n: {"result": "pass", "last_pass": NOW - 86400} for n in ("oc-east", "oc-west")},
         "wg": {"oc-core-2": NOW - 20, "oc-db-1": NOW - 40}, "disks": {"/": 0.3}, "certs": {}, "errors": {},
-        "prev_archive_failed": {"oc-east": 0, "oc-west": 0},
+        # keyed (cluster, leader) (review I2): oc-east's leader is oc-db-1, oc-west's is oc-core-2
+        "prev_archive_failed": {"oc-east:oc-db-1": 0, "oc-west:oc-core-2": 0},
     }
 
 
@@ -178,9 +180,11 @@ class State(unittest.TestCase):
         s, ev = chk.update_state(s, {"no-leader:oc-east": "m"}, NOW + 120)
         self.assertEqual(ev, [])  # not mailed twice
         s, ev = chk.update_state(s, {}, NOW + 180)
+        self.assertEqual(ev, [])  # review I2: a clear waits out its own hold too
+        s, ev = chk.update_state(s, {}, NOW + 180 + chk.CLEAR_HOLD_MIN)
         self.assertEqual(ev, [["clear", "critical", "no-leader:oc-east", "m"]])
         s = chk.mark_sent(s)
-        s, ev = chk.update_state(s, {}, NOW + 240)
+        s, ev = chk.update_state(s, {}, NOW + 180 + chk.CLEAR_HOLD_MIN + 60)
         self.assertEqual(ev, [])
 
     def test_a_blip_shorter_than_the_hold_is_never_mailed(self):
@@ -204,6 +208,36 @@ class State(unittest.TestCase):
         s, ev = chk.update_state({}, {"disk:/": "85 %"}, NOW)
         s, ev = chk.update_state(copy.deepcopy(s), {"disk:/": "86 %"}, NOW + 60)
         self.assertEqual(ev, [["raise", "warning", "disk:/", "85 %"]])  # the mail failed: still due
+
+    def test_flapping_condition_raises_once_and_never_clears(self):
+        # review I2: archive-failing (hold 0) present on even runs, absent on
+        # odd ones, 60 s apart -- a real pattern during a London outage
+        # (async archive-push retries roughly once a minute).
+        s = {}
+        events = []
+        for i in range(10):
+            current = {"archive-failing:oc-east": "m"} if i % 2 == 0 else {}
+            s, ev = chk.update_state(s, current, NOW + i * 60)
+            events += ev
+            s = chk.mark_sent(s)  # each run's mail "succeeds", as in normal operation
+        self.assertEqual([e for e in events if e[0] == "raise"],
+                          [["raise", "warning", "archive-failing:oc-east", "m"]])
+        self.assertEqual([e for e in events if e[0] == "clear"], [])
+
+    def test_reappearing_before_the_clear_hold_cancels_it(self):
+        s, ev = chk.update_state({}, {"disk:/": "85 %"}, NOW)
+        self.assertEqual(ev, [["raise", "warning", "disk:/", "85 %"]])
+        s = chk.mark_sent(s)
+        s, ev = chk.update_state(s, {}, NOW + 60)  # absent: the clear countdown starts at +60
+        self.assertEqual(ev, [])
+        s, ev = chk.update_state(s, {"disk:/": "85 %"}, NOW + 90)  # back: cancelled
+        self.assertEqual(ev, [])
+        s, ev = chk.update_state(s, {}, NOW + 150)  # absent again: the countdown restarts at +150
+        self.assertEqual(ev, [])
+        s, ev = chk.update_state(s, {}, NOW + 150 + chk.CLEAR_HOLD_MIN - 1)
+        self.assertEqual(ev, [])  # not yet -- the old (uncancelled) +60 countdown would have fired by now
+        s, ev = chk.update_state(s, {}, NOW + 150 + chk.CLEAR_HOLD_MIN)
+        self.assertEqual(ev, [["clear", "warning", "disk:/", "85 %"]])
 
     def test_mail_text(self):
         subject, body = chk.mail_text([["raise", "critical", "no-leader:oc-east", "oc-east: no running leader"],
@@ -239,6 +273,64 @@ class Parse(unittest.TestCase):
         self.assertEqual(c["london_etcd"], LDN)
         self.assertEqual(c["filesystems"], ["/", "/var/lib/postgresql"])
         self.assertEqual(c["wg_peers"]["oc-core-2"], "gEIo3gPxNdIe6Vv+N9DQVAXBW3zOXebRw8m8IvvuhjU=")
+
+
+class Handoff(unittest.TestCase):
+    def test_drop_handoff_conditions_removes_only_cluster_keys(self):
+        # review M10
+        state = {"conditions": {
+            "no-leader:oc-east": {"first": NOW - 1000, "raised": True, "message": "m1",
+                                   "level": "critical", "absent_since": None},
+            "wg:oc-core-2": {"first": NOW - 1000, "raised": True, "message": "m2",
+                              "level": "warning", "absent_since": None}},
+            "pending": [["raise", "critical", "no-leader:oc-east", "m1"]]}
+        chk.drop_handoff_conditions(state)
+        self.assertNotIn("no-leader:oc-east", state["conditions"])
+        self.assertIn("wg:oc-core-2", state["conditions"])  # not a cluster-check key: untouched
+        self.assertEqual(state["pending"], [])
+
+    def test_london_return_drops_member_conditions_without_a_clear(self):
+        # A member (oc-db-1) was covering for a silent London and had raised
+        # no-leader:oc-east. London answers again this run: evaluate() stops
+        # reporting oc-east's conditions (the witness owns them now), and that
+        # must not read as "resolved" -- no CLEARED mail, ever, for this key.
+        f = healthy()
+        state = {"conditions": {
+            "no-leader:oc-east": {"first": NOW - 1000, "raised": True, "message": "old",
+                                   "level": "critical", "absent_since": None}},
+            "pending": []}
+        state = chk.drop_handoff_conditions(state)
+        current = chk.evaluate(f, cfg("member"), NOW)  # london_ok in f/cfg(): etcd all healthy
+        state, ev = chk.update_state(state, current, NOW)
+        self.assertEqual(ev, [])  # no CLEARED mail
+        self.assertNotIn("no-leader:oc-east", state["conditions"])
+
+
+class Main(unittest.TestCase):
+    def test_main_survives_a_missing_etcdctl_and_wg(self):
+        # review I1: a missing (or hanging) subprocess helper must become a
+        # fact, not an uncaught exception that skips saving state and mailing.
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "db-check.conf")
+            with open(conf, "w") as f:
+                f.write("[check]\nhost = oc-db-1\nrole = witness\n"
+                        f"[etcd]\nendpoints = {LDN}\n"
+                        "[wg_peers]\noc-core-2 = gEIo3gPxNdIe6Vv+N9DQVAXBW3zOXebRw8m8IvvuhjU=\n")
+            state_path = os.path.join(d, "state.json")
+            empty_bin = os.path.join(d, "bin")
+            os.mkdir(empty_bin)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = empty_bin  # no etcdctl, no wg, no runuser, no pgbackrest
+            try:
+                rc = chk.main(["--config", conf, "--state", state_path, "--no-mail"])
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(state_path))
+            with open(state_path) as f:
+                saved = json.load(f)
+            self.assertTrue(any(k.startswith("collect:") for k in saved.get("conditions", {})),
+                             saved.get("conditions"))
 
 
 if __name__ == "__main__":

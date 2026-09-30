@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""oc-db-check: the database layer's checks and alerts (postgres-ha spec §14).
+
+Runs once a minute (a systemd timer) on the witness (oc-ldn-1), on oc-db-1 and,
+with local checks only, on oc-core-2. Each run collects facts (Patroni REST,
+Postgres as oc_monitor, a heartbeat insert as oc_drill, etcd, pgBackRest, the
+drills' results, WireGuard, disks, certificates), turns them into conditions,
+and keeps a state file so that a condition raises an alert only after it has
+lasted its time (spec §14.2), and clears once. Alerts go by email on a change
+(raised, cleared); every run also logs one line per active condition.
+
+  oc-db-check [--config /etc/opencell/db-check.conf] [--state FILE] [--no-mail]
+
+Standard library only (Debian 13's python3). The client certificate is the
+host's db certificate (role db, postgres-ha spec §9.2): Postgres maps its CN
+to oc_monitor / oc_drill, Patroni and etcd require it.
+"""
+import argparse
+import calendar
+import configparser
+import json
+import os
+import smtplib
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+from email.message import EmailMessage
+
+WAL_SEGMENT = 16 * 1024 * 1024
+SPOOL_CAP = 2 * 1024 * 1024 * 1024  # archive-push-queue-max (spec §10.3)
+DAY = 86400
+
+# key prefix: (level, seconds the condition must last) -- spec §14.2
+RULES = {
+    "no-leader": ("critical", 30),
+    "leader-away": ("warning", 3600),
+    "not-sync": ("critical", 60),
+    "lag": ("warning", 120),
+    "slot": ("warning", 0),
+    "archive-failing": ("warning", 0),
+    "archive-stale": ("warning", 600),
+    "archive-queue": ("warning", 0),
+    "archive-queue-high": ("critical", 0),
+    "heartbeat": ("critical", 60),
+    "member": ("warning", 120),
+    "backup-full": ("warning", 0),
+    "backup-diff": ("warning", 0),
+    "stanza": ("warning", 0),
+    "drill": ("warning", 0),
+    "etcd": ("warning", 120),
+    "etcd-quorum": ("critical", 0),
+    "london-silent": ("warning", 600),
+    "wg": ("warning", 0),
+    "disk": ("warning", 0),
+    "cert": ("warning", 0),
+    "collect": ("warning", 120),
+}
+
+
+def rule(key):
+    return RULES[key.split(":", 1)[0]]
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config(path):
+    cp = configparser.ConfigParser(interpolation=None)
+    if not cp.read(path):
+        raise SystemExit(f"oc-db-check: cannot read {path}")
+    c = cp["check"]
+    cfg = {
+        "host": c["host"],
+        "role": c["role"],  # witness | member | local
+        "tls_dir": c.get("tls_dir", "/etc/opencell/db-tls"),
+        "mail_env": c.get("mail_env", "/etc/opencell/alert-smtp.env"),
+        "drill_dir": c.get("drill_dir", "/var/lib/oc-db-drill"),
+        "clusters": {},
+        "members": dict(cp["members"]) if cp.has_section("members") else {},
+        "etcd": [e.strip() for e in cp.get("etcd", "endpoints", fallback="").split(",") if e.strip()],
+        "london_etcd": cp.get("etcd", "london", fallback=""),
+        "filesystems": cp.get("local", "filesystems", fallback="/").split(),
+        "certs": cp.get("local", "certs", fallback="").split(),
+        "wg_peers": dict(cp["wg_peers"]) if cp.has_section("wg_peers") else {},
+    }
+    if cfg["role"] not in ("witness", "member", "local"):
+        raise SystemExit(f"oc-db-check: role '{cfg['role']}': witness, member or local")
+    if cp.has_section("clusters"):
+        for name, v in cp["clusters"].items():
+            port, rest_port, home, sync = v.split()
+            cfg["clusters"][name] = {"port": int(port), "rest": int(rest_port), "home": home,
+                                     "sync": sync == "sync"}
+    return cfg
+
+
+# ---------------------------------------------------------------- evaluate (pure)
+
+
+def evaluate(facts, cfg, now):
+    """facts (from collect) -> {key: message}. Levels and durations come from RULES."""
+    out = {}
+    london_ok = any(e.get("health") and e["endpoint"] == cfg["london_etcd"] for e in facts.get("etcd", []))
+    if cfg["role"] == "member" and cfg["london_etcd"] and not london_ok:
+        out["london-silent:"] = "London (oc-ldn-1) does not answer: no automatic failover if a second site fails"
+    # The witness checks the clusters; oc-db-1 checks them too only while London is silent
+    # (so one incident is mailed once, and a dead London is still noticed).
+    if cfg["role"] == "witness" or (cfg["role"] == "member" and not london_ok):
+        for name, cl in cfg["clusters"].items():
+            f = facts.get("clusters", {}).get(name, {})
+            members = f.get("members")
+            for m, err in sorted(f.get("rest_errors", {}).items()):
+                out[f"member:{name}:{m}"] = f"{name}: Patroni on {m} does not answer ({err})"
+            if members is None:
+                out[f"no-leader:{name}"] = f"{name}: no Patroni member answers"
+                continue
+            leaders = [m for m in members if m.get("role") in ("leader", "primary", "standby_leader")]
+            if not leaders or leaders[0].get("state") != "running":
+                out[f"no-leader:{name}"] = f"{name}: no running leader ({describe(members)})"
+                continue
+            leader = leaders[0]["name"]
+            if leader != cl["home"]:
+                out[f"leader-away:{name}"] = f"{name}: the leader is {leader}, not {cl['home']} (switch back: runbook R2)"
+            if cl["sync"] and not any(m.get("role") == "sync_standby" and m.get("state") in ("streaming", "running")
+                                      for m in members):
+                out[f"not-sync:{name}"] = f"{name}: no synchronous standby: portal writes are not zero-loss ({describe(members)})"
+            for m in members:
+                if m["name"] == leader:
+                    continue
+                lag = m.get("lag")
+                if not isinstance(lag, int) or lag > WAL_SEGMENT or m.get("state") not in ("streaming", "running"):
+                    out[f"lag:{name}:{m['name']}"] = f"{name}: standby {m['name']} is {m.get('state')}, lag {lag}"
+            pg = f.get("primary")
+            if pg is None:
+                out[f"collect:{name}:primary"] = f"{name}: cannot query the primary as oc_monitor ({f.get('primary_error')})"
+            else:
+                for r in pg.get("replication", []):
+                    if r.get("replay_lag_s") is not None and r["replay_lag_s"] > 10:
+                        out[f"lag:{name}:{r['name']}"] = f"{name}: standby {r['name']} replays {r['replay_lag_s']:.0f} s behind"
+                for s in pg.get("slots", []):
+                    if (s.get("retained") or 0) > 2 * 1024 ** 3:
+                        out[f"slot:{name}:{s['name']}"] = f"{name}: slot {s['name']} retains {s['retained'] // 1024 ** 2} MB of WAL (cap 4 GB: runbook R3)"
+                arch = pg.get("archiver", {})
+                prev = facts.get("prev_archive_failed", {}).get(name)
+                if prev is not None and arch.get("failed_count", 0) > prev:
+                    out[f"archive-failing:{name}"] = f"{name}: WAL archiving to London failed {arch['failed_count'] - prev} time(s) since the last check"
+                # WAL waiting to be archived (the .ready files) is the stall; an idle
+                # cluster archives nothing and is fine. Held 10 min (RULES).
+                ready = pg.get("ready") or 0
+                if ready > 0:
+                    age = arch.get("last_archived_age_s")
+                    last = "never" if age is None else f"{age / 60:.0f} min ago"
+                    out[f"archive-stale:{name}"] = f"{name}: {ready} WAL segment(s) waiting for London (last archived {last})"
+                queued = ready * WAL_SEGMENT
+                if queued > 0.75 * SPOOL_CAP:
+                    out[f"archive-queue-high:{name}"] = f"{name}: {queued // 1024 ** 2} MB of WAL waiting for London (drop at 2048 MB: runbook R5)"
+                elif queued > 0.25 * SPOOL_CAP:
+                    out[f"archive-queue:{name}"] = f"{name}: {queued // 1024 ** 2} MB of WAL waiting for London (runbook R5)"
+            hb = f.get("heartbeat")
+            if hb is not None and not hb.get("ok"):
+                out[f"heartbeat:{name}"] = f"{name}: the primary does not take a write ({hb.get('error')})"
+        ok = [e for e in facts.get("etcd", []) if e.get("health")]
+        for e in facts.get("etcd", []):
+            if not e.get("health"):
+                out[f"etcd:{e['endpoint']}"] = f"etcd member {e['endpoint']} is unhealthy ({e.get('error')})"
+        if cfg["etcd"] and len(ok) < 2:
+            out["etcd-quorum:"] = f"etcd: {len(ok)} of {len(cfg['etcd'])} members healthy: no quorum, no failover possible"
+    if cfg["role"] == "witness":
+        for name in cfg["clusters"]:
+            st = facts.get("backups", {}).get(name)
+            if st is None:
+                out[f"stanza:{name}"] = f"{name}: pgbackrest info has no stanza ({facts.get('backups_error')})"
+                continue
+            if st.get("status", 0) != 0:
+                out[f"stanza:{name}"] = f"{name}: pgBackRest says '{st.get('message')}'"
+            if st.get("last_full") is None or now - st["last_full"] > 8 * DAY:
+                out[f"backup-full:{name}"] = f"{name}: no full backup for {ago(st.get('last_full'), now)}"
+            if st.get("last_any") is None or now - st["last_any"] > 26 * 3600:
+                out[f"backup-diff:{name}"] = f"{name}: no backup for {ago(st.get('last_any'), now)}"
+            d = facts.get("drills", {}).get(name) or {}
+            if d.get("result") == "fail":
+                out[f"drill:{name}"] = f"{name}: the last restore drill failed: {d.get('detail')}"
+            elif d.get("last_pass") is None or now - d["last_pass"] > 35 * DAY:
+                out[f"drill:{name}"] = f"{name}: no passed restore drill for {ago(d.get('last_pass'), now)}"
+    for peer, t in facts.get("wg", {}).items():
+        if t is None or now - t > 180:
+            out[f"wg:{peer}"] = f"WireGuard: no handshake with {peer} for {ago(t, now)}"
+    for fs, used in facts.get("disks", {}).items():
+        if used > 0.80:
+            out[f"disk:{fs}"] = f"{fs} is {used * 100:.0f} % full"
+    for path, end in facts.get("certs", {}).items():
+        if end is None or end - now < 30 * DAY:
+            out[f"cert:{path}"] = f"{path} expires {ago(end, now, future=True)} (runbook R7)"
+    for what, err in facts.get("errors", {}).items():
+        out[f"collect:{what}"] = f"cannot check {what}: {err}"
+    return out
+
+
+def describe(members):
+    return ", ".join(f"{m.get('name')} {m.get('role')}/{m.get('state')}" for m in members) or "no members"
+
+
+def ago(t, now, future=False):
+    if t is None:
+        return "ever" if not future else "(unknown date)"
+    d = abs(now - t)
+    s = f"{d / DAY:.1f} days" if d >= DAY else f"{d / 3600:.1f} h" if d >= 3600 else f"{d / 60:.0f} min"
+    return f"in {s}" if future else s
+
+
+# ---------------------------------------------------------------- state (pure)
+
+
+def update_state(state, current, now):
+    """state + {key: message} -> (state, events). An event is (kind, level, key, message),
+    kind "raise" or "clear", still to be mailed. Mailed events are dropped by mark_sent."""
+    conds = state.setdefault("conditions", {})
+    pending = state.setdefault("pending", [])
+    for key, msg in current.items():
+        level, hold = rule(key)
+        c = conds.get(key)
+        if c is None:
+            c = conds[key] = {"first": now, "raised": False}
+        c["message"], c["level"] = msg, level
+        if not c["raised"] and now - c["first"] >= hold:
+            c["raised"] = True
+            pending.append(["raise", level, key, msg])
+    for key in [k for k in conds if k not in current]:
+        c = conds.pop(key)
+        if c["raised"]:
+            pending.append(["clear", c["level"], key, c["message"]])
+        else:
+            pending[:] = [p for p in pending if p[2] != key]
+    return state, list(pending)
+
+
+def mark_sent(state):
+    state["pending"] = []
+    return state
+
+
+def mail_text(events, host):
+    raised = [e for e in events if e[0] == "raise"]
+    top = "critical" if any(e[1] == "critical" for e in raised) else "warning" if raised else "cleared"
+    first = (raised or events)[0]
+    subject = f"[OpenCell db] {top.upper()} {first[2].split(':')[0]}: {first[3]}"[:160]
+    lines = [f"From oc-db-check on {host}.", ""]
+    for kind, level, key, msg in events:
+        lines.append(f"{'RAISED ' + level.upper() if kind == 'raise' else 'CLEARED'}  {msg}  [{key}]")
+    lines += ["", "Runbooks: docs/ops/postgres-runbooks.md in the docs repository."]
+    return subject, "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------- collect (I/O)
+
+
+def tls_files(cfg):
+    d = cfg["tls_dir"]
+    return f"{d}/ca.crt", f"{d}/db.crt", f"{d}/db.key"
+
+
+def rest_get(url, cfg):
+    ca, crt, key = tls_files(cfg)
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.load_cert_chain(crt, key)
+    with urllib.request.urlopen(url, context=ctx, timeout=5) as r:
+        return json.load(r)
+
+
+def psql(host, port, db, user, sql, cfg):
+    ca, crt, key = tls_files(cfg)
+    conn = (f"host={host} port={port} dbname={db} user={user} sslmode=verify-full sslrootcert={ca} "
+            f"sslcert={crt} sslkey={key} connect_timeout=5 application_name=oc-db-check")
+    cmd = ["psql", conn, "-XAtqc", sql]
+    if os.geteuid() == 0:
+        # libpq refuses a key its own user owns with group access, which a
+        # root-owned 0640 key is when the caller is root: read it as postgres
+        # (group oc-db-tls), the way Postgres and Patroni do.
+        cmd = ["runuser", "-u", "postgres", "--"] + cmd
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"psql exit {r.returncode}")
+    return r.stdout.strip()
+
+
+PRIMARY_SQL = """SELECT json_build_object(
+ 'replication', (SELECT coalesce(json_agg(json_build_object('name', application_name, 'sync_state', sync_state,
+    'replay_lag_s', extract(epoch from replay_lag),
+    'bytes_behind', pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn))), '[]') FROM pg_stat_replication),
+ 'slots', (SELECT coalesce(json_agg(json_build_object('name', slot_name,
+    'retained', pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))), '[]') FROM pg_replication_slots),
+ 'archiver', (SELECT json_build_object('failed_count', failed_count,
+    'last_archived_age_s', extract(epoch from now() - last_archived_time)) FROM pg_stat_archiver),
+ 'ready', (SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready'))"""
+
+HEARTBEAT_SQL = ("WITH old AS (DELETE FROM heartbeat WHERE at < now() - interval '60 days') "
+                 "INSERT INTO heartbeat (source) VALUES ('{host}') RETURNING 1")
+
+
+def collect(cfg, prev_state):
+    facts = {"clusters": {}, "errors": {}, "prev_archive_failed": prev_state.get("archive_failed", {})}
+    if cfg["role"] in ("witness", "member"):
+        for name, cl in cfg["clusters"].items():
+            f = facts["clusters"][name] = {"rest_errors": {}}
+            for m, addr in cfg["members"].items():
+                try:
+                    members = rest_get(f"https://{addr}:{cl['rest']}/cluster", cfg)["members"]
+                    f.setdefault("members", members)
+                except Exception as e:  # noqa: BLE001 -- any failure is a fact
+                    f["rest_errors"][m] = str(e)
+            leader = next((m for m in f.get("members") or [] if m.get("role") in ("leader", "primary")), None)
+            if leader:
+                host = leader.get("host") or cfg["members"].get(leader["name"])
+                try:
+                    f["primary"] = json.loads(psql(host, cl["port"], "postgres", "oc_monitor", PRIMARY_SQL, cfg))
+                except Exception as e:  # noqa: BLE001
+                    f["primary_error"] = str(e)
+                try:
+                    psql(host, cl["port"], "oc_drill", "oc_drill", HEARTBEAT_SQL.format(host=cfg["host"]), cfg)
+                    f["heartbeat"] = {"ok": True}
+                except Exception as e:  # noqa: BLE001
+                    f["heartbeat"] = {"ok": False, "error": str(e)}
+        facts["etcd"] = etcd_health(cfg)
+    if cfg["role"] == "witness":
+        try:
+            facts["backups"] = backup_info()
+        except Exception as e:  # noqa: BLE001
+            facts["backups"], facts["backups_error"] = {}, str(e)
+        facts["drills"] = {n: read_json(f"{cfg['drill_dir']}/last-{n}.json") for n in cfg["clusters"]}
+    facts["wg"] = wg_handshakes(cfg, facts["errors"])
+    facts["disks"] = {}
+    for fs in cfg["filesystems"]:
+        try:
+            st = os.statvfs(fs)
+            facts["disks"][fs] = 1 - st.f_bavail / st.f_blocks
+        except OSError as e:
+            facts["errors"][f"disk {fs}"] = str(e)
+    facts["certs"] = {p: cert_end(p) for p in cfg["certs"]}
+    return facts
+
+
+def etcd_health(cfg):
+    if not cfg["etcd"]:
+        return []
+    ca, crt, key = tls_files(cfg)
+    r = subprocess.run(["etcdctl", f"--endpoints={','.join(cfg['etcd'])}", f"--cacert={ca}", f"--cert={crt}",
+                        f"--key={key}", "--dial-timeout=3s", "--command-timeout=5s", "endpoint", "health",
+                        "-w", "json"], capture_output=True, text=True, timeout=30)
+    try:
+        seen = {e["endpoint"]: e for e in json.loads(r.stdout or "[]")}
+    except ValueError:
+        seen = {}
+    return [seen.get(ep, {"endpoint": ep, "health": False, "error": "no answer"}) for ep in cfg["etcd"]]
+
+
+def backup_info():
+    r = subprocess.run(["runuser", "-u", "postgres", "--", "pgbackrest", "info", "--output=json"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"pgbackrest exit {r.returncode}")
+    return parse_backup_info(json.loads(r.stdout))
+
+
+def parse_backup_info(info):
+    out = {}
+    for st in info:
+        backups = st.get("backup", [])
+        fulls = [b["timestamp"]["stop"] for b in backups if b.get("type") == "full"]
+        out[st["name"]] = {
+            "status": st.get("status", {}).get("code", 99),
+            "message": st.get("status", {}).get("message"),
+            "last_full": max(fulls) if fulls else None,
+            "last_any": max((b["timestamp"]["stop"] for b in backups), default=None),
+        }
+    return out
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def wg_handshakes(cfg, errors):
+    if not cfg["wg_peers"]:
+        return {}
+    r = subprocess.run(["wg", "show", "wg0", "latest-handshakes"], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        errors["wireguard"] = r.stderr.strip() or "wg show failed"
+        return {}
+    seen = dict(line.split("\t") for line in r.stdout.splitlines() if "\t" in line)
+    out = {}
+    for name, pub in cfg["wg_peers"].items():
+        t = int(seen.get(pub, "0"))
+        out[name] = t if t > 0 else None
+    return out
+
+
+def cert_end(path):
+    r = subprocess.run(["openssl", "x509", "-noout", "-enddate", "-in", path], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return calendar.timegm(time.strptime(r.stdout.strip().split("=", 1)[1], "%b %d %H:%M:%S %Y %Z"))
+
+
+# ---------------------------------------------------------------- mail, main
+
+
+def send_mail(env_path, subject, body):
+    env = {}
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = env["SMTP_USER"], env["ALERT_TO"], subject
+    msg.set_content(body)
+    with smtplib.SMTP(env["SMTP_HOST"], int(env.get("SMTP_PORT", "587")), timeout=20) as s:
+        s.starttls(context=ssl.create_default_context())
+        s.login(env["SMTP_USER"], env["SMTP_TOKEN"])
+        s.send_message(msg)
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description="the database layer's checks and alerts")
+    ap.add_argument("--config", default="/etc/opencell/db-check.conf")
+    ap.add_argument("--state", default="/var/lib/oc-db-check/state.json")
+    ap.add_argument("--no-mail", action="store_true", help="log only; keep the events for the next run")
+    ap.add_argument("--test-mail", action="store_true", help="send one test message and exit")
+    a = ap.parse_args(argv)
+    cfg = load_config(a.config)
+    if a.test_mail:
+        send_mail(cfg["mail_env"], f"[OpenCell db] test from {cfg['host']}", "oc-db-check can send alerts.\n")
+        print("test mail sent")
+        return 0
+    state = read_json(a.state) or {}
+    now = int(time.time())
+    facts = collect(cfg, state)
+    current = evaluate(facts, cfg, now)
+    state, events = update_state(state, current, now)
+    state["archive_failed"] = {n: f["primary"]["archiver"]["failed_count"]
+                               for n, f in facts["clusters"].items() if f.get("primary")}
+    for key in sorted(current):
+        c = state["conditions"][key]
+        print(f"{'ALERT' if c['raised'] else 'pending'} {c['level']} {key}: {current[key]}")
+    if events and not a.no_mail:
+        try:
+            send_mail(cfg["mail_env"], *mail_text(events, cfg["host"]))
+            state = mark_sent(state)
+        except Exception as e:  # noqa: BLE001 -- retried next run
+            print(f"mail failed, retried next run: {e}")
+    print(f"oc-db-check: {len(current)} condition(s), {sum(c['raised'] for c in state['conditions'].values())} alerting, "
+          f"{len(state.get('pending', []))} unsent")
+    os.makedirs(os.path.dirname(a.state), exist_ok=True)
+    tmp = a.state + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, a.state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -383,9 +383,11 @@ static void test_import_tells_a_store_error_and_shows_no_keys(void)
     done();
 }
 
-/* ocbench net --chan-list's cases (firmware host-tests/test_ocbench.c),
- * ported with the text: MHz on the 915 grid, ':fixed', at most 12, no
- * whitespace; and no channel twice. */
+/* The channel-list text's cases, ported from ocbench net --chan-list's
+ * (test_chan_list_parse in firmware host-tests/test_ocbench.c, removed with
+ * ocbench net in firmware 73859af, plan 8 Task 12): these are now the only
+ * tests of that text. MHz on the 915 grid, ':fixed', at most 12, no
+ * whitespace; and, new here, no channel twice. */
 static void test_chan_parse_as_ocbench_did(void)
 {
     oc_sig_chan_list_t l;

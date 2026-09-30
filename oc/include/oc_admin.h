@@ -100,10 +100,10 @@ int oc_admin_sudo_field(const char *word, uint32_t peer_uid, uint32_t *sudo_uid)
  * spaces), or "" / "none" for an empty list. 0, or -1 with err set. */
 int oc_chan_parse(const char *text, oc_sig_chan_list_t *out, char *err, size_t cap);
 
-/* ocbench's text HSS (tools/ocbench/ocb_hss.h in opencell-firmware before
- * network core 2): its network key pair and its subscribers, with their
- * TMIDs, K, OPc and SQN, so activated terminals keep working without a new
- * QR code. All or nothing. Tokens are not carried over (their ids have no
+/* ocbench's text HSS (tools/ocbench/ocb_hss.h in opencell-firmware,
+ * removed with ocbench net in firmware 73859af, plan 8 Task 12): its
+ * network key pair and its subscribers, with their TMIDs, K, OPc and SQN,
+ * so activated terminals keep working without a new QR code. All or nothing. Tokens are not carried over (their ids have no
  * block index, spec §14.3). The keys go into the store (sealed there) and
  * nowhere else. 0 or 1, as oc_admin_run. */
 int oc_import_ocb_hss(oc_admin_t *a, const char *path, oc_buf_t *out);

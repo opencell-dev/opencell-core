@@ -211,7 +211,7 @@ static void test_the_key_check_is_written_with_the_first_migration(void)
     sqlite3_close(raw);
     oc_sql_t *s = open_db(db, KEY, NULL, 0, err); /* the real schema, from v0 */
     TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
-    TEST_ASSERT_EQUAL_INT(1, oc_sql_version(s));
+    TEST_ASSERT_EQUAL_INT(OC_SQL_VERSION, oc_sql_version(s));
     oc_sql_close(s);
     rm_dir();
 }
@@ -727,6 +727,95 @@ static uint64_t ask_one_vector(oc_sql_t *s, int first)
     return y.sqn;
 }
 
+/* A database at v1 (what oc-core v0.1.0 made on the bench and on
+ * oc-core-1) opens in this build at v2: backed up first, every row kept,
+ * the new indexes there. */
+static void test_a_v1_database_migrates_to_v2(void)
+{
+    char err[256];
+    const char *v1[] = { oc_sql_migration(0) };
+    fresh_dir();
+    oc_sql_t *s = open_db(db, KEY, v1, 1, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_sub_t x = a_sub(), y;
+    TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
+    oc_sql_close(s);
+    s = open_db(db, KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    TEST_ASSERT_EQUAL_INT(2, oc_sql_version(s));
+    TEST_ASSERT_NOT_NULL(strstr(oc_sql_backup(s), "core.db.v1."));
+    st = oc_sql_store(s);
+    TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, x.number, &y));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(x.k, y.k, 16);
+    sqlite3_stmt *q;
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(oc_sql_db(s),
+                                                        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN"
+                                                        " ('audit_number', 'cdr_caller', 'cdr_called', 'token_unused_expiry')",
+                                                        -1, &q, NULL));
+    TEST_ASSERT_EQUAL_INT(SQLITE_ROW, sqlite3_step(q));
+    TEST_ASSERT_EQUAL_INT(4, sqlite3_column_int(q, 0));
+    sqlite3_finalize(q);
+    oc_sql_close(s);
+    rm_dir();
+}
+
+/* The two reads and the one write the admin API adds beside the store. */
+static void test_cert_pins_and_the_expiry_scan(void)
+{
+    char err[256];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_cell_t c;
+    memset(&c, 0, sizeof(c));
+    c.cell_id = 4;
+    strcpy(c.name, "x");
+    c.enabled = 1;
+    TEST_ASSERT_EQUAL_INT(0, st.cell_put(st.ctx, &c));
+    const char *fpr = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_cell_cert_set(s, 4, fpr));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, oc_sql_cell_cert_set(s, 5, fpr));
+    c.boot_id = 9; /* oc_core's cell_put leaves the pin alone */
+    TEST_ASSERT_EQUAL_INT(0, st.cell_put(st.ctx, &c));
+    sqlite3_stmt *q;
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(oc_sql_db(s), "SELECT cert_fpr FROM cell WHERE cell_id = 4", -1,
+                                                        &q, NULL));
+    TEST_ASSERT_EQUAL_INT(SQLITE_ROW, sqlite3_step(q));
+    TEST_ASSERT_EQUAL_STRING(fpr, (const char *)sqlite3_column_text(q, 0));
+    sqlite3_finalize(q);
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_cell_cert_set(s, 4, NULL));
+
+    /* the scan: unactivated, unused token at or past its expiry */
+    const char *nums[] = { "+883160655501001", "+883160655501002", "+883160655501003", "+883160655501004" };
+    uint32_t expiry[] = { 100, 200, 300, 100 };
+    for (int i = 0; i < 4; i++) {
+        oc_core_sub_t x;
+        oc_core_token_t t;
+        memset(&x, 0, sizeof(x));
+        memset(&t, 0, sizeof(t));
+        TEST_ASSERT_EQUAL_INT(0, oc_sig_number_to_bcd(nums[i], 16, x.number));
+        x.state = OC_CORE_SUB_ACTIVE;
+        x.activated = i == 3; /* the fourth is activated: never released */
+        TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
+        memcpy(t.number, x.number, OC_SIG_NUMBER_LEN);
+        t.token_id[7] = (uint8_t)(i + 1);
+        t.expiry = expiry[i];
+        TEST_ASSERT_EQUAL_INT(0, st.token_put(st.ctx, &t));
+    }
+    uint8_t out[4][OC_SIG_NUMBER_LEN];
+    char text[OC_SIG_NUMBER_TEXT];
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_expired(s, 99, out, 4));
+    TEST_ASSERT_EQUAL_INT(2, oc_sql_expired(s, 200, out, 4));
+    oc_sig_number_to_text(out[0], text);
+    TEST_ASSERT_EQUAL_STRING("+883160655501001", text);
+    oc_sig_number_to_text(out[1], text);
+    TEST_ASSERT_EQUAL_STRING("+883160655501002", text);
+    TEST_ASSERT_EQUAL_INT(1, oc_sql_expired(s, 1000, out, 1)); /* at most max */
+    TEST_ASSERT_EQUAL_INT(3, oc_sql_expired(s, 1000, out, 4));
+    oc_sql_close(s);
+}
+
 static void test_sqn_rises_across_a_core_restart(void)
 {
     char err[256];
@@ -767,5 +856,7 @@ int main(void)
     RUN_TEST(test_begin_clears_a_leftover_transaction);
     RUN_TEST(test_the_last_list_version_outlives_a_malformed_row);
     RUN_TEST(test_sqn_rises_across_a_core_restart);
+    RUN_TEST(test_a_v1_database_migrates_to_v2);
+    RUN_TEST(test_cert_pins_and_the_expiry_scan);
     return UNITY_END();
 }

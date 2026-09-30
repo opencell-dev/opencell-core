@@ -33,7 +33,7 @@
 
 #include "oc_core_store.h"
 
-#define OC_SQL_VERSION 1 /* the schema this build writes */
+#define OC_SQL_VERSION 2 /* the schema this build writes */
 
 typedef struct oc_sql oc_sql_t;
 
@@ -59,5 +59,15 @@ const char     *oc_sql_backup(oc_sql_t *s);  /* the backup taken before migratin
 unsigned        oc_sql_unseal_failures(oc_sql_t *s); /* rows whose keys did not open (read as failed) */
 /* This build's migration i (taking user_version i to i + 1), or NULL. */
 const char     *oc_sql_migration(unsigned i);
+
+/* cell.cert_fpr (network-core spec §5), which oc_core does not keep (its
+ * cell_put leaves it alone): the pinned certificate's SHA-256, 64
+ * lowercase hex digits, or NULL to unpin. 0, OC_CORE_STORE_NONE (no such
+ * cell) or OC_CORE_STORE_FAILED. */
+int oc_sql_cell_cert_set(oc_sql_t *s, uint32_t cell_id, const char *fpr);
+/* For the release job (network-core spec §18.3): up to max unactivated
+ * subscribers whose unused token expired at or before now, oldest expiry
+ * first. How many, or -1 (the store failed). */
+int oc_sql_expired(oc_sql_t *s, uint32_t now, uint8_t (*out)[OC_SIG_NUMBER_LEN], int max);
 
 #endif

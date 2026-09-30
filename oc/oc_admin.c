@@ -78,8 +78,9 @@ void oc_buf_free(oc_buf_t *b)
 
 static const char USAGE[] =
     "commands: status | net init [--period S] | cell add ID NAME [--mode part15|part97] [--list N]\n"
-    "  | cell mode ID part15|part97 | cell revoke ID | cell list | sub add [NUMBER]\n"
-    "  | sub issue NUMBER [--valid-h H] | sub disable NUMBER | sub list | loc | cdr [N] | audit [N]\n"
+    "  | cell mode ID part15|part97 | cell revoke ID | cell cert ID FPR|none | cell list | sub add [NUMBER]\n"
+    "  | sub issue NUMBER [--valid-h H] | sub disable NUMBER | sub enable NUMBER | sub release NUMBER\n"
+    "  | sub list | loc | cdr [N] | audit [N]\n"
     "  | list set ID MHZ[:fixed],...|none [--force] | list show | import-ocb-hss FILE (--offline only)\n"
     "list set --force: replace a stored list that can't be read (a damaged row), at the version after\n"
     "  the last one written, so every cell of the group takes it\n";
@@ -348,7 +349,8 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
     int add = argc >= 4 && strcmp(argv[1], "add") == 0 && opts_ok(argc, argv, 4, add_flags) == 0;
     int mode = argc == 4 && strcmp(argv[1], "mode") == 0;
     int revoke = argc == 3 && strcmp(argv[1], "revoke") == 0;
-    if (!add && !mode && !revoke) return 2;
+    int cert = argc == 4 && strcmp(argv[1], "cert") == 0;
+    if (!add && !mode && !revoke && !cert) return 2;
     unsigned long id = strtoul(argv[2], &end, 10);
     if (*end != '\0' || end == argv[2] || argv[2][0] == '-' || id == 0 || id > 0xFFFFFFFFul) {
         oc_buf_printf(o, "cell id '%s': 1-4294967295\n", argv[2]);
@@ -385,6 +387,24 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         return 1;
     }
     if (got != 0) return store_error(o, "the cell can't be read (nothing changed)");
+    if (cert) {
+        char fpr[65];
+        int none = strcmp(argv[3], "none") == 0;
+        if (!none && oc_admin_fpr(argv[3], fpr) != 0) {
+            oc_buf_printf(o, "fingerprint '%s': the certificate's SHA-256, 64 hex digits (oc-ca prints it), or none\n",
+                          argv[3]);
+            return 1;
+        }
+        if (!none && !c.enabled) {
+            oc_buf_printf(o, "cell %lu is revoked: nothing pinned\n", id);
+            return 1;
+        }
+        if (oc_sql_cell_cert_set(a->sql, (uint32_t)id, none ? NULL : fpr) != 0) {
+            return store_error(o, "the fingerprint was not stored");
+        }
+        oc_buf_printf(o, "cell %lu: %s\n", id, none ? "no certificate pinned" : "certificate pinned");
+        return 0;
+    }
     if (mode) {
         if (mode_arg(argv[3], &c.mode, o) != 0) return 1;
         if (!c.enabled) {
@@ -400,13 +420,28 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         }
         return 0;
     }
-    if (!c.enabled) {
+    if (!c.enabled) { /* unpinned again: an earlier revoke may have failed between the two writes */
+        if (oc_sql_cell_cert_set(a->sql, (uint32_t)id, NULL) != 0) return store_error(o, "the pin was not removed");
         oc_buf_printf(o, "cell %lu is revoked already: nothing changed\n", id);
         return 0;
     }
     if ((k = core(a, o)) == NULL) return 1;
     if (oc_core_cell_revoke(k, (uint32_t)id, now_us(a)) != 0) return store_error(o, "the cell was not revoked");
-    oc_buf_printf(o, "cell %lu revoked: its link is dropped and its HELLO refused\n", id);
+    if (oc_sql_cell_cert_set(a->sql, (uint32_t)id, NULL) != 0) {
+        return store_error(o, "the cell is revoked, but its certificate is still pinned: run this again");
+    }
+    oc_buf_printf(o, "cell %lu revoked: its link is dropped, its HELLO refused and its certificate unpinned\n", id);
+    return 0;
+}
+
+int oc_admin_fpr(const char *text, char out[65])
+{
+    if (strlen(text) != 64) return -1;
+    for (int i = 0; i < 64; i++) {
+        if (!isxdigit((unsigned char)text[i])) return -1;
+        out[i] = (char)tolower((unsigned char)text[i]);
+    }
+    out[64] = '\0';
     return 0;
 }
 
@@ -459,9 +494,29 @@ static int cmd_sub(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
     }
     int issue = argc >= 3 && strcmp(argv[1], "issue") == 0 && opts_ok(argc, argv, 3, issue_flags) == 0;
     int disable = argc == 3 && strcmp(argv[1], "disable") == 0;
-    if (!issue && !disable) return 2;
+    int enable = argc == 3 && strcmp(argv[1], "enable") == 0;
+    int release = argc == 3 && strcmp(argv[1], "release") == 0;
+    if (!issue && !disable && !enable && !release) return 2;
     if (number_arg(argv[2], n, o) != 0) return 1;
     memcpy(a->audit_number, n, OC_SIG_NUMBER_LEN);
+    if (enable || release) {
+        char why[16];
+        snprintf(why, sizeof(why), "u%u", a->uid);
+        if ((k = core(a, o)) == NULL) return 1;
+        int r = enable ? oc_core_sub_enable(k, n) : oc_core_sub_release(k, n, why);
+        if (r == OC_CORE_E_NOT_FOUND) {
+            oc_buf_printf(o, "%s: not a subscriber (no such subscriber)\n", show(n, sh));
+            return 1;
+        }
+        if (r == OC_CORE_E_ACTIVATED) {
+            oc_buf_printf(o, "%s is activated: only an unactivated number is released (sub disable stops it)\n",
+                          show(n, sh));
+            return 1;
+        }
+        if (r != 0) return store_error(o, enable ? "the subscriber was not enabled" : "the number was not released");
+        oc_buf_printf(o, "%s %s\n", show(n, sh), enable ? "enabled: it may register again" : "released: it is free");
+        return 0;
+    }
     long hours = 24;
     if (issue && opt_num(argc, argv, "--valid-h", 1, 720, &hours, o) < 0) return 1;
     if (issue && !home(a, n)) {
@@ -558,7 +613,8 @@ static const char *event_name(int e)
 {
     static const char *const names[] = { "?",           "ACTIVATE",    "ACT_FAIL",   "REGISTER",
                                          "AUTH_FAIL",   "RESYNC",      "LOC_CANCEL", "TOKEN_ISSUE",
-                                         "SUB_DISABLE", "CELL_REJECT", "ADMIN" };
+                                         "SUB_DISABLE", "CELL_REJECT", "ADMIN",       "API",
+                                         "SUB_RELEASE", "SUB_ENABLE" };
     return e >= 0 && e < (int)(sizeof(names) / sizeof(names[0])) ? names[e] : "?";
 }
 

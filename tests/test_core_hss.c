@@ -184,6 +184,123 @@ static void test_token_issue_fills_the_qr_and_voids_the_old_token(void)
     TEST_ASSERT_EQUAL_INT(-1, oc_core_token_issue(&K, n, 3600, &qr2)); /* not a subscriber */
 }
 
+/* The admin API's sub.create (portal spec §7): the subscriber and its
+ * first token in one go, refused by rule (each its own code) or by the
+ * store (nothing written); the QR it gives activates a terminal. */
+static void test_sub_create_makes_the_subscriber_and_its_token_at_once(void)
+{
+    uint8_t n[OC_SIG_NUMBER_LEN];
+    oc_sig_qr_t qr;
+    core_world();
+    hello(10, 1, 1);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_route_add(&K.route, "8831606555", 2, 2)); /* core 2's exchange */
+    number("+883160677701234", n);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_create(&K, n, 72u * 3600u, &qr));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(n, qr.number, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 1u + 72u * 3600u, qr.expiry);
+    TEST_ASSERT_EQUAL_UINT16(1, oc_core_token_block(qr.token_id));
+    oc_core_sub_t s;
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_SUB_ACTIVE, s.state);
+    TEST_ASSERT_EQUAL_UINT8(0, s.activated);
+    oc_core_token_t t;
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &t));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(qr.token_secret, t.secret, 16);
+    TEST_ASSERT_NOT_NULL(oc_core_mem_audit(&MEM, OC_CORE_AUDIT_TOKEN_ISSUE));
+    term_t term1;
+    term(&term1, TMID, 0x42, &qr);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, activate(10, &term1)->u.act_res.msg.type);
+
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_TAKEN, oc_core_sub_create(&K, n, 3600, &qr));
+    number("+883160677709911", n);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_NOT_ASSIGNABLE, oc_core_sub_create(&K, n, 3600, &qr)); /* reserved */
+    number("+883160655501234", n);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_NOT_ASSIGNABLE, oc_core_sub_create(&K, n, 3600, &qr)); /* core 2's */
+    number("+883185955520000", n);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_NOT_ASSIGNABLE, oc_core_sub_create(&K, n, 3600, &qr)); /* no block */
+    memset(n, 0, sizeof(n));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_INVALID, oc_core_sub_create(&K, n, 3600, &qr));
+
+    unsigned nsub = MEM.d.nsub, ntoken = MEM.d.ntoken, naudit = MEM.d.naudit;
+    number("+883160677701235", n);
+    MEM.fail_reads = OC_CORE_MEM_FAIL_SUB_GET; /* can't tell whether it is free: not taken for free */
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_STORE, oc_core_sub_create(&K, n, 3600, &qr));
+    MEM.fail_reads = 0;
+    MEM.fail_commits = 1;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_STORE, oc_core_sub_create(&K, n, 3600, &qr));
+    TEST_ASSERT_EQUAL_UINT(nsub, MEM.d.nsub);
+    TEST_ASSERT_EQUAL_UINT(ntoken, MEM.d.ntoken);
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_create(&K, n, 3600, &qr)); /* and it works once the store does */
+}
+
+/* sub.release: only an unactivated number, and then it is free again. */
+static void test_sub_release_frees_only_an_unactivated_number(void)
+{
+    uint8_t n[OC_SIG_NUMBER_LEN];
+    oc_sig_qr_t qr, qr2;
+    core_world();
+    hello(10, 1, 1);
+    number("+883160677701234", n);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_create(&K, n, 3600, &qr));
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_release(&K, n, "a7"));
+    oc_core_sub_t s;
+    oc_core_token_t t;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, ST.token_get(ST.ctx, qr.token_id, &t));
+    const oc_core_audit_t *a = oc_core_mem_audit(&MEM, OC_CORE_AUDIT_SUB_RELEASE);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_STRING("a7", a->detail);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(n, a->number, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_NOT_FOUND, oc_core_sub_release(&K, n, "a7"));
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_create(&K, n, 3600, &qr2)); /* free again */
+    term_t term1; /* the old code is void: only the new one activates */
+    term(&term1, TMID, 0x42, &qr);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_NAK, activate(10, &term1)->u.act_res.msg.type);
+    term(&term1, TMID, 0x42, &qr2);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, activate(10, &term1)->u.act_res.msg.type);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_ACTIVATED, oc_core_sub_release(&K, n, "a7"));
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+
+    number("+883160677701235", n);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_create(&K, n, 3600, &qr));
+    unsigned naudit = MEM.d.naudit;
+    MEM.fail_commits = 1;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_STORE, oc_core_sub_release(&K, n, "a7"));
+    TEST_ASSERT_EQUAL_INT(0, ST.sub_get(ST.ctx, n, &s));
+    TEST_ASSERT_EQUAL_INT(0, ST.token_get(ST.ctx, qr.token_id, &t));
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    MEM.fail_reads = OC_CORE_MEM_FAIL_SUB_GET; /* not "not found" */
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_STORE, oc_core_sub_release(&K, n, "a7"));
+    MEM.fail_reads = 0;
+}
+
+/* sub.enable undoes sub.disable: the bound terminal gets vectors again. */
+static void test_sub_enable_undoes_a_disable(void)
+{
+    oc_sig_qr_t qr = sub_world();
+    term_t t;
+    term(&t, TMID, 0x42, &qr);
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_ACT_ACK, activate(10, &t)->u.act_res.msg.type);
+    uint8_t n[OC_SIG_NUMBER_LEN];
+    number(NUM, n);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_disable(&K, n, NOW));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_DISABLED, ask_avs(10, TMID, 1)->u.av_res.status);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_enable(&K, n));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AV_OK, ask_avs(10, TMID, 1)->u.av_res.status);
+    const oc_core_audit_t *a = oc_core_mem_audit(&MEM, OC_CORE_AUDIT_SUB_ENABLE);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_HEX32(TMID, a->tmid);
+    unsigned naudit = MEM.d.naudit;
+    TEST_ASSERT_EQUAL_INT(0, oc_core_sub_enable(&K, n)); /* enabled already: nothing written */
+    TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+    number("+883160655509999", n);
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_NOT_FOUND, oc_core_sub_enable(&K, n));
+    MEM.fail_reads = OC_CORE_MEM_FAIL_SUB_GET;
+    TEST_ASSERT_EQUAL_INT(OC_CORE_E_STORE, oc_core_sub_enable(&K, n));
+    MEM.fail_reads = 0;
+}
+
 /* NUM bound to TMID with qr's token used, as an activation leaves it (set
  * by hand: this test is about disabling). */
 static void bind_by_hand(const oc_sig_qr_t *qr)
@@ -1102,6 +1219,9 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_subscribers_are_added_by_policy);
     RUN_TEST(test_token_issue_fills_the_qr_and_voids_the_old_token);
+    RUN_TEST(test_sub_create_makes_the_subscriber_and_its_token_at_once);
+    RUN_TEST(test_sub_release_frees_only_an_unactivated_number);
+    RUN_TEST(test_sub_enable_undoes_a_disable);
     RUN_TEST(test_disable_cancels_the_location_and_voids_tokens);
     RUN_TEST(test_token_issue_commit_failure_changes_nothing);
     RUN_TEST(test_sub_disable_commit_failure_changes_nothing);

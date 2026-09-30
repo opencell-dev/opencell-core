@@ -141,4 +141,29 @@ int  oc_core_token_issue(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], 
  * is told (LOC_CANCEL disabled). 0 or -1. */
 int  oc_core_sub_disable(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint64_t now_us);
 
+/* The admin API's subscriber operations (portal spec §7, network-core spec
+ * §18.1 and §18.3). Each returns 0 or an OC_CORE_E_* saying which rule
+ * refused it; a store that can't answer is OC_CORE_E_STORE, never "not
+ * found" or "taken" (oc_core_store.h), and then nothing is changed. */
+enum {
+    OC_CORE_E_INVALID = -1,        /* not a valid full number */
+    OC_CORE_E_NOT_ASSIGNABLE = -2, /* reserved, or not in a block this core is home for */
+    OC_CORE_E_TAKEN = -3,          /* a subscriber already */
+    OC_CORE_E_NOT_FOUND = -4,      /* not a subscriber */
+    OC_CORE_E_ACTIVATED = -5,      /* bound to a terminal: only an unactivated number is released */
+    OC_CORE_E_STORE = -6           /* the store failed: nothing changed */
+};
+/* A new subscriber and its first token, in one transaction (the portal's
+ * sub.create): *qr is what its QR code carries, valid for valid_s. */
+int  oc_core_sub_create(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint32_t valid_s, oc_sig_qr_t *qr);
+/* An unactivated subscriber goes, with its unused tokens and any vectors:
+ * the number is free again. Audited SUB_RELEASE with why ("expired",
+ * "a<account>", "u<uid>"). A number whose terminal was taken over by
+ * another activation (activated 0 again) counts as unactivated. */
+int  oc_core_sub_release(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], const char *why);
+/* A disabled subscriber may register again; its terminal is still bound,
+ * and no token is issued (a disable voided them). Audited SUB_ENABLE.
+ * Enabling an enabled one changes nothing and writes no record. */
+int  oc_core_sub_enable(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN]);
+
 #endif

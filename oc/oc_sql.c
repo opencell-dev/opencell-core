@@ -50,7 +50,16 @@ static const char SCHEMA_V1[] =
     "CREATE TABLE audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, event INTEGER NOT NULL,"
     " number TEXT, tmid INTEGER NOT NULL, cell_id INTEGER NOT NULL, detail TEXT NOT NULL);";
 
-static const char *const MIGRATIONS[] = { SCHEMA_V1 };
+/* v2 (portal plan P4, the admin API): indexes only. An API call names one
+ * number, so its last registration (the audit), its calls (cdr) and the
+ * expiry job's scan of unused tokens must not read whole tables. */
+static const char SCHEMA_V2[] =
+    "CREATE INDEX audit_number ON audit(number, event, ts) WHERE number IS NOT NULL;"
+    "CREATE INDEX cdr_caller ON cdr(caller, setup);"
+    "CREATE INDEX cdr_called ON cdr(called, setup);"
+    "CREATE INDEX token_unused_expiry ON token(expiry) WHERE used_at = 0;";
+
+static const char *const MIGRATIONS[] = { SCHEMA_V1, SCHEMA_V2 };
 
 static const char KEY_CHECK[] = "OpenCell master key";
 
@@ -506,6 +515,14 @@ static int token_void(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
     return by_number(S(c), "DELETE FROM token WHERE number = ? AND used_at = 0", number);
 }
 
+/* -1 when there was none, which does not doom the transaction (as loc_del). */
+static int sub_del(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
+{
+    oc_sql_t *s = S(c);
+    if (by_number(s, "DELETE FROM subscriber WHERE number = ?", number) != 0) return -1;
+    return sqlite3_changes(s->db) > 0 ? 0 : -1;
+}
+
 /* ---- issued vectors ---- */
 
 static int av_put(void *c, const oc_core_av_issued_t *a)
@@ -894,6 +911,37 @@ const char *oc_sql_migration(unsigned i)
 }
 
 sqlite3 *oc_sql_db(oc_sql_t *s) { return s->db; }
+
+int oc_sql_cell_cert_set(oc_sql_t *s, uint32_t cell_id, const char *fpr)
+{
+    int b = SQLITE_OK; /* the binds' codes, OR-ed */
+    if (blocked(s)) return OC_CORE_STORE_FAILED;
+    sqlite3_stmt *st = prep(s, "UPDATE cell SET cert_fpr = ? WHERE cell_id = ?");
+    if (st != NULL) {
+        b |= fpr != NULL ? sqlite3_bind_text(st, 1, fpr, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 1);
+        b |= sqlite3_bind_int64(st, 2, cell_id);
+    }
+    if (run(s, st, b) != 0) return OC_CORE_STORE_FAILED;
+    return sqlite3_changes(s->db) > 0 ? 0 : OC_CORE_STORE_NONE;
+}
+
+int oc_sql_expired(oc_sql_t *s, uint32_t now, uint8_t (*out)[OC_SIG_NUMBER_LEN], int max)
+{
+    int n = 0, rc = SQLITE_DONE;
+    sqlite3_stmt *st = prep(s, "SELECT s.number FROM token t JOIN subscriber s ON s.number = t.number"
+                               " WHERE t.used_at = 0 AND t.expiry <= ? AND s.activated = 0"
+                               " ORDER BY t.expiry LIMIT ?");
+    if (st == NULL || sqlite3_bind_int64(st, 1, now) != SQLITE_OK || sqlite3_bind_int(st, 2, max) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    while (n < max && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (num_col(st, 0, out[n]) == 0) n++;
+    }
+    if (n < max && rc != SQLITE_DONE) n = -1;
+    sqlite3_finalize(st);
+    return n;
+}
 int oc_sql_version(oc_sql_t *s) { return user_version(s->db); }
 const char *oc_sql_backup(oc_sql_t *s) { return s->backup; }
 unsigned oc_sql_unseal_failures(oc_sql_t *s) { return s->unseal_failures; }
@@ -914,6 +962,7 @@ oc_core_store_t oc_sql_store(oc_sql_t *s)
         .sub_get = sub_get,
         .sub_by_tmid = sub_by_tmid,
         .sub_put = sub_put,
+        .sub_del = sub_del,
         .token_get = token_get,
         .token_put = token_put,
         .token_void = token_void,

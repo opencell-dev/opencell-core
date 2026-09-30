@@ -218,6 +218,19 @@ static int sub_put(void *c, const oc_core_sub_t *s)
     return 0;
 }
 
+static int sub_del(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
+{
+    if (refuse(c)) return -1;
+    oc_core_mem_data_t *d = D(c);
+    for (unsigned i = 0; i < d->nsub; i++) {
+        if (num_eq(d->sub[i].number, number)) {
+            d->sub[i] = d->sub[--d->nsub];
+            return 0;
+        }
+    }
+    return -1; /* nothing to delete: not fail_txn(c), as loc_del */
+}
+
 static int token_get(void *c, const uint8_t token_id[8], oc_core_token_t *out)
 {
     if (M(c)->fail_reads & OC_CORE_MEM_FAIL_TOKEN_GET) return OC_CORE_STORE_FAILED;
@@ -440,6 +453,7 @@ oc_core_store_t oc_core_mem_store(oc_core_mem_t *m)
         .sub_get = sub_get,
         .sub_by_tmid = sub_by_tmid,
         .sub_put = sub_put,
+        .sub_del = sub_del,
         .token_get = token_get,
         .token_put = token_put,
         .token_void = token_void,

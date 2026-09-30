@@ -13,8 +13,11 @@
  *   net init [--period S]                  the network key pair (first setup)
  *   cell add ID NAME [--mode part15|part97] [--list N]
  *   cell mode ID part15|part97             the cell reconnects to take it
- *   cell revoke ID | cell list
+ *   cell revoke ID | cell list             revoking also unpins its certificate
+ *   cell cert ID FPR|none                  pin the cell's certificate (SHA-256, 64 hex digits)
  *   sub add [NUMBER] | sub issue NUMBER [--valid-h H] | sub disable NUMBER | sub list
+ *   sub enable NUMBER                      a disabled number may register again
+ *   sub release NUMBER                     an unactivated number is freed (network-core spec §18.3)
  *   loc | cdr [N] | audit [N]
  *   list set ID MHZ[:fixed],...|none [--force] | list show
  *                                          --force: replace a stored list that
@@ -95,6 +98,10 @@ int oc_admin_run(oc_admin_t *a, int argc, char **argv, oc_buf_t *out);
  * client then asks again without it, once. */
 #define OC_ADMIN_SUDO_FIELD "--sudo-uid="
 int oc_admin_sudo_field(const char *word, uint32_t peer_uid, uint32_t *sudo_uid);
+
+/* A certificate fingerprint as typed (64 hex digits, either case) into its
+ * stored form, lowercase: 0, or -1 if it is not one. */
+int oc_admin_fpr(const char *text, char out[65]);
 
 /* "917.25,922.25:fixed" (MHz on the 915 grid, at most OC_SIG_CHAN_MAX, no
  * spaces), or "" / "none" for an empty list. 0, or -1 with err set. */

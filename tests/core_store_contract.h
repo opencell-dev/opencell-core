@@ -240,6 +240,22 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n1, &s2));
     TEST_ASSERT_EQUAL_UINT64(6, s2.sqn);
     TEST_ASSERT_EQUAL_INT(0, st->token_get(c, t1.token_id, &tg));
+
+    /* a subscriber deleted (a released number): gone; deleting it again
+     * finds nothing (-1), and inside a transaction that does not doom it */
+    memcpy(s.number, n2, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
+    TEST_ASSERT_EQUAL_INT(0, st->sub_del(c, n2));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->sub_get(c, n2, &s2));
+    TEST_ASSERT_EQUAL_INT(-1, st->sub_del(c, n2));
+    TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n1, &s2)); /* the other one stays */
+    s.sqn = 8;
+    TEST_ASSERT_EQUAL_INT(0, st->begin(c));
+    TEST_ASSERT_EQUAL_INT(-1, st->sub_del(c, n2));
+    TEST_ASSERT_EQUAL_INT(0, st->sub_put(c, &s));
+    TEST_ASSERT_EQUAL_INT(0, st->commit(c)); /* not doomed */
+    TEST_ASSERT_EQUAL_INT(0, st->sub_get(c, n2, &s2));
+    TEST_ASSERT_EQUAL_UINT64(8, s2.sqn);
 }
 
 #endif

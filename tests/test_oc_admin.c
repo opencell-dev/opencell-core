@@ -137,6 +137,57 @@ static void test_issue_and_disable(void)
     done();
 }
 
+/* The operations the admin API added (portal spec §7) are the CLI's too:
+ * sub enable, sub release, cell cert; a revoke unpins. */
+static void test_enable_release_and_cert_pins(void)
+{
+    world();
+    TEST_ASSERT_EQUAL_INT(0, run("net init"));
+    TEST_ASSERT_EQUAL_INT(0, run("sub add +883160655501236"));
+    TEST_ASSERT_EQUAL_INT(0, run("sub disable +883160655501236"));
+    TEST_ASSERT_EQUAL_INT(0, run("sub enable +883160655501236"));
+    HAS("enabled: it may register again");
+    TEST_ASSERT_EQUAL_INT(0, run("sub list"));
+    HAS("+883160655501236  active    not activated");
+    TEST_ASSERT_EQUAL_INT(0, run("sub release +883-1-606-555-01236"));
+    HAS("released: it is free");
+    TEST_ASSERT_EQUAL_INT(1, run("sub release +883160655501236"));
+    HAS("no such subscriber");
+    TEST_ASSERT_EQUAL_INT(1, run("sub enable +883160655501236"));
+    TEST_ASSERT_EQUAL_INT(0, run("audit 20"));
+    HAS("SUB_RELEASE  +883160655501236  tmid 00000000  cell 0  u1000");
+    HAS("SUB_ENABLE");
+
+    TEST_ASSERT_EQUAL_INT(0, run("cell add 3 site3"));
+    const char *fpr = "00112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff";
+    char line[128];
+    snprintf(line, sizeof(line), "cell cert 3 %s", fpr);
+    TEST_ASSERT_EQUAL_INT(0, run(line));
+    HAS("certificate pinned");
+    sqlite3_stmt *q;
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(oc_sql_db(sql), "SELECT cert_fpr FROM cell WHERE cell_id = 3",
+                                                        -1, &q, NULL));
+    TEST_ASSERT_EQUAL_INT(SQLITE_ROW, sqlite3_step(q));
+    TEST_ASSERT_EQUAL_STRING("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                             (const char *)sqlite3_column_text(q, 0)); /* stored lowercase */
+    sqlite3_finalize(q);
+    TEST_ASSERT_EQUAL_INT(1, run("cell cert 3 0011"));
+    HAS("64 hex digits");
+    TEST_ASSERT_EQUAL_INT(1, run("cell cert 9 none"));
+    HAS("no cell 9");
+    TEST_ASSERT_EQUAL_INT(0, run("cell revoke 3"));
+    HAS("certificate unpinned");
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(oc_sql_db(sql), "SELECT cert_fpr IS NULL FROM cell WHERE cell_id = 3",
+                                                        -1, &q, NULL));
+    TEST_ASSERT_EQUAL_INT(SQLITE_ROW, sqlite3_step(q));
+    TEST_ASSERT_EQUAL_INT(1, sqlite3_column_int(q, 0));
+    sqlite3_finalize(q);
+    snprintf(line, sizeof(line), "cell cert 3 %s", fpr);
+    TEST_ASSERT_EQUAL_INT(1, run(line));
+    HAS("cell 3 is revoked: nothing pinned");
+    done();
+}
+
 static void test_channel_lists(void)
 {
     world();
@@ -718,6 +769,7 @@ int main(void)
     RUN_TEST(test_import_takes_the_write_lock_first);
     RUN_TEST(test_first_setup_and_subscribers);
     RUN_TEST(test_issue_and_disable);
+    RUN_TEST(test_enable_release_and_cert_pins);
     RUN_TEST(test_channel_lists);
     RUN_TEST(test_import_keeps_activated_terminals);
     RUN_TEST(test_import_is_all_or_nothing);

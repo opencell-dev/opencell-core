@@ -319,7 +319,7 @@ static void test_refusals_have_their_own_status(void)
     TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_CREATE, "+883171746401000", 1));
     TEST_ASSERT_EQUAL_HEX8(OC_API_TAKEN, num_op(OC_API_SUB_CREATE, "+883171746401000", 1));
     TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, num_op(OC_API_SUB_REISSUE, "+883171746401001", 1));
-    TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, num_op(OC_API_SUB_RELEASE, "+883171746401001", 1));
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_RELEASE, "+883171746401001", 1)); /* free already: ok */
     TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, num_op(OC_API_SUB_DISABLE, "+883171746401001", 1));
     TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, num_op(OC_API_SUB_ENABLE, "+883171746401001", 1));
 
@@ -707,6 +707,57 @@ static void test_rate_limits_refuse_and_are_audited_once_a_minute(void)
     done();
 }
 
+/* Operations the core does not have (route.offer until P5, op 0, an
+ * unknown op) are rate-limited like the rest: a flood of them is answered
+ * rate_limited and adds a few audit records, not one per call. */
+static void test_unsupported_operations_are_rate_limited_too(void)
+{
+    world();
+    req_t r;
+    long before = count_rows("SELECT count(*) FROM audit");
+    int unsupported = 0, limited = 0;
+    static const uint8_t ops[] = { OC_API_ROUTE_OFFER, 0x00, 0x42, 0x7f };
+    for (int i = 0; i < 3000; i++) {
+        begin(&r, ops[i % 4], (uint32_t)i, 9);
+        put32(&r, 1);
+        uint8_t st = call1(&r);
+        if (st == OC_API_UNSUPPORTED) unsupported++;
+        else if (st == OC_API_RATE_LIMITED) limited++;
+        else TEST_FAIL_MESSAGE("neither unsupported nor rate_limited");
+    }
+    TEST_ASSERT_EQUAL_INT(3000, unsupported + limited);
+    TEST_ASSERT_TRUE_MESSAGE(unsupported <= 12, "route.offer's burst (2) and the unknown ops' (10)");
+    TEST_ASSERT_TRUE_MESSAGE(count_rows("SELECT count(*) FROM audit") - before <= 14, "one audit record per call");
+    mono += 60000000u;
+    oc_api_tick(&api); /* the minute's counts: one record for each bucket */
+    TEST_ASSERT_TRUE(count_rows("SELECT count(*) FROM audit") - before <= 16);
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit"
+                                             " WHERE detail LIKE 'a9 route.offer rate_limited x% in 60 s'"));
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit"
+                                             " WHERE detail LIKE 'a9 unknown rate_limited x% in 60 s'"));
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_NUM_CHECK, "+883171746412345", 9)); /* the rest go on */
+    done();
+}
+
+/* sub.release is idempotent: a number that is free already - released by
+ * the 72 h job a moment before, or never taken - answers ok, so the
+ * portal's account deletion never fails on a number the core freed. */
+static void test_releasing_a_free_number_is_ok(void)
+{
+    world();
+    char detail[64], number[32];
+    const char *N = "+883171746412345";
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_CREATE, N, 1));
+    wall = UNIX0 + OC_API_TOKEN_S; /* its code expired: the release before the call frees it */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_RELEASE, N, 7));
+    last_audit(detail, sizeof(detail), number, sizeof(number));
+    TEST_ASSERT_EQUAL_STRING("a7 sub.release ok free already", detail);
+    TEST_ASSERT_EQUAL_STRING(N, number);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_RELEASE, N, 7)); /* and again */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, num_op(OC_API_SUB_STATUS, N, 7));
+    done();
+}
+
 /* sub.release_expired (network-core spec §18.3): an unactivated number
  * whose 72 h code has passed is free again - at once for a call about it,
  * and for every number at the minute's sweep. Activated numbers never go. */
@@ -771,5 +822,7 @@ int main(void)
     RUN_TEST(test_core_status);
     RUN_TEST(test_rate_limits_refuse_and_are_audited_once_a_minute);
     RUN_TEST(test_expired_unactivated_numbers_are_released);
+    RUN_TEST(test_unsupported_operations_are_rate_limited_too);
+    RUN_TEST(test_releasing_a_free_number_is_ok);
     return UNITY_END();
 }

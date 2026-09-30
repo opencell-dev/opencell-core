@@ -25,7 +25,8 @@
  *                                                        token expiry (4, 0 none), registered (1),
  *                                                        cell (4, 0 none), the TMID's top 16 bits (2),
  *                                                        last seen (4, unix s, 0 never)
- *   0x06 sub.release      number                         -
+ *   0x06 sub.release      number                         -  (ok, too, when the number is free already:
+ *                                                        released by the 72 h job, or never taken)
  *   0x07 sub.disable      number                         -
  *   0x08 sub.enable       number                         -
  *   0x09 cdr.list         number, since (4, unix s)      rows, newest first, at most OC_API_CDR_MAX:
@@ -54,6 +55,8 @@
  * <status> [what]", the number in the record's number column, the cell in
  * its cell column), except calls a rate limit refused: the first in each
  * minute is audited, the rest counted into one record at the minute's end.
+ * Every operation has its rate limit, route.offer too; op 0 and unknown
+ * ops share one of their own, named "unknown" (api_rate = unknown ...). 
  *
  * An unactivated number whose token has expired is released before any
  * call about it (sub.release_expired, network-core spec §18.3), and every

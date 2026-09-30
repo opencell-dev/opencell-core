@@ -16,6 +16,9 @@ static const struct {
     const char *name;
     uint32_t    per_hour, burst;
 } OPS[OC_API_OPS] = {
+    /* 0: every operation the core does not have (op 0, an unknown op): one
+     * bucket, so a flood of them is refused and audited once a minute too */
+    [0] = { "unknown", 60, 10 },
     [OC_API_NUM_FREE] = { "num.free", 600, 60 },         [OC_API_NUM_CHECK] = { "num.check", 600, 60 },
     [OC_API_SUB_CREATE] = { "sub.create", 120, 20 },     [OC_API_SUB_REISSUE] = { "sub.reissue", 120, 20 },
     [OC_API_SUB_STATUS] = { "sub.status", 7200, 120 },   [OC_API_SUB_RELEASE] = { "sub.release", 120, 20 },
@@ -483,6 +486,10 @@ static uint8_t op_sub_change(call_t *c, uint8_t op, uint32_t actor)
         char why[16];
         snprintf(why, sizeof(why), "a%u", (unsigned)actor);
         e = oc_core_sub_release(c->a->core, n, why);
+        if (e == OC_CORE_E_NOT_FOUND) { /* idempotent: free already (the 72 h job, an earlier call) */
+            snprintf(c->a->audit_what, sizeof(c->a->audit_what), "free already");
+            e = 0;
+        }
     } else if (op == OC_API_SUB_ENABLE) {
         e = oc_core_sub_enable(c->a->core, n);
     } else {
@@ -681,7 +688,7 @@ static uint8_t op_core_status(call_t *c)
 
 void oc_api_init(oc_api_t *a)
 {
-    for (unsigned op = 1; op < OC_API_OPS; op++) {
+    for (unsigned op = 0; op < OC_API_OPS; op++) {
         memset(&a->rate[op], 0, sizeof(a->rate[op]));
         a->rate[op].per_hour = OPS[op].per_hour;
         a->rate[op].burst = OPS[op].burst;
@@ -701,7 +708,7 @@ int oc_api_rate_set(oc_api_t *a, const char *spec, char *err, size_t cap)
         snprintf(err, cap, "api_rate = '%s': OP PER_HOUR BURST, e.g. sub.disable 30 10 (burst 1-100000)", spec);
         return -1;
     }
-    for (unsigned op = 1; op < OC_API_OPS; op++) {
+    for (unsigned op = 0; op < OC_API_OPS; op++) {
         if (strcmp(name, OPS[op].name) != 0) continue;
         a->rate[op].per_hour = (uint32_t)per_hour;
         a->rate[op].burst = (uint32_t)burst;
@@ -729,7 +736,7 @@ static int allowed(oc_api_t *a, unsigned op)
     return 1;
 }
 
-static void audit(oc_api_t *a, uint32_t actor, unsigned op, uint8_t status, const char *extra)
+static void audit(oc_api_t *a, uint32_t actor, const char *opname, uint8_t status, const char *extra)
 {
     oc_core_audit_t r;
     oc_core_store_t st = store(a);
@@ -738,16 +745,21 @@ static void audit(oc_api_t *a, uint32_t actor, unsigned op, uint8_t status, cons
     r.event = OC_CORE_AUDIT_API;
     memcpy(r.number, a->audit_number, OC_SIG_NUMBER_LEN);
     r.cell_id = a->audit_cell;
-    char opname[8];
-    snprintf(opname, sizeof(opname), "op%u", op);
-    snprintf(r.detail, sizeof(r.detail), "a%u %s %s%s%s", (unsigned)actor,
-             op > 0 && op < OC_API_OPS ? OPS[op].name : opname, oc_api_status_name(status),
+    snprintf(r.detail, sizeof(r.detail), "a%u %s %s%s%s", (unsigned)actor, opname, oc_api_status_name(status),
              extra[0] != '\0' ? " " : "", extra);
     oc_log_clean(r.detail);
     if (st.audit_add(st.ctx, &r) != 0) oc_log(OC_LOG_ERR, "api: audit write FAILED (%s)", r.detail);
 }
 
-/* The refusals a rate limit counted in a minute, as one record. */
+/* A call's operation as the audit names it: "sub.create", or "op66". */
+static const char *op_label(unsigned op, char buf[8])
+{
+    if (op > 0 && op < OC_API_OPS) return OPS[op].name;
+    snprintf(buf, 8, "op%u", op & 0xffu);
+    return buf;
+}
+
+/* The refusals a rate limit (bucket op) counted in a minute, as one record. */
 static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
 {
     oc_api_rate_t *r = &a->rate[op];
@@ -757,7 +769,7 @@ static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
         snprintf(what, sizeof(what), "x%u in 60 s", (unsigned)r->refused);
         memset(a->audit_number, 0, sizeof(a->audit_number));
         a->audit_cell = 0;
-        audit(a, r->refused_actor, op, OC_API_RATE_LIMITED, what);
+        audit(a, r->refused_actor, OPS[op].name, OC_API_RATE_LIMITED, what);
         oc_log(OC_LOG_WARNING, "api: %s: %u more calls refused by its rate limit", OPS[op].name, (unsigned)r->refused);
     }
     r->refused = 0;
@@ -767,7 +779,7 @@ static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
 void oc_api_tick(oc_api_t *a)
 {
     uint64_t now = a->now_us();
-    for (unsigned op = 1; op < OC_API_OPS; op++) audit_refusals(a, op, now);
+    for (unsigned op = 0; op < OC_API_OPS; op++) audit_refusals(a, op, now);
     if (now >= a->sweep_at_us) {
         a->sweep_at_us = now + 60000000u;
         int n = oc_api_release_expired(a, NULL);
@@ -797,17 +809,17 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
     c.w.op = op;
     c.w.req = req;
     uint8_t status;
-    if (op == 0 || op >= OC_API_OPS || op == OC_API_ROUTE_OFFER) {
-        status = fail(&c, OC_API_UNSUPPORTED, op == OC_API_ROUTE_OFFER ? "route.offer comes with plan P5" : "no such operation");
-    } else if (!allowed(a, op)) {
-        oc_api_rate_t *r = &a->rate[op];
+    char label[8];
+    unsigned bucket = op < OC_API_OPS ? op : 0; /* 0: the operations the core does not have */
+    if (!allowed(a, bucket)) {
+        oc_api_rate_t *r = &a->rate[bucket];
         uint64_t now = a->now_us();
-        audit_refusals(a, op, now); /* a minute that ended: its count first */
+        audit_refusals(a, bucket, now); /* a minute that ended: its count first */
         r->refused_actor = actor;
         if (r->window_us == 0) { /* the first refusal in a minute: audited as itself */
             r->window_us = now + 60000000u;
-            audit(a, actor, op, OC_API_RATE_LIMITED, "");
-            oc_log(OC_LOG_WARNING, "api: %s refused by its rate limit (%u/h, burst %u)", OPS[op].name,
+            audit(a, actor, op_label(op, label), OC_API_RATE_LIMITED, "");
+            oc_log(OC_LOG_WARNING, "api: %s refused by its rate limit (%u/h, burst %u)", OPS[bucket].name,
                    (unsigned)r->per_hour, (unsigned)r->burst);
         } else {
             r->refused++;
@@ -816,6 +828,8 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         wr_text(&c.w, "rate limited");
         wr_end(&c.w);
         return 0;
+    } else if (op == 0 || op >= OC_API_OPS || op == OC_API_ROUTE_OFFER) {
+        status = fail(&c, OC_API_UNSUPPORTED, op == OC_API_ROUTE_OFFER ? "route.offer comes with plan P5" : "no such operation");
     } else {
         wr_start(&c.w, OC_API_OK);
         switch (op) {
@@ -841,6 +855,6 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         wr_text(&c.w, c.msg != NULL ? c.msg : oc_api_status_name(status));
         wr_end(&c.w);
     }
-    audit(a, actor, op, status, a->audit_what);
+    audit(a, actor, op_label(op, label), status, a->audit_what);
     return 0;
 }

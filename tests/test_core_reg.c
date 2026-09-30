@@ -426,9 +426,11 @@ static unsigned registers(void)
 }
 
 /* REGISTER is audited when the location changes - the first registration,
- * a move, a new boot's or an expired location's registration anew - and
- * not for a refresh from the same cell with the same binding: the replay a
- * cell sends after every HELLO_ACK (§7.10), or a re-registration there. */
+ * a move, a new boot's or an expired location's registration anew - or
+ * when a fresh authentication proves it (the proving SQN rises: a
+ * re-registration on the same cell with a new vector), and not for a
+ * replay of a proof already on record: the one a cell sends after every
+ * HELLO_ACK (§7.10), or an older one. */
 static void test_only_a_location_change_is_audited_as_register(void)
 {
     reg_world();
@@ -443,13 +445,17 @@ static void test_only_a_location_change_is_audited_as_register(void)
     TEST_ASSERT_EQUAL_INT(0, where(&l));
     TEST_ASSERT_EQUAL_UINT32(UNIX0 + 61u + 3600u, l.expires); /* refreshed all the same */
     TEST_ASSERT_EQUAL_UINT(1, registers());
-    oc_core_av_t v2 = vector_for(11); /* re-registers there */
+    oc_core_av_t v2 = vector_for(11); /* re-registers there: a fresh authentication */
     loc_update(11, TMID, &v2);
-    TEST_ASSERT_EQUAL_UINT(1, registers());
+    TEST_ASSERT_EQUAL_UINT(2, registers());
+    loc_update(11, TMID, &v2); /* ...replayed */
+    TEST_ASSERT_EQUAL_UINT(2, registers());
+    loc_update(11, TMID, &v1); /* an older proof again */
+    TEST_ASSERT_EQUAL_UINT(2, registers());
 
     oc_core_av_t v3 = vector_for(20); /* moves to cell 2 */
     loc_update(20, TMID, &v3);
-    TEST_ASSERT_EQUAL_UINT(2, registers());
+    TEST_ASSERT_EQUAL_UINT(3, registers());
     const oc_core_audit_t *a = oc_core_mem_audit(&MEM, OC_CORE_AUDIT_REGISTER);
     TEST_ASSERT_EQUAL_UINT32(2, a->cell_id);
     TEST_ASSERT_EQUAL_HEX32(TMID, a->tmid);
@@ -458,11 +464,11 @@ static void test_only_a_location_change_is_audited_as_register(void)
     hello(21, 2, 2); /* cell 2's new boot purges it: registering again is a change */
     oc_core_av_t v4 = vector_for(21);
     loc_update(21, TMID, &v4);
-    TEST_ASSERT_EQUAL_UINT(3, registers());
+    TEST_ASSERT_EQUAL_UINT(4, registers());
 
     NOW += 3601000000ull; /* the location lapses: its refresh is a registration anew */
     loc_update(21, TMID, &v4);
-    TEST_ASSERT_EQUAL_UINT(4, registers());
+    TEST_ASSERT_EQUAL_UINT(5, registers());
 }
 
 static void test_purge_only_from_the_location_cell(void)

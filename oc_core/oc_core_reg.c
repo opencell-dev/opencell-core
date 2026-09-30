@@ -136,12 +136,13 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         }
     }
     int moved = had && (old.cell_id != cell || old.tmid != tmid);
-    /* REGISTER is audited when the location changes: the first one, a move
-     * or a new binding, or one that had lapsed (a new boot purged it, or it
-     * expired). A refresh from the same cell with the same binding - the
-     * replay a cell sends after every HELLO_ACK (§7.10), a re-registration
-     * there - changes nothing worth a record. */
-    int changed = !had || moved || old.expires <= oc_core_unix(k);
+    /* REGISTER is audited when the location changes - the first one, a
+     * move or a new binding, or one that had lapsed (a new boot purged it,
+     * or it expired) - or when a fresh authentication proves it (the
+     * proving SQN rises: a re-registration there, periodic or not). A
+     * replay of a proof already on record - the one a cell sends after
+     * every HELLO_ACK (§7.10), or an older one - writes none. */
+    int changed = !had || moved || old.expires <= oc_core_unix(k) || a.sqn > old.sqn;
     memset(&l, 0, sizeof(l));
     memcpy(l.number, num, OC_SIG_NUMBER_LEN);
     l.cell_id = cell;

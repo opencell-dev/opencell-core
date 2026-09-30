@@ -27,3 +27,9 @@ target_link_libraries(oc-core PRIVATE oc_store)
 if(PROJECT_IS_TOP_LEVEL)
   install(TARGETS oc-core RUNTIME DESTINATION bin)
 endif()
+
+# The admin API's TLS (portal plan P4): oc_tls (OpenSSL 3, TLS 1.3, pinned
+# client certificates) and oc_apisrv (its listener and connections).
+add_library(oc_net STATIC oc_tls.c)
+target_include_directories(oc_net PUBLIC include)
+target_link_libraries(oc_net PUBLIC oc_store OpenSSL::SSL)

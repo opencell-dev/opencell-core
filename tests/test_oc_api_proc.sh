@@ -82,6 +82,20 @@ done
 conf "$(grep -v api_portal_fpr <<<"$API_CONF")"
 out=$("$OC" --config "$T/oc-core.conf" --key-file "$T/key" --db "$T/core.db" 2>&1) && fail "started with no pin"
 expect "$out" "api_portal_fpr is needed too"
+
+# Binding at boot: an api_listen address that is not up yet (10.0.0.60
+# before its interface is) does not stop the core: the cells are served.
+conf "${API_CONF/api_listen = 127.0.0.1:$PORT/api_listen = 10.255.254.253:$PORT}"
+CREDENTIALS_DIRECTORY=$T/creds "$OC" --config "$T/oc-core.conf" --key-file "$T/key" --db "$T/core.db" 2>>"$T/log" &
+PID=$!
+for _ in $(seq 30); do
+    out=$("$HELLO" "$T/core.sock" 1 7 0 2>&1) && break
+    kill -0 "$PID" 2>/dev/null || fail "oc-core exited with api_listen on an address not up yet"
+    sleep 0.1
+done
+expect "$out" "HELLO_ACK"
+expect "$(cat "$T/log")" "API 10.255.254.253:$PORT"
+stop
 conf "$API_CONF"
 
 start
@@ -110,6 +124,13 @@ expect "$(cat "$T/log")" "does not speak oc-admin/1"
 # The config's rate limit: num.check 3 at once.
 for _ in 1 2 3; do expect "$("$API" "$PORT" "$PKI" portal num.check +883171746400001)" "^ok"; done
 expect "$("$API" "$PORT" "$PKI" portal num.check +883171746400001)" "^rate_limited"
+
+# Pipelined: more requests at once than one loop turn serves (16), all
+# answered in order at once, not at the 10 s answer deadline.
+out=$("$API" "$PORT" "$PKI" portal pipe 40)
+expect "$out" "^answered 40 in"
+ms=$(sed -n 's/^answered 40 in \([0-9]*\) ms$/\1/p' <<<"$out")
+[ "$ms" -lt 1000 ] || fail "40 pipelined calls took $ms ms"
 
 # Slow peers: a TCP connection that never starts TLS, a client that sends
 # half a request, one that sits idle. None holds up a cell's HELLO or

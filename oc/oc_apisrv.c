@@ -77,7 +77,11 @@ int oc_apisrv_open(oc_apisrv_t *s, const char *text, oc_tls_t *tls, oc_api_t *ap
     for (unsigned i = 0; i < OC_APISRV_CONNS; i++) s->c[i].tls.fd = -1;
     if (oc_apisrv_addr(text, &sa, &len, err, cap) != 0) return -1;
     int fd = socket(sa.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), one = 1;
+    /* IP_FREEBIND: at boot the address (10.0.0.60) may not be up yet; the
+     * core must start anyway (its cells too), and the listener takes the
+     * connections once the address is there. */
     if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+        setsockopt(fd, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one)) != 0 ||
         bind(fd, (struct sockaddr *)&sa, len) != 0 || listen(fd, 8) != 0) {
         snprintf(err, cap, "api_listen = '%s': %s", text, strerror(errno));
         if (fd >= 0) close(fd);
@@ -212,6 +216,10 @@ static void conn_serve(oc_apisrv_t *s, oc_apisrv_conn_t *c)
         c->rn += (size_t)r;
         set_phase(s, c);
     }
+    /* The burst ended with an answer queued (its write never tried, so the
+     * last SSL call wanted nothing): poll for writing, or it would wait for
+     * input the client, waiting for that answer, never sends. */
+    if (c->toff < c->tx.n && c->tls.want == POLLIN) c->tls.want = POLLOUT;
     set_phase(s, c);
 }
 
@@ -244,13 +252,15 @@ void oc_apisrv_serve(oc_apisrv_t *s, const struct pollfd *p, unsigned n)
             if (c->state != C_FREE && c->tls.fd == p[j].fd && p[j].revents != 0) conn_serve(s, c);
         }
     }
-    uint64_t now = s->now_us();
     for (unsigned i = 0; i < OC_APISRV_CONNS; i++) {
         oc_apisrv_conn_t *c = &s->c[i];
         if (c->state == C_FREE) continue;
         if (c->state == C_OPEN && oc_tls_conn_pending(&c->tls) > 0) conn_serve(s, c); /* poll can't see these */
         else if (c->state == C_OPEN && c->toff >= c->tx.n && c->rn >= 2) conn_serve(s, c);
         if (c->state == C_FREE) continue;
+        /* read after serving: conn_serve may have just started a phase, and
+         * an earlier "now" would make its age wrap round to "too old" */
+        uint64_t now = s->now_us();
         if (now - c->since_us >= (uint64_t)LIMIT_S[c->phase] * 1000000u) {
             char why[80];
             snprintf(why, sizeof(why), "%s took more than %u s", PHASE[c->phase], LIMIT_S[c->phase]);

@@ -115,7 +115,7 @@ The library stops holding K, OPc, SQN and SKn. It asks and gets answered later; 
 | Now (`oc_sig_net_io_t`) | Proposed |
 |---|---|
 | `by_token` + `cfg.sk` + writes `sub->k/opc/sqn`, `unbind`, `save` | `act_req(ctx, tmid, token_id, pkt, tag)` → `oc_sig_net_act_done(n, tmid, msg)`: the core returns the finished `ACT_ACK`/`ACT_NAK` (it needs K for `confirm` and the token secret for the NAK tag). |
-| `by_tmid` + `new_av()` computing MILENAGE | `av_req(ctx, tmid)` → `oc_sig_net_av_done(n, tmid, status, number, av)`. `av` = RAND, AUTN, XRES, CK, IK. `status` ∈ ok / not activated / bound elsewhere / disabled / core unavailable (no answer: the terminal backs off as today). |
+| `by_tmid` + `new_av()` computing MILENAGE | `av_req(ctx, tmid)` → `oc_sig_net_av_done(n, tmid, status, number, av)`. `av` = RAND, AUTN, HXRES, CK, IK (HXRES = SHA-256(RAND ‖ XRES)[0..16), §19). `status` ∈ ok / not activated / bound elsewhere / disabled / core unavailable (no answer: the terminal backs off as today). |
 | resync inside `handle(AUTH_FAIL)` | `resync_req(ctx, tmid, rand, auts)` → `av_done` with a fresh AV |
 | — | `registered(ctx, tmid, number, rand, res)`: fired when `AUTH_RSP` matches (the cell sends `LOC_UPDATE`, §7.7) |
 | `by_number` for the local-callee test | The session keeps its `number` (from `av_done`); `oc_sig_net` finds a local callee among its own **registered** sessions. Anything else goes out as `OC_SIG_NET_MO`. |
@@ -131,9 +131,9 @@ The existing fixes stay: a REG_REQ never touches a registered session until `AUT
 | `network` | `key_id` PK, `sk_enc`, `pk`, `period_s`, `created` | The X25519 pair for activation (QR carries `key_id` + `pk`, plan-5 spec §3.1). Several rows allow key rotation. With several cores, each pair belongs to a block's tenant and moves with the block (§14.7). |
 | `cell` | `cell_id` PK (u32), `name`, `cert_fpr`, `mode` (part15/part97), `enabled`, `boot_id`, `last_seen` | The `cert_fpr` column is `security-model.md`'s planned `certificate_fingerprint`. |
 | `subscriber` | `number` PK (full form, text `+883160655501234`: 15 digits for NANP, ≤ 15 otherwise), `state` (active/disabled), `tmid`, `activated`, `k_enc`, `opc_enc`, `sqn` (int), `created`, `updated` | One bound terminal per number (plan-5 spec §3.2 step 3). Always the full form (`numbering-plan.md` v0.2 §Display Formatting), never a dialled short form. |
-| `token` | `token_id` PK (8 B: block index 2 ‖ random 6, §14.3), `number` FK, `secret_enc`, `expiry`, `used_at`, `used_by_tmid` | At most one unused token per number (partial unique index). Issuing a new token voids the old one. |
+| `token` | `token_id` PK (8 B: block index 2 ‖ random 6, §14.3), `number` FK, `secret_enc`, `expiry`, `used_at`, `used_by_tmid` | At most one unused token per number (partial unique index). Issuing a new token voids the old one. *(amended: an unactivated token past `expiry` is released automatically, §18.3.)* |
 | `av_issued` | `number`, `rand`, `xres`, `sqn`, `cell_id`, `issued`, `confirmed` | Lets the core verify a cell's `LOC_UPDATE` (§8). Rows are pruned after 24 h. |
-| `location` | `number` PK, `cell_id`, `tmid`, `expires` | Current location only, no history (`security-model.md` §Number and Subscriber Privacy). Persisted so a core restart keeps it. |
+| `location` | `number` PK, `cell_id`, `tmid`, `expires`, `sqn` (§19) | Current location only, no history (`security-model.md` §Number and Subscriber Privacy). Persisted so a core restart keeps it. |
 | `cdr` | `id`, `caller`, `called`, `cell_a`, `cell_b`, `setup`, `answer`, `end`, `cause` | |
 | `audit` | `ts`, `event`, `number`, `tmid`, `cell_id`, `detail` | Append-only. Events: ACTIVATE, ACT_FAIL, REGISTER, AUTH_FAIL, RESYNC, LOC_CANCEL, TOKEN_ISSUE, SUB_DISABLE, CELL_REJECT; with several cores also PROMOTE, DEMOTE, TRANSFER, TABLE_UPDATE, PEER_REJECT. |
 | `route` | `version`, `blob`, `sig`, `received` | The signed routing table (§14.2), newest valid version wins; older rows kept for audit. A single-core network has one version listing itself. |
@@ -142,11 +142,13 @@ The existing fixes stay: a REG_REQ never touches a registered session until `AUT
 
 **Keys at rest.** `k`, `opc`, `sk` and token `secret` are sealed with AES-256-GCM under a 32-byte master key. The GCM nonce is random (12 B, stored with the ciphertext), and the AAD is `table ‖ column ‖ primary key ‖ key_version`.
 - This deviates from `security-model.md`, which uses `aad = tmid`: the TMID changes on re-activation, the number does not.
-- The master key is not in the database. It comes from a systemd credential file (`LoadCredential=`, root-only, 0400), or from `--key-file` on the bench.
+- The master key is not in the database. It comes from a systemd credential file (`LoadCredential=`, root-only, 0400), or from `--key-file` on the bench. The key file is owned by root or by the process reading it and readable by no one else; systemd (v257) writes a credential as root 0400 plus one POSIX ACL read entry for the service user (so `stat` shows 0440), and exactly that shape is accepted: one named-user entry for the reading user, no group or other access (plan 8 Task 6).
 - SQN, numbers and TMIDs are stored in the clear.
 - Backups copy the database; the master key is backed up separately.
 
 ## 6. Cell ↔ core protocol
+
+*(amended: the portal's admin API is a second listener on each core, alongside this one; see §18.1.)*
 
 - **Transport:**
   - Single site: a Unix stream socket (`/run/opencell/core.sock`, owner-only).
@@ -158,18 +160,19 @@ The existing fixes stay: a REG_REQ never touches a registered session until `AUT
 
 | Type | Name | Dir | Body |
 |---|---|---|---|
-| 0x01 | HELLO | C→K | proto 1, cell_id 4, boot_id 8, sw_version 3 |
+| 0x01 | HELLO | C→K | proto 1 (value 2 since §19: the AV_RES layout changed), cell_id 4, boot_id 8, sw_version 3 |
 | 0x02 | HELLO_ACK | K→C | mode 1, period_s 2, key_id 2, echo_number 8 |
 | 0x03 | HELLO_NAK | K→C | reason 1 (unknown cell, disabled, bad version) |
 | 0x04 / 0x05 | PING / PONG | both | — |
+| 0x06 | CELL_CFG | K→C | a `CHAN_LIST` body exactly as `oc_sig` encodes it (ver, count, count × {freq_hz BE 4, flags 1}): the cell group's channel list, sent after HELLO_ACK and on every change; the cell serves it via `oc_sig_net_set_chan_list` (channel-list spec §8; added 2026-09-28 with network core plan 1, Task 16) |
 | 0x10 | ACT_FWD | C→K | req 2, tmid 4, token_id 8, PKt 32, tag 8 |
 | 0x11 | ACT_RES | K→C | req 2, tmid 4, oc_sig message (ACT_ACK or ACT_NAK, ≤ 20 B) |
 | 0x12 | AV_REQ | C→K | req 2, tmid 4, count 1 (1–4) |
-| 0x13 | AV_RES | K→C | req 2, tmid 4, status 1, number 8, count 1, count × {RAND 16, AUTN 16, XRES 8, CK 16, IK 16} |
+| 0x13 | AV_RES | K→C | req 2, tmid 4, status 1, number 8, count 1, count × {RAND 16, AUTN 16, HXRES 16, CK 16, IK 16} (HXRES since §19; the cell never gets XRES) |
 | 0x14 | RESYNC | C→K | req 2, tmid 4, RAND 16, AUTS 14 (answered by AV_RES) |
 | 0x18 | LOC_UPDATE | C→K | tmid 4, number 8, RAND 16, RES 8 |
 | 0x19 | LOC_PURGE | C→K | tmid 4, number 8 (session expired or dropped) |
-| 0x1A | LOC_CANCEL | K→C | tmid 4, cause 1 (moved, reactivated, disabled) |
+| 0x1A | LOC_CANCEL | K→C | tmid 4, cause 1 (moved, reactivated, disabled), rand 16 (§19 follow-ups: the RAND of the vector that proved the cancelled location, all zero when there is none; the cell drops a registration only on a zero or matching RAND) |
 | 0x20 | CALL_ROUTE | C→K | leg_ref 4, caller 8, called 8 |
 | 0x21 | CALL_OFFER | K→C | call_ref 4, callee 8, caller 8 |
 | 0x22 | CALL_ALERT | both | ref 4 |
@@ -280,7 +283,7 @@ Numbering v2 (`numbering-plan.md` v0.2): a number is 883 · country code · nati
 | Asset | Where | Protection |
 |---|---|---|
 | K, OPc, token secrets, network SKn | `oc-core` only | AES-256-GCM at rest (§5); never sent to a cell. Single-site: the core runs on the Pi, and this is only as strong as that Pi. |
-| AVs (RAND, AUTN, XRES, CK, IK) | Core → cell, over mTLS | CK/IK give a cell its own terminals' session keys, as in 3GPP. |
+| AVs (RAND, AUTN, HXRES, CK, IK) | Core → cell, over mTLS | CK/IK give a cell its own terminals' session keys, as in 3GPP. The cell gets HXRES, not XRES (§19), so it learns RES only from the terminal. |
 | Location claims | Core | A cell must return the `RES` matching an `XRES` it was issued (the 5G "home control" idea), so a rogue or compromised cell cannot pull another cell's subscribers' MT calls to itself. |
 | App data in the network | Cells and core | Plaintext inside processes and inside TLS, as in plan-5 local calls. End-to-end encryption is a later option. |
 | Cell identity | Core | Per-cell certificate; revoke = `cell.enabled = 0` or a new fingerprint. |
@@ -358,7 +361,7 @@ Plan 6 (the Android app) is unaffected by the core: the BLE contract does not ch
 
 ## 12. Out of scope
 
-Voice codec and audio. PSTN/SIP gateway. Direct Connect, push-to-talk and group calls. Web portal (admin CLI only). Active-call handover and multi-cell paging. Automatic failover and consensus between cores (v1 promotion is manual, §14.4). OCSS message layouts (their own spec, §15.7). RF backhaul as the core transport. CDR billing and user-visible call history. End-to-end media encryption. Emergency calls.
+Voice codec and audio. PSTN/SIP gateway. Direct Connect, push-to-talk and group calls. Web portal (admin CLI only; amended, see §18). Active-call handover and multi-cell paging. Automatic failover and consensus between cores (v1 promotion is manual, §14.4). OCSS message layouts (their own spec, §15.7). RF backhaul as the core transport. CDR billing and user-visible call history. End-to-end media encryption. Emergency calls.
 
 ## 13. Decisions (2026-09-27)
 
@@ -414,7 +417,7 @@ The **longest prefix wins**, so an exchange block can sit inside another tenant'
 | `883 1 606 555` | 2 | B | core 2 (B's server) | core 1 | 3 |
 | `883 1 859` | 3 | A | core 1 | — | 1 |
 
-- **Signed** as a whole (version number, Ed25519) by the **routing authority**: an offline key held by the network's operator (today the user), kept on the laptop and on the Proxmox host (root-only, outside every VM; never in the oc-core VM or its backups), and used by `oc-core admin route sign` from either. Adding a core or a block, changing secondaries, and a block transfer (§14.5) are new versions.
+- **Signed** as a whole (version number, Ed25519) by the **routing authority**: an offline key held by the network's operator (today the user), kept on the laptop and on the Proxmox host (root-only, outside every VM; never in the oc-core VM or its backups), and used by `oc-core admin route sign` from either. Adding a core or a block, changing secondaries, and a block transfer (§14.5) are new versions. *(amended: a new geographic-NPA block may also be added by the scoped delegate key on the portal guest, without the offline routing authority; see §18.2.)*
 - **Takeover records** (§14.4) change one block's home and epoch without the authority. They are signed by the promoted core's key and valid only if that core is a listed secondary of the block and the epoch is exactly one higher.
 - Every core keeps the newest valid version and the takeover records, and passes them on over OCSS (§15.3). A core that sees a higher epoch for a block it holds as home stops writing it at once.
 - A single-core network has a table with one core and every block at home: the same code path, no OCSS links.
@@ -608,3 +611,108 @@ An ISO install works too. The cloud image is recommended because the same script
 ### 16.5 The bench
 
 The laptop keeps running `oc-core` locally (Unix socket, or TLS on 127.0.0.1) for development and the plan-8 bench. The VM is the first deployed core (plan 9). In plan 10 the laptop's core and the VM are the two cores for the OCSS tests.
+
+## 17. Decisions for plans 8–9 (2026-09-28)
+
+The user chose these; §1–16 are unchanged except where this section says so.
+
+**Call routing and switching** keeps the split in §7 and §14–15:
+- `oc_sig_net` in `oc-cell` switches calls whose two legs are on one cell;
+- `oc_core`'s switch joins cells on one core;
+- OCSS joins cores (plans 10–11).
+
+| # | Topic | Decision |
+|---|---|---|
+| 1 | Admin CLI | `oc-core admin …` talks to the **running daemon over a local Unix socket** (`/run/opencell/admin.sock`). Access is root or the `oc-admin` group, mode 0660, and every admin command is written to `audit`. Only the daemon writes the database, so a disable takes effect at once (`LOC_CANCEL` goes out). `oc-core admin --offline --db …` opens the database directly, only while the daemon is stopped (first setup, recovery); it refuses if the daemon's lock is held. |
+| 2 | Plan-8 bench | **`oc-cell` runs on the Pi** (`opencell-bs1`) with board A on USB (the `ocb_cell` backend). `oc-core` runs on the same Pi over the Unix socket of §6, the single-site layout of §3.3. The laptop builds and runs everything for development and process tests. Terminals: T on the Pi's USB (console only), T2 on the laptop, both over the air. Plan 9 adds TLS and moves the core to the VM. |
+| 3 | `oc-core-2` (the OVH VPS) | The **second core** for plans 10–11 (OCSS, replication and failover between the VM and the VPS over real WAN latency, in place of the laptop in §9.6 and §16.5). Until then it is the **off-host backup target** for `oc-core-1`. |
+| 4 | Build and install | A **deploy script** run from the laptop (`tools/deploy/`). It takes a tagged revision (`vX.Y.Z`; only tags are deployed), sends it over SSH or Tailscale, builds on the target (Debian 13 amd64 on the VM and VPS, Debian 13 arm64 on the Pi), installs to `/usr/local` with a systemd unit, and keeps the previous build for `rollback`. No packages for now. |
+| 5 | Daemon structure | One thread: a `poll()` loop that feeds `oc_core` its messages and `tick(now)`, with SQLite on the same thread (WAL, `synchronous=FULL`, small transactions). |
+| 6 | Certificates (plan 9) | **The CA key:** an offline OpenCell CA key, kept like the routing authority key, on the laptop and the Proxmox host and never on a core. **Validity:** the CA 10 years; cell and core certificates 2 years. **Revocation:** the pinned fingerprint (`cell.cert_fpr`, and the core directory for OCSS), so there is no CRL. |
+| 7 | Backups (plan 9) | Nightly online `sqlite3 .backup`, encrypted with `age` to a backup public key, pushed to `oc-core-2` over Tailscale, and kept 14 days. This is in addition to the VM's `vzdump`. The master key is still backed up once, offline and separately (§16.4). |
+| 8 | Logs and monitoring | journald, plus `oc-core admin status` (links, cells, calls, and later replication lag). There are no metrics endpoints until a need appears. |
+| 9 | Schema changes | `PRAGMA user_version`, with ordered migrations in the binary. Before migrating, the daemon takes an automatic `.backup` next to the database. |
+| 10 | Repositories | **`oc-core` (daemon, store, admin, transport)** lives in `opencell-core` with `oc_core`. **`oc-cell`** lives in `opencell-pi`, with `opencell-firmware` as a submodule for `oc_sig`, `oc_air`, `ocb_cell` and `oc_link`, and `opencell-core` as a submodule for the `oc_core_msg` codec. |
+| 11 | Releases | A `vX.Y.Z` tag per repository; the deploy script installs tags only. |
+
+§11's plan table changes to match: plan 8's bench is §9.5a on the Pi (decision 2), and plan 8 includes the deploy script (decision 4). Plan 9 includes the CA script and certificates (decision 6), the backups to `oc-core-2` (decision 7), and the VM.
+
+## 18. Amendments from the portal spec (2026-09-28)
+
+The web portal (`docs/superpowers/specs/2026-09-28-portal-design.md`, approved 2026-09-28) adds a second listener and two online, limited-scope keys to the core. It does not change §1–17 otherwise; the pointers placed above mark the spots it touches.
+
+### 18.1 The admin API (a second listener)
+
+- **Port 7444**, bound to private interfaces only: core 1 on `10.0.0.60` (the portal guest is on `internal`); core 2 on its Tailscale address (the portal guest joins the tailnet). Never public.
+- **TLS 1.3**, ALPN `oc-admin/1` (the cell listener keeps `oc-cell/1` on 7443, §6). The client certificate must carry the `portal` role, issued offline by the OpenCell CA (1 year, as §17 decision 6), and its fingerprint is pinned in the core's config.
+- **Framing** as §6 (`len ‖ type ‖ body`), request id + status on every answer.
+- **Operations** — the same set as `oc-core admin` over the local socket (§17 decision 1): `num.free`, `num.check`, `sub.create`, `sub.reissue`, `sub.status`, `sub.release`, `sub.disable` / `sub.enable`, `cdr.list`, `cell.add` / `cell.set_cert` / `cell.revoke` / `cell.status`, `core.status`, `route.offer`. Plus the core-internal job `sub.release_expired` (§18.3). The core never returns K, OPc, SQN or token secrets over this API; a `sub.create`/`sub.reissue` answer carries only the QR payload for the token it just issued.
+- **Audit:** every call is written to `audit` (§5) with the portal account id the portal passes — the admin or subscriber it acts for.
+- **Rate limits:** per-operation limits on the core side, in addition to the portal's own, so a compromised portal can't enumerate or mass-disable quickly.
+
+### 18.2 The scoped routing delegation
+
+A second online signing key, on the portal guest, does the one job that would otherwise need the offline routing authority key every week: adding a new NPA block as NANPA opens an area code (the portal's weekly NANPA refresh, portal §4.4).
+
+- The routing authority (offline, §14.2) signs a **delegation record**: the delegate's Ed25519 public key, a scope — *add a block `883 1 NPA` for the default tenant, homed per the East/West state split (`numbering-plan.md`, portal §4.3), with the other core as secondary; nothing else* — and a 1-year validity.
+- A core accepts a `route.offer` (§18.1) signed by the delegate only if it adds new NPA blocks and nothing else, each new block's state code checks out against the delegation's East/West lists, and the delegation itself is valid and not revoked. A wrong state claim at worst homes a new NPA on the other core, correctable by the offline root key.
+- **Revocation:** a root-signed table version lists revoked delegate keys, the same mechanism as any other key in the routing table (§14.2).
+
+### 18.3 The 72 h unactivated-number release
+
+`sub.create` (§18.1) issues a token with a 72-hour expiry, using the `token.expiry` column that already exists (§5). A periodic core-internal job, `sub.release_expired`, releases the number and voids the token for every `subscriber` whose token has passed `expiry` with no activation, and writes an audit entry. This is the same path an admin's `sub.release` takes, run automatically instead of on request; it touches the `token` and `subscriber` rows of §5, both amended there with a pointer to this section.
+
+### 18.4 The online intermediate CA
+
+A third online, limited-scope credential on the portal guest: an **intermediate CA**, signed by the offline OpenCell root CA (§17 decision 6), valid 1 year, `pathlen:0`, restricted by EKU to clientAuth and by policy OID to cell certificates.
+
+- It signs only cell certificates (2 years, as §17 decision 6 already sets), from a CSR made on the Pi during operator setup (portal §6.3); the private key never leaves the Pi.
+- Cores still check the chain **and** the pinned fingerprint (`cell.cert_fpr`, set through `cell.set_cert`, §5, §18.1): a certificate the portal issued for a cell that was never approved through the admin API does nothing.
+- **Revocation:** unpin the cell (`cell.revoke`), or, if the intermediate itself is compromised, remove it from the cores' trust (a config change) and re-issue — the same fingerprint-pinning model as §17 decision 6, with no CRL.
+
+### 18.5 DNS names
+
+Cells and admin clients now address the cores by name, per the DNS records created 2026-09-28 (portal §9):
+
+| Name | Points at |
+|---|---|
+| `core1.opencell.k4ozi.com` | The Proxmox host's own A and AAAA; the host forwards TCP 7443 to `oc-core-1` on both, the IPv6 path by a host-side forward since the VM has no IPv6 of its own (§16.3's "no IPv6 for the VM" still holds — core 1 is now reachable over IPv6 only via the host's forward). |
+| `core2.opencell.k4ozi.com` | `oc-core-2`'s own A and AAAA (it has both natively, §17 decision 3). |
+
+Cell and core certificates use these names.
+
+### 18.6 Scope
+
+The web portal itself — accounts, sign-up, the subscriber and operator UI — stays **out of scope** for the network core (§12): the core only gains the listener and keys above. Everything else about the portal (Next.js, SQLite, passkeys, the fake core for early development) lives in `2026-09-28-portal-design.md`.
+
+## 19. Amendments from the plan-1 reviews (2026-09-28)
+
+The Task 12 review found that §8's location protection ("a rogue or compromised cell cannot pull another cell's subscribers' MT calls to itself") did not hold. Two gaps:
+- **The proof could be faked.** `AV_RES` gave the cell the XRES, and any cell can send `AV_REQ` for any TMID it hears on air, so a cell could "prove" a registration without the terminal ever answering.
+- **Older claims could win.** An older proven `LOC_UPDATE` could override a newer one: the §7.10 offline replay, or a deliberate replay for up to 24 h.
+
+The controller's rulings, applied in plan 1 as Task 12b:
+
+1. **Hashed expected response, as 5G does (HXRES).**
+   - **`AV_RES` (§6, 0x13):** each vector carries `HXRES` (16 B) in place of `XRES` (8 B), so a vector is RAND 16, AUTN 16, HXRES 16, CK 16, IK 16. The core keeps XRES in `av_issued`. The cell never receives it.
+   - **The hash:** `HXRES = SHA-256(RAND ‖ XRES)`, first 16 bytes.
+   - **At the cell:** on `AUTH_RSP`, the cell (`oc_sig_net`) checks `SHA-256(RAND ‖ RES)[0..16)` against HXRES, in constant time, and keeps the RES for `LOC_UPDATE`.
+   - **At the core:** it checks `RES = XRES` (§7.7, unchanged).
+   - **Result:** a cell learns RES only from the terminal, so only a registration that really happened proves a location.
+2. **Newest claim wins (§5 `location` gains `sqn`).**
+   - Each location records the SQN of the vector that proved it.
+   - A `LOC_UPDATE` from a different cell whose vector's SQN is lower than the current location's is refused, and the claimant gets `LOC_CANCEL(moved)`.
+   - A claim from the same cell, or a higher SQN, proceeds as before.
+3. **Re-activation clears the old binding's vectors.** The activation transaction deletes the number's `av_issued` rows, so a vector issued under the previous K cannot prove a location for the new binding.
+
+**§19 follow-ups (Task 12b review, 2026-09-29):**
+- **Re-activation.** A claim whose vector no longer exists still gets `LOC_CANCEL(reactivated / disabled)` when the number is no longer bound to the claimed TMID, or is disabled. §7.1 step 4 therefore still cuts off an old terminal whose cell was offline at re-activation.
+- **Newest claim wins even with no location.** A claim is also refused, with `LOC_CANCEL(moved)`, when the number has a confirmed `av_issued` row from another cell with a higher SQN. The floor therefore survives a purge, an expiry or a cell's new boot, for as long as any replayable vector exists.
+- **`OC_CORE_PROTO` = 2**, because the `AV_RES` layout changed.
+- **Known limit: RES is 64-bit.** A cell holding HXRES could search offline for a RES, about 2^64 SHA-256 operations per vector, within the vector's 24 h life. 5G hashes a 128-bit RES* instead. Deriving a 128-bit RES* on the terminal (for example HMAC-SHA-256(CK ‖ IK, RAND ‖ RES)) is a later hardening, and it changes the terminal's `AUTH_RSP`.
+- **§7.10's "kept those AVs' XRES"** still holds at the core: the core keeps XRES in `av_issued`, and the cell forwards the RES it received.
+- **LOC_CANCEL carries the RAND (Task 13 review, 2026-09-29).**
+  - The race: a late moved-cancel, caused by a backhaul stall across two cells, could drop a terminal's fresh registration on the cell it has just returned to.
+  - The fix: `LOC_CANCEL` now carries the RAND of the vector that proved the location being cancelled, which the core keeps in `location.rand`. The cell ignores a cancel whose RAND is neither zero nor its registration's.
+  - A cancel that has no proof behind it (reactivated, disabled, an unproven stale claim) carries zeros and always drops.
+- **A replayed `ACT_REQ` is harmless (Task 13 review).** An `ACT_ACK` with an unchanged number neither drops the session's registration nor ends its call. Only an `ACK` for a different number cuts the old terminal off.

@@ -147,7 +147,7 @@ host_link() { # TARGET LINK
 # writer.
 as_builder() {
     if [ -n "$BUILDER" ]; then
-        runuser -u "$BUILDER" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$OC_UP" LC_ALL=C.UTF-8 "$@" 9>&-
+        runuser -u "$BUILDER" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$OC_UP" LC_ALL=C.UTF-8 "$@" 9>&- # lc2oc: keep (LC_ALL is the POSIX locale var, not our lc/oc naming)
     else
         "$@" 9>&-
     fi

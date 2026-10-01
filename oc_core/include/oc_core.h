@@ -21,13 +21,39 @@
 #define OC_CORE_PING_US  5000000u  /* PING when nothing was sent on a link for this long */
 #define OC_CORE_DEAD_US  15000000u /* a link that sent nothing for this long is down */
 #define OC_CORE_CALLS    32u
+/* OCSS peers (core test services spec §6): other cores this core has a
+ * link to. Calls go to a peer for a number in a block it is home for. */
+#define OC_CORE_PEERS      4u
+#define OC_CORE_PEER_CALLS 8u /* calls at once with a leg on one peer (spec §15.6's per-peer limit, as a count) */
+#define OC_CORE_HOP_MAX    2u /* a CALL_SETUP with a larger hop is refused (network-core spec §15.5) */
+#define OC_CORE_SETUP_RATE_HZ 5u  /* a peer's CALL_SETUPs, refilled this many tokens a second (review M3) */
+#define OC_CORE_SETUP_BURST   10u /* ... up to this many at once */
 #define OC_CORE_SETUP_US 10000000u /* CALL_ROUTE to the callee's alert or release (§7.4) */
-#define OC_CORE_ECHO_US  3000000u  /* the echo service rings this long, then answers */
+#define OC_CORE_ECHO_US  3000000u  /* the echo and playback services ring this long, then answer */
+/* The playback service (core test services spec §5): one payload of the
+ * clip per radio frame, the core's own clock pacing it. */
+#define OC_CORE_PLAY_US      120000u         /* one payload per 120 ms frame */
+#define OC_CORE_PLAY_BYTES   18u             /* 3 x 6 B Codec2 1200 frames: one app data frame (voice spec §4) */
+#define OC_CORE_PLAY_LEAD_US 1500000u        /* answer to first payload, unless the caller's first media comes sooner */
+#define OC_CORE_PLAY_LATE_US 240000u         /* a payload this late is skipped, never sent in a burst */
+#define OC_CORE_PLAY_MAX_US  600000000ull    /* the service hangs up (cause 0) after 10 min connected */
+#define OC_CORE_CLIP_MAX     (OC_CORE_PLAY_BYTES * 5000u) /* 10 min of clip */
+/* The relay budget from a peer leg into a cell leg (review I2): at most
+ * this many MEDIA at once, refilled at OC_CORE_PLAY_US (the voice spec §3
+ * frame), so a burst after a stalled OCSS link can't fill the cell's
+ * shared, 8-deep DL queue. */
+#define OC_CORE_RELAY_DEPTH  2u
 
 typedef struct {
     uint16_t core_id;
     uint16_t key_id;                          /* the network key pair in use: must be in the store */
     uint8_t  echo_number[OC_SIG_NUMBER_LEN];  /* the echo service, +883160655500100 */
+    /* The playback service (core test services spec §5): all zero, none.
+     * Set, it needs a clip oc_core_clip_ok accepts, which the caller keeps
+     * alive as long as the core. */
+    uint8_t        playback_number[OC_SIG_NUMBER_LEN];
+    const uint8_t *clip;
+    uint32_t       clip_len;
 } oc_core_cfg_t;
 
 typedef struct {
@@ -41,18 +67,62 @@ typedef struct {
     void     (*log)(void *ctx, const char *line);
 } oc_core_io_t;
 
+/* A cell's latest CELL_STATUS (NOC design §7.3), whole: its parts are
+ * gathered in the link's tel_in and published here once the last one
+ * arrives. In memory only, gone with the link; read by the admin API. */
+#define OC_CORE_TEL_RADIOS 4u
+#define OC_CORE_TEL_TERMS  64u
+
+typedef struct {
+    uint32_t           at; /* unix s the last part arrived; 0: no report yet */
+    uint8_t            nradio, nterm;
+    oc_core_radio_t    radio[OC_CORE_TEL_RADIOS];
+    oc_core_term_sig_t term[OC_CORE_TEL_TERMS];
+} oc_core_tel_t;
+
 typedef struct {
     int      used;
     uint32_t link;
     uint32_t cell_id; /* 0 until its HELLO is accepted */
     uint64_t last_rx, last_tx;
+    uint8_t  cfg_pending;  /* CELL_CFG is owed to this cell: retried from oc_core_tick */
+    uint8_t  cfg_backoff_s; /* the next retry's wait: 1 s doubling to 60 s */
+    uint64_t cfg_retry_at;
+    oc_core_tel_t tel, tel_in; /* the published report, and the one being gathered */
+    uint8_t  tel_next;         /* the part tel_in expects next; 0xFF: none (wait for part 0) */
 } oc_core_link_t;
 
-/* One leg of a call: a cell and the ref the leg started with. */
+/* One leg of a call (core test services spec §4): a cell's leg, one of
+ * this core's services (no cell, no ref of its own that anyone sees), or a
+ * peer core's leg over OCSS. cell is 0 for every kind but CELL (a cell id is
+ * never 0), so a lookup by cell never finds another kind's leg. */
+enum { OC_CORE_LEG_CELL = 0, OC_CORE_LEG_ECHO = 1, OC_CORE_LEG_PLAY = 2, OC_CORE_LEG_PEER = 3 };
+
 typedef struct {
-    uint32_t cell; /* 0: the echo service */
-    uint32_t ref;
+    uint8_t  kind; /* OC_CORE_LEG_* */
+    uint16_t peer; /* PEER: the peer's core_id */
+    uint32_t cell; /* CELL: the cell; 0 for the other kinds */
+    uint32_t ref;  /* CELL: the ref the leg started with; PEER: its CALL_SETUP's call_ref */
 } oc_core_leg_t;
+
+/* An OCSS link: the transport authenticated the core behind it (its
+ * pinned certificate, core_id); the link carries calls once HELLO and
+ * HELLO_ACK have agreed on that core_id ("up"). */
+typedef struct {
+    int      used;
+    uint32_t link;
+    uint16_t core_id;
+    uint8_t  dialer; /* this core dialled: it says HELLO */
+    uint8_t  up;
+    uint64_t since; /* link_up: a link not up 10 s later is dropped */
+    uint64_t last_rx, last_tx;
+    /* review M3: a per-peer CALL_SETUP budget (OC_CORE_SETUP_RATE_HZ,
+     * burst OC_CORE_SETUP_BURST), so a bad or compromised pinned peer
+     * looping setups can't flood this core's CDRs and logs without limit. */
+    uint32_t setup_tokens_x1000;
+    uint64_t setup_refill_us;
+    uint64_t setup_log_at; /* a "rate limited" line is logged at most once this often */
+} oc_core_peer_t;
 
 enum { OC_CORE_CALL_ROUTING = 1, OC_CORE_CALL_ALERTING = 2, OC_CORE_CALL_ACTIVE = 3 };
 
@@ -61,8 +131,21 @@ typedef struct {
     uint8_t       state;
     oc_core_leg_t a, b; /* a: the caller's leg (the cell's ref); b: the callee's (a core ref) */
     uint8_t       caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN];
-    uint64_t      due;           /* ROUTING: give up then; the echo service: answer then */
+    uint64_t      due;           /* ROUTING: give up then; a service ALERTING: answer then; PLAY ACTIVE: hang up then */
     uint32_t      setup, answer; /* unix s; answer 0 = not answered */
+    /* b is the playback service: */
+    uint64_t      play_next;     /* ACTIVE: when the next payload is due */
+    uint32_t      play_at;       /* the clip offset of the next payload */
+    uint16_t      play_seq;      /* its MEDIA seq */
+    uint32_t      play_sent, play_skipped;
+    /* A leg is a peer, the other a cell: a token bucket (review I2) bounds
+     * MEDIA relayed from the peer into the cell's DL queue, so a burst from
+     * a stalled link (the peer's own pacing does not protect this core's
+     * cell) can't fill it. OC_CORE_RELAY_DEPTH tokens, refilled one every
+     * OC_CORE_PLAY_US (the spec §3 frame); x1000: fixed point, 1000 = 1 token. */
+    uint32_t      relay_tokens_x1000;
+    uint64_t      relay_refill_us;
+    uint32_t      relay_dropped;
 } oc_core_call_t;
 
 typedef struct {
@@ -74,7 +157,8 @@ typedef struct {
     uint64_t        now;      /* the now_us of the call being served */
     uint64_t        prune_at; /* next pruning of issued vectors */
     oc_core_call_t  calls[OC_CORE_CALLS];
-    uint32_t        next_ref; /* wraps at 2^31 (top bit is OC_CORE_REF_CORE); safe since calls[] does not survive a core restart (§7.10) */
+    oc_core_peer_t  peers[OC_CORE_PEERS];
+    uint32_t        next_ref; /* wraps at 2^30 (bit 31 is OC_CORE_REF_CORE, bit 30 OC_CORE_REF_DIR for a peer leg's ref: review I1); safe since calls[] does not survive a core restart (§7.10) */
 } oc_core_t;
 
 /* A new network key pair (X25519 from random32) with its registration
@@ -83,27 +167,81 @@ typedef struct {
 int  oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t period_s, const uint8_t random32[32],
                         uint32_t unix_now);
 
-/* 0, or -1 when cfg->key_id is not in the store. Keeps nothing of a previous
- * run but what the store holds (a restart). */
+/* 1 if clip can be the playback service's: 1 to OC_CORE_CLIP_MAX bytes, a
+ * whole number of OC_CORE_PLAY_BYTES payloads (headerless `c2enc 1200`
+ * output, cut to 120 ms blocks: tools/clip/oc-clip-gen). */
+int  oc_core_clip_ok(const uint8_t *clip, uint32_t len);
+
+/* 0, or -1 when cfg->key_id is not in the store (or can't be read), or the
+ * playback service is configured without a clip oc_core_clip_ok accepts.
+ * Keeps nothing of a previous run but what the store holds (a restart). */
 int  oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                   const oc_core_cfg_t *cfg);
 void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_link_down(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
+
+/* OCSS links (core test services spec §6). The transport calls peer_up
+ * once TLS has shown the peer's pinned certificate (core_id is whose it
+ * is); dialer: this core dialled, and sends HELLO. Its frames go to
+ * peer_rx; a link that died goes to peer_down (calls on it end, cause 5).
+ * The links share io.send and io.close (and the transport's handle space)
+ * with the cells'. A second link to the same core replaces the first. */
+void oc_core_peer_up(oc_core_t *k, uint32_t link, uint16_t core_id, int dialer, uint64_t now_us);
+void oc_core_peer_down(oc_core_t *k, uint32_t link, uint64_t now_us);
+void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
+/* 1 if a link to core_id is up (HELLO done). */
+int  oc_core_peer_linked(const oc_core_t *k, uint16_t core_id);
+/* Liveness (PING, dead links), timers, pruning, and CELL_CFG a cell is owed:
+ * a HELLO is acked even when its cell's channel list can't be read then -
+ * the cell serves on the list it has (network-core spec §7.10) - and the
+ * CELL_CFG is retried from here, 1 s doubling to 60 s, never by dropping
+ * the link.
+ *
+ * For the daemons on both ends of a link (oc-core, oc-cell; plan 8 Tasks 6
+ * and 8): the cell's reconnect backoff is reset only after HELLO_ACK *and*
+ * a quiet period connected (30 s), not at HELLO_ACK alone, so a core that
+ * accepts and then drops a link can't drive a 1 s reconnect loop. */
 void oc_core_tick(oc_core_t *k, uint64_t now_us);
+/* When oc_core_tick next has a timer to serve (a service's answer, a
+ * playback payload, a setup timeout), in now_us's clock; UINT64_MAX: none.
+ * The daemon's poll waits no longer than this, so a payload leaves on time
+ * (core test services spec §5.3). */
+uint64_t oc_core_due(const oc_core_t *k);
 
 /* Admin (plan 8's CLI drives these). A new cell is enabled, in channel-list
- * group list_id (0: none); 0, or -1 if it exists. Revoking disables it and
- * drops its link. */
+ * group list_id (0: none); 0, -1 if it exists (or cell_id is 0), or -2 if the
+ * store failed (reading whether it exists, or writing it). Revoking disables
+ * it and drops its link. */
 int  oc_core_cell_add(oc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id);
 int  oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us);
+/* A cell's mode (OC_SIG_MODE_PART15 or _PART97), as `oc-core admin cell
+ * mode` sets it: stored, and the cell's link dropped so it reconnects and
+ * takes it from HELLO_ACK (its calls end). 0 changed; 1 it already had
+ * that mode (final review M4: idempotent, so a retried call does not drop
+ * a cell that already reconnected); -1 no such cell or a bad mode; -2 the
+ * store failed; -3 the cell is revoked (nothing changed). */
+int  oc_core_cell_mode(oc_core_t *k, uint32_t cell_id, uint8_t mode, uint64_t now_us);
+/* The linked cell's latest whole CELL_STATUS, or NULL (not linked, or no
+ * report since it linked). */
+const oc_core_tel_t *oc_core_cell_tel(const oc_core_t *k, uint32_t cell_id);
 /* The channel list of list group list_id (channel-list spec §8): stored, and
  * sent in CELL_CFG to every linked cell of the group now and to each after
  * its HELLO_ACK. The core numbers the versions (list->ver is ignored): 1, 2,
  * ... 255, then 1 again. The new version, or -1: list_id 0, more than
- * OC_SIG_CHAN_MAX entries, or the store failed. The operator's anchors and
- * the unique-anchor check per group come with network core 2. */
+ * OC_SIG_CHAN_MAX entries, or the store failed - including a stored list
+ * that can't be read, whose version the new one must follow (nothing
+ * changed). A linked cell whose own record can't be read gets the list by
+ * oc_core_tick's retry. The operator's anchors and the unique-anchor check
+ * per group come with network core 2. */
 int  oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us);
+/* The operator's repair (the CLI's `list set ID ... --force`): as
+ * oc_core_chan_list_set, but a stored list that can't be read (a failing
+ * or malformed row) is replaced, at the version after the last one written
+ * for list_id - which the store keeps apart from the list (list_ver_get) -
+ * so every cell of the group takes it as a change. -1 as above, or when
+ * that last version can't be read either. */
+int  oc_core_chan_list_replace(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us);
 
 /* Subscribers (admin). number NULL: a random free number in the first NANP
  * block this core is home for (numbering-plan.md "Assignment Modes"). 0 with
@@ -116,5 +254,30 @@ int  oc_core_token_issue(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], 
 /* The subscriber can no longer register: its tokens are voided and its cell
  * is told (LOC_CANCEL disabled). 0 or -1. */
 int  oc_core_sub_disable(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint64_t now_us);
+
+/* The admin API's subscriber operations (portal spec §7, network-core spec
+ * §18.1 and §18.3). Each returns 0 or an OC_CORE_E_* saying which rule
+ * refused it; a store that can't answer is OC_CORE_E_STORE, never "not
+ * found" or "taken" (oc_core_store.h), and then nothing is changed. */
+enum {
+    OC_CORE_E_INVALID = -1,        /* not a valid full number */
+    OC_CORE_E_NOT_ASSIGNABLE = -2, /* reserved, or not in a block this core is home for */
+    OC_CORE_E_TAKEN = -3,          /* a subscriber already */
+    OC_CORE_E_NOT_FOUND = -4,      /* not a subscriber */
+    OC_CORE_E_ACTIVATED = -5,      /* bound to a terminal: only an unactivated number is released */
+    OC_CORE_E_STORE = -6           /* the store failed: nothing changed */
+};
+/* A new subscriber and its first token, in one transaction (the portal's
+ * sub.create): *qr is what its QR code carries, valid for valid_s. */
+int  oc_core_sub_create(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint32_t valid_s, oc_sig_qr_t *qr);
+/* An unactivated subscriber goes, with its unused tokens and any vectors:
+ * the number is free again. Audited SUB_RELEASE with why ("expired",
+ * "a<account>", "u<uid>"). A number whose terminal was taken over by
+ * another activation (activated 0 again) counts as unactivated. */
+int  oc_core_sub_release(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], const char *why);
+/* A disabled subscriber may register again; its terminal is still bound,
+ * and no token is issued (a disable voided them). Audited SUB_ENABLE.
+ * Enabling an enabled one changes nothing and writes no record. */
+int  oc_core_sub_enable(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN]);
 
 #endif

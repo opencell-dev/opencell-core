@@ -1,0 +1,70 @@
+# oc-core, the OpenCell network core (network-core spec §4.2, §17). Installed
+# by tools/deploy/oc-deploy. The master key is /etc/opencell/master.key
+# (root, 0400), handed over as a credential: the service user never reads
+# the file itself (systemd copies it to $CREDENTIALS_DIRECTORY/master.key,
+# root's with a read ACL for oc-core on tmpfs - or oc-core's own on ramfs -
+# and oc_key_load takes either). Group oc-admin may use the admin socket;
+# group oc-cell the cell socket (a single site runs oc-cell on the same
+# machine). Plan 9 (the VM, TLS) drops oc-cell from SupplementaryGroups
+# there. First setup, with the service stopped (--offline makes the
+# database's directory, /var/lib/opencell/core, oc-core's and 0700, if the
+# unit has not run yet):
+#   sudo oc-core admin --offline --key-file /etc/opencell/master.key net init
+# `sudo oc-core admin ...` sends the operator's SUDO_UID for the audit
+# record; a daemon older than that (v0.1.0) answers it with usage, and the
+# client asks again without it, so a client ahead of the running daemon
+# (installed, not yet restarted) still works, audited as plain u0.
+# The admin API's key (api_key = api.key in oc-core.conf) comes the same way
+# as the master key, by a drop-in on the hosts that listen, sorting after any
+# drop-in that resets LoadCredential= (oc-core-1: tls-key.conf, its key on
+# the key disk):
+#   [Service]
+#   LoadCredential=api.key:/srv/oc-core-key/api.key
+[Unit]
+Description=OpenCell network core (oc-core)
+After=network.target
+
+[Service]
+Type=simple
+User=oc-core
+Group=oc-core
+SupplementaryGroups=oc-admin oc-cell
+ExecStart=/usr/local/bin/oc-core --config /etc/opencell/oc-core.conf
+LoadCredential=master.key:/etc/opencell/master.key
+RuntimeDirectory=opencell
+RuntimeDirectoryMode=0755
+StateDirectory=opencell/core
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+UMask=0077
+# The master key lives in its memory: no core dumps (oc-core also sets
+# itself non-dumpable, which covers a pipe core_pattern).
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+# The cell and admin sockets (Unix), and the admin API's TCP listener
+# (api_listen, portal plan P4; plan 9's cell links later).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

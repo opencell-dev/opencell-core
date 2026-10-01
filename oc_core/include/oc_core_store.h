@@ -35,14 +35,16 @@
  * failure too.
  *
  * Deleting nothing, by function: loc_del returns -1 when the number has no
- * location (and, as above, does not doom a transaction for it); the bulk
+ * location, and sub_del when there is no such subscriber (and, as above,
+ * neither dooms a transaction for it); the bulk
  * deletes - token_void, av_drop_cell, av_del_number, av_prune,
  * loc_purge_cell - return 0 when they find nothing to delete. The contract
  * test (tests/core_store_contract.h) pins both.
  *
- * Lookups that tell "none" from "failed": sub_get, loc_get and
- * av_newest_confirmed return 0 (found), OC_CORE_STORE_NONE (-1: there is no
- * such record) or OC_CORE_STORE_FAILED (-2: the store could not say). A
+ * Lookups tell "none" from "failed": every get (netkey_get, cell_get,
+ * list_get, sub_get, sub_by_tmid, token_get, av_get, av_newest_confirmed,
+ * loc_get) returns 0 (found), OC_CORE_STORE_NONE (-1: there is no such
+ * record) or OC_CORE_STORE_FAILED (-2: the store could not say). A
  * caller must never read "failed" as "none": oc_core fails closed on it -
  * the location floor of network-core spec §19.2 is not skipped because a
  * read failed, a number whose record could not be read is not assigned
@@ -120,7 +122,11 @@ typedef struct {
 typedef enum {
     OC_CORE_AUDIT_ACTIVATE = 1, OC_CORE_AUDIT_ACT_FAIL, OC_CORE_AUDIT_REGISTER, OC_CORE_AUDIT_AUTH_FAIL,
     OC_CORE_AUDIT_RESYNC, OC_CORE_AUDIT_LOC_CANCEL, OC_CORE_AUDIT_TOKEN_ISSUE, OC_CORE_AUDIT_SUB_DISABLE,
-    OC_CORE_AUDIT_CELL_REJECT
+    OC_CORE_AUDIT_CELL_REJECT, OC_CORE_AUDIT_ADMIN, /* an operator's command (oc-core admin) */
+    OC_CORE_AUDIT_API,         /* a call on the admin API (portal spec §7): "a<account> <op> <result> ..." */
+    OC_CORE_AUDIT_SUB_RELEASE, /* an unactivated number freed: "expired", "a<account>" or "u<uid>" */
+    OC_CORE_AUDIT_SUB_ENABLE,
+    OC_CORE_AUDIT_PEER_REJECT  /* an OCSS peer refused at HELLO: "core <id> HELLO refused (<reason>)" */
 } oc_core_audit_event_t;
 
 typedef struct {
@@ -142,9 +148,16 @@ typedef struct {
     /* channel lists, one per list group (channel-list spec §8; list_id 1-65535) */
     int (*list_get)(void *ctx, uint16_t list_id, oc_sig_chan_list_t *out);
     int (*list_put)(void *ctx, uint16_t list_id, const oc_sig_chan_list_t *l); /* insert or replace */
+    /* the version of the list list_put last wrote for list_id, kept apart
+     * from the list itself, so a list that can't be read still has it (the
+     * floor of oc_core_chan_list_replace): 0, NONE or FAILED */
+    int (*list_ver_get)(void *ctx, uint16_t list_id, uint8_t *ver);
     int (*sub_get)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_sub_t *out); /* 0, NONE or FAILED */
-    int (*sub_by_tmid)(void *ctx, uint32_t tmid, oc_core_sub_t *out); /* activated and bound to tmid */
+    int (*sub_by_tmid)(void *ctx, uint32_t tmid, oc_core_sub_t *out); /* activated, bound to tmid: 0, NONE or FAILED */
     int (*sub_put)(void *ctx, const oc_core_sub_t *s);                /* insert or replace */
+    /* the subscriber's record goes (oc_core_sub_release): -1 if there was
+     * none, which, like loc_del's, does not doom a transaction */
+    int (*sub_del)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN]);
     int (*token_get)(void *ctx, const uint8_t token_id[8], oc_core_token_t *out);
     int (*token_put)(void *ctx, const oc_core_token_t *t);
     int (*token_void)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN]); /* delete its unused tokens */

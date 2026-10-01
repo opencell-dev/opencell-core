@@ -1,0 +1,800 @@
+#!/bin/bash
+# oc-deploy: install a tagged OpenCell program on a host (network-core spec
+# §17 decisions 4 and 11). Run from the laptop.
+#
+#   oc-deploy deploy REPO_DIR TAG HOST   build TAG of REPO_DIR on HOST, install, restart its unit
+#   oc-deploy rollback HOST NAME         back to the previous build of NAME (oc-core, oc-cell)
+#   oc-deploy list HOST NAME             the builds of NAME on HOST
+#   oc-deploy status HOST                current/previous, the latest run and its log
+#
+# REPO_DIR is a local clone of opencell-core (the program oc-core) or
+# opencell-pi (oc-cell), told apart by the files at the tag, with its
+# submodules checked out; only tags vX.Y.Z are deployed. The tag's tree and
+# every submodule's tree at the commit the tag pins (recursively) are
+# packed, copied over SSH (HOST is [user@]host as in ~/.ssh/config, or a
+# Tailscale name; OC_DEPLOY_JUMP=[user@]host[:port] (or a plain alias from
+# ~/.ssh/config) adds a jump host, e.g. the core VM: OC_DEPLOY_JUMP=ovh-pve
+# ... opencell@10.0.0.60),
+# built on the host as the SSH user with the tests off (Debian 13: cmake,
+# make, gcc, libssl-dev, libsqlite3-dev), and installed by root (the SSH
+# user needs passwordless sudo, or is root):
+#   /usr/local/lib/opencell/NAME/TAG/          a build (bin/NAME, NAME.service)
+#   /usr/local/lib/opencell/NAME/current       -> TAG
+#   /usr/local/lib/opencell/NAME/previous      -> the build before (for rollback)
+#   /usr/local/bin/NAME                        -> ../lib/opencell/NAME/current/bin/NAME
+#   /etc/systemd/system/NAME.service           the current build's NAME.service
+# Older builds are removed. Neither current nor previous is ever rebuilt in
+# place (rollback goes back to previous). The master key and /etc/opencell
+# are the operator's, never touched here. A unit that is enabled (or
+# running) is restarted and checked: active with the new build's binary as
+# its main process for 5 s running and, for oc-core, `oc-core admin status`
+# answering, within 30 s; if not, the host goes back to the build before
+# on its own. `previous` moves only after a healthy switch. The first time,
+# enabling the unit is left to the operator.
+#
+# A dropped connection can't leave a half-switched install: the host side
+# runs as root with HUP and PIPE ignored, writes its output to its own log
+# (/var/lib/oc-deploy/deploy.log, root's, 0600) and its exit status to
+# /var/lib/oc-deploy/status/RUN_ID, then runs to its end whatever happens to
+# the connection (logind's KillUserProcesses stays off, Debian's default).
+# The laptop follows that log (a fetch every 5 s) and reports the status the
+# host recorded, never ssh's exit code; if ssh fails (255) it keeps
+# following for up to OC_DEPLOY_POLL_BUDGET s (default 900, a fetch every
+# OC_DEPLOY_POLL_INTERVAL s, default 10), then points at `status` - never
+# at running deploy or rollback again. One flock on the host keeps runs from
+# overlapping; the directories it trusts must not be symlinks or writable
+# by anyone else.
+#
+# One TCP connection per run: every call (upload, run, log fetches) is
+# multiplexed over one ssh master (ControlMaster=auto, its socket in a
+# private 0700 directory, ControlPersist=60) - the OVH Proxmox host drops
+# bursts of new SSH connections. Only constant command strings reach ssh;
+# what varies (a validated tag, name, run id, upload path) travels in the
+# script on stdin.
+#
+# Overrides: OC_DEPLOY_SSH replaces the ssh command (split on whitespace;
+# HOST and the command follow). Tests: OC_DEPLOY_LOCAL=ROOT runs the host
+# side here, as this user, under ROOT (the prefix; /etc, /var and /proc
+# under it too), without ssh, sudo or systemctl - OC_DEPLOY_SYSTEMD=1 lets a
+# fake systemctl on PATH take part.
+set -euo pipefail
+unset CDPATH
+
+TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+HOST_RE='^[A-Za-z0-9_][A-Za-z0-9._@:%-]*$'
+STREAM_INTERVAL=5
+PLAIN_CMD='bash -s'
+ELEVATED_CMD='if [ "$(id -u)" -eq 0 ]; then exec bash -s; else exec sudo -n bash -s; fi'
+UPLOAD_CMD='umask 077 && d=$(mktemp -d "${TMPDIR:-/tmp}/oc-deploy.XXXXXXXX") && cat >"$d/src.tgz" && echo "$d"'
+# There, root is needed after the upload: without passwordless sudo, nothing
+# is sent.
+SUDO_CHECK='{ [ "$(id -u)" -eq 0 ] || sudo -n true || { echo "oc-deploy: $(id -un) needs passwordless sudo here" >&2; exit 3; }; } && '
+
+die() { echo "oc-deploy: $*" >&2; exit 1; }
+usage() {
+    echo "usage: oc-deploy deploy REPO_DIR TAG HOST | rollback HOST NAME | list HOST NAME | status HOST" >&2
+    exit 2
+}
+
+# ---- the host side: host_main runs there (as root through sudo, or as
+# this user under OC_DEPLOY_LOCAL), sent as the text of these functions ----
+
+host_bad() {
+    echo "oc-deploy on the host: bad call" >&2
+    exit 2
+}
+
+host_name() { case "$1" in oc-core | oc-cell) ;; *) host_bad ;; esac }
+
+# A directory the host side trusts: not a symlink, owned by whoever runs
+# this (root there), writable by no one else.
+host_trust() { # DIR
+    local d=$1 owner mode
+    if [ -L "$d" ]; then
+        echo "refusing: $d is a symlink" >&2
+        exit 1
+    fi
+    if [ ! -d "$d" ]; then
+        echo "refusing: $d is not a directory" >&2
+        exit 1
+    fi
+    owner=$(stat -c %u -- "$d")
+    if [ "$owner" != "$(id -u)" ]; then
+        echo "refusing: $d belongs to uid $owner, not $(id -u)" >&2
+        exit 1
+    fi
+    mode=$(stat -c %a -- "$d")
+    if ((8#$mode & 8#022)); then
+        echo "refusing: $d is group- or other-writable (mode $mode)" >&2
+        exit 1
+    fi
+}
+
+# The deploy's own directories: made if missing (0700; one there already,
+# or made at the same moment by a log fetch, is left alone), then trusted.
+host_state() {
+    mkdir -p -- "$ROOT/var/lib"
+    host_trust "$ROOT/var/lib"
+    mkdir -m 0700 -- "$STATE" 2>/dev/null || true
+    host_trust "$STATE"
+    mkdir -m 0700 -- "$STATE/status" 2>/dev/null || true
+    host_trust "$STATE/status"
+}
+
+# The upload directory: the SSH user's (the builder's), made by mktemp.
+host_upload() { # DIR
+    local up=$1
+    if ! [[ $up =~ ^/[A-Za-z0-9._/-]*/oc-deploy\.[A-Za-z0-9]{8}$ ]] || [[ $up == *..* ]]; then host_bad; fi
+    if [ -n "$BUILDER" ]; then OC_UID=$(id -u -- "$BUILDER"); else OC_UID=$(id -u); fi
+    if [ -L "$up" ] || [ ! -d "$up" ] || [ "$(stat -c %u -- "$up")" != "$OC_UID" ]; then
+        echo "oc-deploy on the host: $up is not the upload" >&2
+        exit 1
+    fi
+}
+
+host_link_of() { readlink -- "$1" 2>/dev/null || true; }
+
+# LINK -> TARGET, atomically.
+host_link() { # TARGET LINK
+    ln -sfn -- "$1" "$2.new" && mv -Tf -- "$2.new" "$2"
+}
+
+# The build, and every read of what the builder unpacked, runs as the SSH
+# user, not root. Hygiene, not a security boundary: that user has
+# passwordless sudo. Without fd 9: a process a build leaves behind must not
+# hold the host's deploy lock. Builds inherit HUP and PIPE ignored (SIG_IGN
+# survives exec): a write to a closed pipe in a build step fails with EPIPE,
+# which make and the compilers report as an error, instead of killing the
+# writer.
+as_builder() {
+    if [ -n "$BUILDER" ]; then
+        runuser -u "$BUILDER" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$OC_UP" LC_ALL=C.UTF-8 "$@" 9>&- # lc2oc: keep (LC_ALL is the POSIX locale var, not our lc/oc naming)
+    else
+        "$@" 9>&-
+    fi
+}
+
+host_exit() {
+    local rc=$?
+    if [ -n "$OC_NEW" ]; then rm -rf -- "$OC_NEW"; fi
+    if [ -n "$OC_UP" ]; then rm -rf -- "$OC_UP"; fi
+    if [ "$STARTED" = 1 ]; then
+        echo "=== run $RUNID end $(date -u +%FT%TZ) rc=$rc ==="
+        echo "$rc" >"$STATE/status/$RUNID.new" && mv -f -- "$STATE/status/$RUNID.new" "$STATE/status/$RUNID"
+    fi
+}
+
+# Healthy: the unit active with the build's binary as its main process, the
+# same process through 5 checks in a row, and for oc-core its admin socket
+# answering (`oc-core admin status`, at most 5 s a try). One check a second,
+# at most 30 checks, all within 30 s.
+host_healthy() { # NAME TAG
+    local name=$1 tag=$2 want pid exe out last="" stable=0 i left end=$((SECONDS + 30))
+    want=$(readlink -f -- "$PREFIX/lib/opencell/$name/$tag/bin/$name")
+    for ((i = 0; i < 30 && SECONDS < end; i++)); do
+        sleep 1
+        if systemctl is-active -q "$name"; then
+            pid=$(systemctl show -p MainPID --value "$name" 2>/dev/null || true)
+            exe=$(readlink -- "$ROOT/proc/$pid/exe" 2>/dev/null || true)
+            if [ -n "$exe" ] && [ "$exe" = "$want" ] && [ "$pid" = "$last" ]; then stable=$((stable + 1)); else stable=0; fi
+            last=$pid
+        else
+            stable=0
+            last=""
+        fi
+        [ "$stable" -ge 5 ] || continue
+        if [ "$name" != oc-core ]; then
+            echo "$name $tag is healthy: active, pid $pid"
+            return 0
+        fi
+        left=$((end - SECONDS))
+        [ "$left" -le 5 ] || left=5
+        [ "$left" -ge 1 ] || break
+        if out=$(timeout "$left" "$PREFIX/bin/oc-core" admin status 2>&1 9>&-); then
+            echo "$name $tag is healthy: active, pid $pid, admin status:"
+            printf '%s\n' "$out"
+            return 0
+        fi
+    done
+    echo "$name $tag is not healthy (journalctl -u $name)"
+    return 1
+}
+
+# The unit of build TAG installed, and restarted and checked if it is
+# enabled or running. Called in a condition: every step is checked here.
+host_activate() { # NAME TAG
+    local name=$1 tag=$2 unit=$ROOT/etc/systemd/system/$1.service
+    [ "$SYSTEMD" = 1 ] || return 0
+    if ! { mkdir -p -- "$ROOT/etc/systemd/system" &&
+        install -m 0644 -- "$PREFIX/lib/opencell/$name/$tag/$name.service" "$unit.new" &&
+        mv -Tf -- "$unit.new" "$unit"; }; then
+        echo "could not install $unit"
+        return 1
+    fi
+    systemctl daemon-reload || echo "systemctl daemon-reload failed"
+    if ! systemctl is-enabled -q "$name" 2>/dev/null && ! systemctl is-active -q "$name" 2>/dev/null; then
+        echo "$name is not enabled yet: sudo systemctl enable --now $name"
+        return 0
+    fi
+    systemctl restart "$name" || echo "systemctl restart $name failed"
+    host_healthy "$name" "$tag"
+}
+
+# current -> TO, unit restarted; previous -> FROM once TO is healthy, else
+# back to FROM.
+host_switch() { # NAME TO FROM deploy|rollback
+    local name=$1 to=$2 from=$3 kind=$4 d=$PREFIX/lib/opencell/$1
+    if ! { host_link "$to" "$d/current" && mkdir -p -- "$PREFIX/bin" &&
+        host_link "../lib/opencell/$name/current/bin/$name" "$PREFIX/bin/$name"; }; then
+        echo "could not switch $name to $to"
+        host_link "${from:-$to}" "$d/current" || true
+        return 1
+    fi
+    if host_activate "$name" "$to"; then
+        if [ -n "$from" ] && [ "$from" != "$to" ]; then host_link "$from" "$d/previous" || return 1; fi
+        if [ "$kind" = deploy ]; then
+            echo "$name $to installed (previous: ${from:-none})"
+        else
+            echo "$name back to $to (previous: $from)"
+        fi
+        return 0
+    fi
+    if [ -z "$from" ] || [ "$from" = "$to" ]; then
+        echo "no build of $name to go back to: $to stays, not healthy"
+        return 1
+    fi
+    if ! host_link "$from" "$d/current"; then
+        echo "could not switch $name back to $from"
+        return 1
+    fi
+    if host_activate "$name" "$from"; then
+        echo "$name back on $from"
+    else
+        echo "$name back on $from, which is not healthy either (journalctl -u $name)"
+    fi
+    return 1
+}
+
+# Builds other than current and previous, leftovers of killed runs, status
+# files older than 30 days.
+host_prune() { # DIR
+    local d=$1 cur prev x
+    cur=$(host_link_of "$d/current")
+    prev=$(host_link_of "$d/previous")
+    for x in "$d"/v* "$d"/.new-*; do
+        [ -e "$x" ] || [ -L "$x" ] || continue
+        case "${x##*/}" in "$cur" | "$prev") ;; *) rm -rf -- "$x" ;; esac
+    done
+    find "$STATE/status" -maxdepth 1 -type f -mtime +30 -delete || true
+}
+
+host_deploy() { # NAME TAG UPLOAD HOSTNAME
+    local name=$1 tag=$2 up=$3 host=$4 d=$PREFIX/lib/opencell/$1 cur prev ver t tests
+    mkdir -p -- "$PREFIX/lib/opencell"
+    host_trust "$PREFIX/lib/opencell"
+    mkdir -p -- "$d"
+    host_trust "$d"
+    cur=$(host_link_of "$d/current")
+    prev=$(host_link_of "$d/previous")
+    if [ "$tag" = "$cur" ]; then
+        echo "refusing: $name $tag is the current build already"
+        exit 1
+    fi
+    if [ "$tag" = "$prev" ]; then
+        echo "refusing: $name $tag is the previous build; to go back to it: oc-deploy rollback $host $name"
+        exit 1
+    fi
+    for t in cmake make cc tar; do
+        command -v "$t" >/dev/null || {
+            echo "this host lacks $t: sudo apt install cmake make gcc libssl-dev libsqlite3-dev"
+            exit 1
+        }
+    done
+    # Uploads of runs that never began (a dropped connection, a script cut
+    # short) are left behind: the builder's own, swept once an hour old.
+    as_builder find "${up%/*}" -mindepth 1 -maxdepth 1 -type d -name 'oc-deploy.????????' -uid "$OC_UID" \
+        -mmin +60 -exec rm -rf -- {} + 2>/dev/null || true
+    echo "building $name $tag as ${BUILDER:-$(id -un)}"
+    as_builder mkdir -- "$up/src"
+    as_builder tar -xzf "$up/src.tgz" -C "$up/src"
+    if ! as_builder test -f "$up/src/dist/systemd/$name.service"; then
+        echo "$tag has no dist/systemd/$name.service"
+        exit 1
+    fi
+    tests=OC_CORE_TESTS
+    [ "$name" = oc-core ] || tests=OC_PI_TESTS
+    as_builder cmake -S "$up/src" -B "$up/build" -DCMAKE_BUILD_TYPE=RelWithDebInfo "-D$tests=OFF" \
+        -DOC_VERSION="$tag" || { echo "cmake failed for $name $tag"; exit 1; }
+    as_builder cmake --build "$up/build" -j2 || { echo "the build of $name $tag failed"; exit 1; }
+    # Installed into a fresh directory, renamed into place only when whole.
+    OC_NEW=$d/.new-$tag-$RUNID
+    rm -rf -- "$OC_NEW"
+    cmake --install "$up/build" --prefix "$OC_NEW" >/dev/null 9>&-
+    if [ ! -x "$OC_NEW/bin/$name" ]; then
+        echo "the build installed no bin/$name"
+        exit 1
+    fi
+    ver=$(as_builder "$OC_NEW/bin/$name" --version 2>&1 || true)
+    case "$ver" in
+    "$name $tag" | "$name $tag "*) ;;
+    *)
+        echo "the build says '$ver', not '$name $tag'"
+        exit 1
+        ;;
+    esac
+    as_builder cat -- "$up/src/dist/systemd/$name.service" >"$OC_NEW/$name.service"
+    chmod 0644 -- "$OC_NEW/$name.service"
+    rm -rf -- "${d:?}/$tag"
+    mv -T -- "$OC_NEW" "$d/$tag"
+    OC_NEW=""
+    if ! host_switch "$name" "$tag" "$cur" deploy; then
+        [ "$(host_link_of "$d/current")" = "$tag" ] || rm -rf -- "${d:?}/$tag"
+        exit 1
+    fi
+    host_prune "$d"
+}
+
+host_rollback() { # NAME
+    local name=$1 d=$PREFIX/lib/opencell/$1 cur prev
+    cur=$(host_link_of "$d/current")
+    prev=$(host_link_of "$d/previous")
+    if [ -z "$prev" ] || [ ! -d "$d/$prev" ]; then
+        echo "no previous build of $name to go back to"
+        exit 1
+    fi
+    if [ -z "$cur" ]; then
+        echo "no current build of $name: nothing to roll back from (current is missing; ls -l $d)"
+        exit 1
+    fi
+    host_trust "$PREFIX/lib/opencell"
+    host_trust "$d"
+    host_switch "$name" "$prev" "$cur" rollback || exit 1
+    find "$STATE/status" -maxdepth 1 -type f -mtime +30 -delete || true
+}
+
+host_list() { # NAME
+    local name=$1 d=$PREFIX/lib/opencell/$1 cur prev x t mark n=0
+    cur=$(host_link_of "$d/current")
+    prev=$(host_link_of "$d/previous")
+    for x in "$d"/v*; do
+        [ -d "$x" ] || continue
+        t=${x##*/}
+        mark=""
+        [ "$t" != "$cur" ] || mark=" (current)"
+        [ "$t" != "$prev" ] || mark=" (previous)"
+        echo "$t$mark"
+        n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] || echo "no builds of $name on this host"
+}
+
+# The run's log (the part between its markers), its status first: once the
+# status is there, the log holds the run's end.
+host_fetch() { # RUN_ID
+    local id=$1 st=-
+    if [ -f "$STATE/status/$id" ]; then st=$(cat -- "$STATE/status/$id"); fi
+    echo "@@oc-status $st"
+    { cat -- "$LOG.1" 2>/dev/null || true; cat -- "$LOG" 2>/dev/null || true; } |
+        sed -n "/^=== run $id start/,/^=== run $id end/p"
+    echo "@@oc-fetched"
+}
+
+host_status() {
+    local name d cur prev line id result locked=0
+    for name in oc-core oc-cell; do
+        d=$PREFIX/lib/opencell/$name
+        [ -d "$d" ] || continue
+        cur=$(host_link_of "$d/current")
+        prev=$(host_link_of "$d/previous")
+        line="$name: current ${cur:-none}, previous ${prev:-none}"
+        if [ "$SYSTEMD" = 1 ]; then line="$line, unit $(systemctl is-active "$name" 2>/dev/null || true)"; fi
+        echo "$line"
+    done
+    id=$(cat -- "$STATE/latest-run-id" 2>/dev/null || true)
+    if ! [[ $id =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]]; then
+        echo "latest run: none"
+        return 0
+    fi
+    # The lock before the status file: a run writes its status before it
+    # lets go of the lock, so one ending in between reads as finished.
+    flock -n "$STATE/lock" -c true 2>/dev/null || locked=1
+    if [ -f "$STATE/status/$id" ]; then
+        result="exit $(cat -- "$STATE/status/$id")"
+    elif [ "$locked" = 1 ]; then
+        result="in progress"
+    else
+        result="no recorded status: interrupted before it could finish"
+    fi
+    echo "latest run: $id ($result)"
+    echo "--- the end of its log ---"
+    { cat -- "$LOG.1" 2>/dev/null || true; cat -- "$LOG" 2>/dev/null || true; } |
+        sed -n "/^=== run $id start/,/^=== run $id end/p" | tail -n 40
+}
+
+host_main() { # MODE ROOT PREFIX SYSTEMD RUN_ID ACTION ARGS...
+    set -euo pipefail
+    trap '' HUP PIPE
+    umask 022
+    exec </dev/null
+    [ $# -ge 6 ] || host_bad
+    local mode=$1
+    ROOT=$2 PREFIX=$3 SYSTEMD=$4 RUNID=$5 ACTION=$6
+    shift 6
+    STATE=$ROOT/var/lib/oc-deploy LOG=$ROOT/var/lib/oc-deploy/deploy.log
+    BUILDER="" OC_UP="" OC_NEW="" OC_UID="" STARTED=0
+    [[ $RUNID =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || host_bad
+    [[ $SYSTEMD =~ ^[01]$ ]] || host_bad
+    case "$mode" in
+    local) ;;
+    host)
+        [ -z "$ROOT" ] && [ "$PREFIX" = /usr/local ] || host_bad
+        if [ "$ACTION" != list ] && [ "$ACTION" != discard ] && [ "$(id -u)" != 0 ]; then
+            echo "oc-deploy on the host: $ACTION needs root (sudo)" >&2
+            exit 1
+        fi
+        if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then BUILDER=$SUDO_USER; fi
+        ;;
+    *) host_bad ;;
+    esac
+    case "$ACTION $#" in
+    "list 1")
+        host_name "$1"
+        host_list "$1"
+        return 0
+        ;;
+    "discard 1")
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            host_upload "$1"
+            rm -rf -- "$1"
+        fi
+        return 0
+        ;;
+    "fetch 1")
+        [[ $1 =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || host_bad
+        if (host_state) >/dev/null 2>&1; then
+            host_fetch "$1"
+        else
+            printf '@@oc-status -\n@@oc-fetched\n'
+        fi
+        return 0
+        ;;
+    "status 0")
+        host_state
+        host_status
+        return 0
+        ;;
+    "deploy 4")
+        host_name "$1"
+        [[ $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || host_bad
+        [[ $4 =~ ^[A-Za-z0-9_][A-Za-z0-9._@:%-]*$ ]] || host_bad
+        host_upload "$3"
+        OC_UP=$3
+        ;;
+    "rollback 1") host_name "$1" ;;
+    *) host_bad ;;
+    esac
+    trap host_exit EXIT
+    host_state
+    exec 9>>"$STATE/lock"
+    if ! flock -n 9; then
+        echo "oc-deploy: another deploy or rollback is running on this host; try again once it has finished" >&2
+        exit 1
+    fi
+    # Holding the lock: a refused run never replaces the latest run id.
+    if [ "$(stat -c %s -- "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then mv -f -- "$LOG" "$LOG.1"; fi
+    : >>"$LOG"
+    chmod 0600 "$LOG"
+    exec >>"$LOG" 2>&1
+    echo "$RUNID" >"$STATE/latest-run-id"
+    STARTED=1
+    echo "=== run $RUNID start $(date -u +%FT%TZ) $ACTION $1 ${2:-} ==="
+    case "$ACTION" in
+    deploy) host_deploy "$@" ;;
+    rollback) host_rollback "$1" ;;
+    esac
+}
+
+HOST_FUNCS=(host_bad host_name host_trust host_state host_upload host_link_of host_link as_builder host_exit
+    host_healthy host_activate host_switch host_prune host_deploy host_rollback host_list host_fetch host_status
+    host_main)
+
+# ---- the laptop side ----
+
+TMP="" FOLLOWER="" RUN_ID="" HOST="" UP="" TRACKING=0
+
+cleanup() {
+    if [ -n "$FOLLOWER" ]; then
+        touch "$TMP/stop" 2>/dev/null || true
+        kill "$FOLLOWER" 2>/dev/null || true
+        wait "$FOLLOWER" 2>/dev/null || true
+    fi
+    if [ -n "$TMP" ] && [ -d "$TMP" ]; then rm -rf -- "$TMP"; fi
+}
+interrupted() {
+    if [ "$TRACKING" = 1 ]; then
+        echo "oc-deploy: interrupted here; run $RUN_ID may go on on $HOST by itself: check with 'oc-deploy status $HOST'" >&2
+    fi
+    exit 130
+}
+trap cleanup EXIT
+trap interrupted INT TERM
+
+make_tmp() {
+    TMP=$(mktemp -d "${TMPDIR:-/tmp}/oc-deploy-laptop.XXXXXX") || die "mktemp failed"
+    if [ -z "$TMP" ] || [ ! -d "$TMP" ] || [ -L "$TMP" ]; then die "mktemp gave '$TMP'"; fi
+}
+
+check_name() {
+    case "$1" in oc-core | oc-cell) ;; *) die "'$1': NAME is oc-core or oc-cell" ;; esac
+}
+
+local_ssh() { bash -c "$2"; } # HOST COMMAND: the "remote" side here (OC_DEPLOY_LOCAL)
+
+# Pauses SECONDS (fractions allowed without STOP_FLAG); with a STOP_FLAG
+# (whole seconds), wakes within a quarter second of it appearing. `command
+# -p` bypasses PATH, so a test's fake sleep never shortens the laptop's
+# waits.
+pause() { # SECONDS [STOP_FLAG]
+    local secs=$1 stop=${2:-} ticks
+    if [ -z "$stop" ]; then
+        command -p sleep "$secs"
+        return 0
+    fi
+    ticks=$((secs * 4))
+    while [ "$ticks" -gt 0 ] && [ ! -f "$stop" ]; do
+        command -p sleep 0.25
+        ticks=$((ticks - 1))
+    done
+}
+
+# SSH, MODE, ROOT, PREFIX, SYSTEMD, PLAIN, ELEVATED, UPLOAD for HOST.
+setup_transport() { # HOST
+    HOST=$1
+    [[ $HOST =~ $HOST_RE ]] || die "'$HOST' is not a host name ([user@]host)"
+    if [ -n "${OC_DEPLOY_LOCAL:-}" ]; then
+        case "$OC_DEPLOY_LOCAL" in /?*) ;; *) die "OC_DEPLOY_LOCAL must be an absolute path other than /" ;; esac
+        MODE=local ROOT=$OC_DEPLOY_LOCAL PREFIX=$OC_DEPLOY_LOCAL SYSTEMD=${OC_DEPLOY_SYSTEMD:-0}
+        PLAIN=$PLAIN_CMD ELEVATED=$PLAIN_CMD UPLOAD=$UPLOAD_CMD
+        [[ $SYSTEMD =~ ^[01]$ ]] || die "OC_DEPLOY_SYSTEMD is 0 or 1"
+    else
+        MODE=host ROOT="" PREFIX=/usr/local SYSTEMD=1 PLAIN=$PLAIN_CMD ELEVATED=$ELEVATED_CMD UPLOAD=$SUDO_CHECK$UPLOAD_CMD
+    fi
+    if [ -n "${OC_DEPLOY_SSH:-}" ]; then
+        read -r -a SSH <<<"$OC_DEPLOY_SSH"
+        SSH+=("$HOST")
+        return 0
+    fi
+    if [ "$MODE" = local ]; then
+        SSH=(local_ssh "$HOST")
+        return 0
+    fi
+    # One master connection, its socket in a private directory of ours
+    # (refused if it is a symlink or someone else's). ssh refuses a
+    # ControlPath of 108 bytes or more, and the master binds a name 17
+    # bytes longer while it starts; %C is 40.
+    local base=${XDG_RUNTIME_DIR:-} dir
+    if [ -z "$base" ] || [ ! -d "$base" ]; then base=$HOME/.ssh; fi
+    dir=$base/oc-deploy-ssh
+    if [ $((${#dir} + 1 + 40 + 17)) -ge 108 ]; then
+        die "the ssh control socket directory $dir is too long for a socket path; set XDG_RUNTIME_DIR to a short private directory"
+    fi
+    [ -d "$base" ] || mkdir -m 0700 -- "$base"
+    [ ! -L "$dir" ] || die "refusing: $dir is a symlink"
+    [ -d "$dir" ] || mkdir -m 0700 -- "$dir"
+    [ "$(stat -c %u -- "$dir")" = "$(id -u)" ] || die "refusing: $dir is not yours"
+    chmod 0700 -- "$dir"
+    SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+        -o ControlMaster=auto -o "ControlPath=$dir/%C" -o ControlPersist=60)
+    if [ -n "${OC_DEPLOY_JUMP:-}" ]; then
+        [[ $OC_DEPLOY_JUMP =~ ^[A-Za-z0-9_][A-Za-z0-9._@:%,-]*$ ]] || die "OC_DEPLOY_JUMP: '$OC_DEPLOY_JUMP' is not [user@]host[:port]"
+        SSH+=(-J "$OC_DEPLOY_JUMP")
+    fi
+    SSH+=(-- "$HOST")
+}
+
+# The script for host_main ARGS...: the host functions, then the call. Cut
+# anywhere, it runs nothing: an unfinished line is a syntax error, and
+# host_main checks its argument count.
+host_script() { # ARGS...
+    declare -f "${HOST_FUNCS[@]}"
+    printf 'OC_ARGS=('
+    printf '%q ' "$@"
+    printf ')\n'
+    printf '%s\n' 'host_main "${OC_ARGS[@]}"'
+}
+
+# One call: host_main ACTION ARGS... on the host, as root when ELEVATE is 1.
+on_host() { # ELEVATE ACTION ARGS...
+    local cmd=$PLAIN
+    if [ "$1" = 1 ]; then cmd=$ELEVATED; fi
+    shift
+    host_script "$MODE" "$ROOT" "$PREFIX" "$SYSTEMD" "$RUN_ID" "$@" | "${SSH[@]}" "$cmd"
+}
+
+# One fetch of the run's log: prints the lines not shown yet ($TMP/shown
+# counts them, shared with the background follower) and keeps the status
+# in $TMP/status once the host has one. Returns 1 if the host could not be
+# asked.
+fetch_once() {
+    local out first st body total shown
+    out=$(on_host 1 fetch "$RUN_ID" 2>/dev/null) || true
+    [ "${out##*$'\n'}" = "@@oc-fetched" ] || return 1
+    first=${out%%$'\n'*}
+    case "$first" in "@@oc-status "*) st=${first#@@oc-status } ;; *) return 1 ;; esac
+    body=${out#*$'\n'}
+    body=${body%@@oc-fetched}
+    body=${body%$'\n'}
+    shown=$(cat "$TMP/shown")
+    if [ -n "$body" ]; then
+        touch "$TMP/began" # the slice starts at the run's start marker
+        total=$(printf '%s\n' "$body" | wc -l)
+        if [ "$total" -gt "$shown" ]; then
+            printf '%s\n' "$body" | tail -n "+$((shown + 1))"
+            echo "$total" >"$TMP/shown"
+        fi
+    fi
+    if [[ $st =~ ^[0-9]{1,3}$ ]]; then echo "$st" >"$TMP/status"; fi
+    return 0
+}
+
+# Fetches every INTERVAL s until the run has a status (0), or STOP_FLAG
+# appears (one last fetch first) or DEADLINE (epoch s, 0 = none) passes (1),
+# or - with NO_SIGN_AFTER (s, 0 = never) - a fetch that long after the start
+# shows neither the run's log nor its status (2).
+follow_log() { # INTERVAL STOP_FLAG DEADLINE [NO_SIGN_AFTER]
+    local interval=$1 stop=$2 deadline=$3 nosign=${4:-0} last=0 asked t0
+    t0=$(date +%s)
+    while :; do
+        pause "$interval" "$stop"
+        if [ -n "$stop" ] && [ -f "$stop" ]; then last=1; fi
+        asked=0
+        if fetch_once; then asked=1; fi
+        [ ! -s "$TMP/status" ] || return 0
+        if [ "$nosign" -gt 0 ] && [ "$asked" = 1 ] && [ ! -e "$TMP/began" ] &&
+            [ $(($(date +%s) - t0)) -ge "$nosign" ]; then return 2; fi
+        [ "$last" = 0 ] || return 1
+        if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then return 1; fi
+    done
+}
+
+# Runs ACTION on the host with its log followed, then reports, once and
+# last, the status the host recorded for it - never ssh's exit code alone.
+run_tracked() { # ACTION ARGS...
+    local rc st tries=3 asked=0
+    local interval=${OC_DEPLOY_POLL_INTERVAL:-10} budget=${OC_DEPLOY_POLL_BUDGET:-900}
+    [[ $interval =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "OC_DEPLOY_POLL_INTERVAL: seconds"
+    [[ $budget =~ ^[0-9]+$ ]] || die "OC_DEPLOY_POLL_BUDGET: whole seconds"
+    echo 0 >"$TMP/shown"
+    : >"$TMP/status"
+    follow_log "$STREAM_INTERVAL" "$TMP/stop" 0 &
+    FOLLOWER=$!
+    TRACKING=1
+    set +e
+    on_host 1 "$@"
+    rc=$?
+    touch "$TMP/stop"
+    wait "$FOLLOWER"
+    FOLLOWER=""
+    set -e
+    if [ ! -s "$TMP/status" ] && [ "$rc" = 255 ]; then
+        echo "ssh exited 255 (the connection may have dropped); run $RUN_ID goes on on $HOST by itself - following it every ${interval}s for up to ${budget}s" >&2
+        # A run that began has written its start marker within moments: no
+        # sign of it 5 s on (at the first fetch, at the default interval)
+        # means it most likely never began.
+        st=0
+        follow_log "$interval" "" $(($(date +%s) + budget)) "$STREAM_INTERVAL" || st=$?
+        if [ "$st" = 2 ]; then
+            echo "no sign of run $RUN_ID on $HOST since the connection dropped (no log, no status): it most likely never began. Check with 'oc-deploy status $HOST' before running deploy or rollback again" >&2
+            return 1
+        fi
+        if [ ! -s "$TMP/status" ]; then
+            echo "no status recorded yet for run $RUN_ID: it may still be running. Check with 'oc-deploy status $HOST' (do not just run deploy or rollback again)" >&2
+            return 1
+        fi
+    fi
+    if [ ! -s "$TMP/status" ]; then
+        # The host side has exited: its status file is final.
+        while [ "$tries" -gt 0 ]; do
+            if fetch_once; then
+                asked=1
+                break
+            fi
+            tries=$((tries - 1))
+            [ "$tries" = 0 ] || pause "$interval"
+        done
+    fi
+    if [ ! -s "$TMP/status" ]; then
+        if [ "$asked" = 1 ] && [ -e "$TMP/began" ]; then
+            echo "run $RUN_ID began but recorded no status (ssh exited $rc): it was cut off before it finished. Check with 'oc-deploy status $HOST' (do not just run deploy or rollback again)" >&2
+        elif [ "$asked" = 1 ]; then
+            echo "the host recorded no status for run $RUN_ID (ssh exited $rc): it was refused before it began (see above) or the script never arrived whole; this run changed nothing" >&2
+            if [ -n "$UP" ]; then on_host 0 discard "$UP" >/dev/null 2>&1 || true; fi
+        else
+            echo "could not read the recorded status of run $RUN_ID (ssh exited $rc). Check with 'oc-deploy status $HOST' (do not just run deploy or rollback again)" >&2
+        fi
+        return 1
+    fi
+    st=$(cat "$TMP/status")
+    echo "host recorded exit $st for run $RUN_ID" >&2
+    return "$st"
+}
+
+# The tree of REPO at REV into DEST/PREFIX, and every submodule's at the
+# commit REV pins, recursively.
+pack() { # REPO REV DEST PREFIX
+    local repo=$1 rev=$2 dest=$3 prefix=$4 type sha path
+    mkdir -p -- "$dest/$prefix"
+    git -C "$repo" archive --format=tar "$rev" | tar -x -C "$dest/$prefix"
+    while IFS=$' \t' read -r -d '' _ type sha path; do
+        [ "$type" = commit ] || continue
+        [ -e "$repo/$path/.git" ] || die "$repo/$path: submodule not checked out (git submodule update --init --recursive)"
+        git -C "$repo/$path" cat-file -e "$sha^{commit}" 2>/dev/null ||
+            die "$repo/$path lacks $sha, which $rev pins (git -C $repo submodule update --init --recursive)"
+        pack "$repo/$path" "$sha" "$dest" "$prefix$path/"
+    done < <(git -C "$repo" ls-tree -r -z "$rev")
+}
+
+cmd_deploy() { # REPO_DIR TAG HOST
+    local repo=$1 tag=$2 host=$3 ref name rc
+    [[ $tag =~ $TAG_RE ]] || die "'$tag': deploys take a tag vX.Y.Z"
+    [ -d "$repo" ] || die "$repo: no such directory"
+    repo=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || die "$repo is not in a git work tree"
+    ref="refs/tags/$tag"
+    git -C "$repo" rev-parse -q --verify "$ref^{commit}" >/dev/null || die "$repo has no tag $tag"
+    if git -C "$repo" cat-file -e "$ref:oc/oc_core_main.c" 2>/dev/null; then
+        name=oc-core
+    elif git -C "$repo" cat-file -e "$ref:oc-cell/occ_main.c" 2>/dev/null; then
+        name=oc-cell
+    else
+        die "$repo at $tag is neither opencell-core (oc-core) nor opencell-pi (oc-cell)"
+    fi
+    git -C "$repo" cat-file -e "$ref:dist/systemd/$name.service" 2>/dev/null || die "$tag has no dist/systemd/$name.service"
+    setup_transport "$host"
+    make_tmp
+    pack "$repo" "$ref^{commit}" "$TMP/tree" ""
+    tar -czf "$TMP/src.tgz" -C "$TMP/tree" .
+    echo "$name $tag: $(du -h "$TMP/src.tgz" | cut -f1) of source to $HOST"
+    rc=0
+    UP=$("${SSH[@]}" "$UPLOAD" <"$TMP/src.tgz") || rc=$?
+    [ "$rc" = 0 ] || die "could not send the source (ssh exited $rc); nothing was changed on $HOST"
+    if ! [[ $UP =~ ^/[A-Za-z0-9._/-]*/oc-deploy\.[A-Za-z0-9]{8}$ ]] || [[ $UP == *..* ]]; then
+        die "the host answered the upload with '$UP'"
+    fi
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    run_tracked deploy "$name" "$tag" "$UP" "$HOST"
+}
+
+cmd_rollback() { # HOST NAME
+    check_name "$2"
+    setup_transport "$1"
+    make_tmp
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    run_tracked rollback "$2"
+}
+
+cmd_list() { # HOST NAME
+    local rc=0
+    check_name "$2"
+    setup_transport "$1"
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    on_host 0 list "$2" || rc=$?
+    [ "$rc" != 255 ] || die "could not reach $HOST (ssh exited 255)"
+    return "$rc"
+}
+
+cmd_status() { # HOST
+    local rc=0
+    setup_transport "$1"
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    on_host 1 status || rc=$?
+    [ "$rc" != 255 ] || die "could not reach $HOST (ssh exited 255)"
+    return "$rc"
+}
+
+case "${1:-}" in
+deploy) [ $# = 4 ] || usage; cmd_deploy "$2" "$3" "$4" ;;
+rollback) [ $# = 3 ] || usage; cmd_rollback "$2" "$3" ;;
+list) [ $# = 3 ] || usage; cmd_list "$2" "$3" ;;
+status) [ $# = 2 ] || usage; cmd_status "$2" ;;
+*) usage ;;
+esac

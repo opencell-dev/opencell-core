@@ -112,6 +112,29 @@ static void test_proven_update_sets_the_location(void)
     TEST_ASSERT_EQUAL_UINT32(UNIX0 + 601u + 3600u, l.expires);
 }
 
+/* A claim whose vector or network key could not be read is refused (no
+ * location, nothing sent) without an AUTH_FAIL audit: nothing failed to
+ * authenticate, the store failed to answer. */
+static void test_a_failed_read_refuses_the_claim_without_blame(void)
+{
+    static const unsigned fails[] = { OC_CORE_MEM_FAIL_AV_GET, OC_CORE_MEM_FAIL_NETKEY_GET };
+    for (unsigned i = 0; i < 2; i++) {
+        reg_world();
+        oc_core_av_t av = vector_for(10);
+        unsigned naudit = MEM.d.naudit;
+        int from = NSENT;
+        MEM.fail_reads = fails[i];
+        loc_update(10, TMID, &av);
+        MEM.fail_reads = 0;
+        oc_core_loc_t l;
+        TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, where(&l));
+        TEST_ASSERT_EQUAL_INT(from, NSENT);
+        TEST_ASSERT_EQUAL_UINT(naudit, MEM.d.naudit);
+        loc_update(10, TMID, &av); /* once the store answers */
+        TEST_ASSERT_EQUAL_INT(0, where(&l));
+    }
+}
+
 /* §7.8: the terminal registers on cell 2; cell 1 is told to drop it. */
 static void test_move_cancels_at_the_old_cell(void)
 {
@@ -395,6 +418,59 @@ static void test_the_same_cell_resending_still_refreshes(void)
     TEST_ASSERT_NULL(sent_since(from, 20, OC_CORE_LOC_CANCEL));
 }
 
+static unsigned registers(void)
+{
+    unsigned n = 0, kept = MEM.d.naudit < OC_CORE_MEM_LOG ? MEM.d.naudit : OC_CORE_MEM_LOG;
+    for (unsigned i = 0; i < kept; i++) n += MEM.d.audit[i].event == OC_CORE_AUDIT_REGISTER;
+    return n;
+}
+
+/* REGISTER is audited when the location changes - the first registration,
+ * a move, a new boot's or an expired location's registration anew - or
+ * when a fresh authentication proves it (the proving SQN rises: a
+ * re-registration on the same cell with a new vector), and not for a
+ * replay of a proof already on record: the one a cell sends after every
+ * HELLO_ACK (§7.10), or an older one. */
+static void test_only_a_location_change_is_audited_as_register(void)
+{
+    reg_world();
+    oc_core_av_t v1 = vector_for(10);
+    loc_update(10, TMID, &v1);
+    TEST_ASSERT_EQUAL_UINT(1, registers());
+
+    NOW += 60000000u; /* cell 1 reconnects (same boot) and replays its registration */
+    hello(11, 1, 1);
+    loc_update(11, TMID, &v1);
+    oc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, where(&l));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 61u + 3600u, l.expires); /* refreshed all the same */
+    TEST_ASSERT_EQUAL_UINT(1, registers());
+    oc_core_av_t v2 = vector_for(11); /* re-registers there: a fresh authentication */
+    loc_update(11, TMID, &v2);
+    TEST_ASSERT_EQUAL_UINT(2, registers());
+    loc_update(11, TMID, &v2); /* ...replayed */
+    TEST_ASSERT_EQUAL_UINT(2, registers());
+    loc_update(11, TMID, &v1); /* an older proof again */
+    TEST_ASSERT_EQUAL_UINT(2, registers());
+
+    oc_core_av_t v3 = vector_for(20); /* moves to cell 2 */
+    loc_update(20, TMID, &v3);
+    TEST_ASSERT_EQUAL_UINT(3, registers());
+    const oc_core_audit_t *a = oc_core_mem_audit(&MEM, OC_CORE_AUDIT_REGISTER);
+    TEST_ASSERT_EQUAL_UINT32(2, a->cell_id);
+    TEST_ASSERT_EQUAL_HEX32(TMID, a->tmid);
+    TEST_ASSERT_EQUAL_MEMORY(N1, a->number, OC_SIG_NUMBER_LEN);
+
+    hello(21, 2, 2); /* cell 2's new boot purges it: registering again is a change */
+    oc_core_av_t v4 = vector_for(21);
+    loc_update(21, TMID, &v4);
+    TEST_ASSERT_EQUAL_UINT(4, registers());
+
+    NOW += 3601000000ull; /* the location lapses: its refresh is a registration anew */
+    loc_update(21, TMID, &v4);
+    TEST_ASSERT_EQUAL_UINT(5, registers());
+}
+
 static void test_purge_only_from_the_location_cell(void)
 {
     reg_world();
@@ -438,9 +514,11 @@ int main(void)
     RUN_TEST(test_a_rogue_cell_cannot_prove_a_registration);
     RUN_TEST(test_an_older_claim_from_another_cell_is_refused);
     RUN_TEST(test_the_same_cell_resending_still_refreshes);
+    RUN_TEST(test_only_a_location_change_is_audited_as_register);
     RUN_TEST(test_an_older_claim_is_refused_after_the_newer_location_went);
     RUN_TEST(test_purge_only_from_the_location_cell);
     RUN_TEST(test_the_location_floor_fails_closed);
+    RUN_TEST(test_a_failed_read_refuses_the_claim_without_blame);
     RUN_TEST(test_issued_vectors_are_pruned_after_a_day);
     return UNITY_END();
 }

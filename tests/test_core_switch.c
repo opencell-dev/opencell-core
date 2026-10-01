@@ -187,6 +187,33 @@ static void test_refusals_and_their_causes(void)
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_UNREACHABLE, refused(NA, NB)); /* disabled */
 }
 
+/* A callee whose record or location the store could not read: the call is
+ * refused as a network failure, not "unreachable" (oc_core_store.h: a
+ * failed lookup is not "none"). */
+static int (*mem_loc_get)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc_t *out);
+static int loc_get_fails_for_nb(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc_t *out)
+{
+    if (memcmp(number, NB, OC_SIG_NUMBER_LEN) == 0) return OC_CORE_STORE_FAILED;
+    return mem_loc_get(ctx, number, out);
+}
+
+static void test_a_failed_callee_lookup_is_a_network_failure(void)
+{
+    sw_world();
+    MEM.fail_reads = OC_CORE_MEM_FAIL_SUB_GET;
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NET_FAILURE, refused(NA, NB));
+    MEM.fail_reads = 0;
+    mem_loc_get = K.st.loc_get;
+    K.st.loc_get = loc_get_fails_for_nb; /* the caller's location reads, the callee's does not */
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NET_FAILURE, refused(NA, NB));
+    K.st.loc_get = mem_loc_get;
+    oc_core_loc_t l;
+    TEST_ASSERT_EQUAL_INT(0, ST.loc_get(ST.ctx, NB, &l)); /* not dropped as stale */
+    int from = NSENT;
+    route(10, LEG, NA, NB);
+    TEST_ASSERT_NOT_NULL(sent_since(from, 20, OC_CORE_CALL_OFFER));
+}
+
 /* §7.4 timers: no alert or release from the callee's cell in 10 s. */
 static void test_setup_times_out_after_10_s(void)
 {
@@ -433,6 +460,7 @@ int main(void)
     RUN_TEST(test_cross_cell_call_relays_both_ways);
     RUN_TEST(test_caller_hangs_up_and_callee_refuses);
     RUN_TEST(test_refusals_and_their_causes);
+    RUN_TEST(test_a_failed_callee_lookup_is_a_network_failure);
     RUN_TEST(test_setup_times_out_after_10_s);
     RUN_TEST(test_echo_service_rings_answers_and_echoes);
     RUN_TEST(test_a_cell_going_releases_its_calls);

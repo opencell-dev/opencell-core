@@ -110,18 +110,27 @@ int oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t peri
     return r;
 }
 
+int oc_core_clip_ok(const uint8_t *clip, uint32_t len)
+{
+    return clip != NULL && len > 0 && len <= OC_CORE_CLIP_MAX && len % OC_CORE_PLAY_BYTES == 0;
+}
+
 int oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                  const oc_core_cfg_t *cfg)
 {
+    static const uint8_t none[OC_SIG_NUMBER_LEN];
     oc_core_netkey_t key;
     memset(k, 0, sizeof(*k));
+    if (memcmp(cfg->playback_number, none, OC_SIG_NUMBER_LEN) != 0 && !oc_core_clip_ok(cfg->clip, cfg->clip_len)) {
+        return -1;
+    }
     k->io = *io;
     k->st = *st;
     k->route = *route;
     k->cfg = *cfg;
     int r = k->st.netkey_get(k->st.ctx, cfg->key_id, &key); /* only asked whether it is there */
     oc_sig_wipe(key.sk, sizeof(key.sk));
-    return r;
+    return r == 0 ? 0 : -1; /* none, or the store failed: no core either way */
 }
 
 void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us)
@@ -135,6 +144,7 @@ void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us)
             l->used = 1;
             l->link = link;
             l->last_rx = l->last_tx = now_us;
+            l->tel_next = 0xFF;
             return;
         }
     }
@@ -152,14 +162,66 @@ void oc_core_link_down(oc_core_t *k, uint32_t link, uint64_t now_us)
     if (cell != 0) cell_gone(k, cell, now_us);
 }
 
-/* CELL_CFG with list group list_id's channel list, if the group has one. */
-static void send_list(oc_core_t *k, oc_core_link_t *l, uint16_t list_id)
+/* CELL_CFG owed to a cell that couldn't have it now (a list or cell read
+ * failed): the link stays up - the cell serves on its old list meanwhile
+ * (network-core spec §7.10) - and oc_core_tick retries, 1 s doubling to
+ * 60 s. Logged when the state changes, not at every retry. */
+static void cfg_owed(oc_core_t *k, oc_core_link_t *l, uint64_t now, const char *what)
+{
+    if (!l->cfg_pending) {
+        oc_core_logf(k, "cell %u: CELL_CFG pending (%s read FAILED), retrying", (unsigned)l->cell_id, what);
+        l->cfg_pending = 1;
+        l->cfg_backoff_s = 1;
+    }
+    l->cfg_retry_at = now + (uint64_t)l->cfg_backoff_s * 1000000ull;
+    l->cfg_backoff_s = l->cfg_backoff_s >= 30u ? 60u : (uint8_t)(l->cfg_backoff_s * 2u);
+}
+
+static void cfg_done(oc_core_t *k, oc_core_link_t *l)
+{
+    if (l->cfg_pending) oc_core_logf(k, "cell %u: CELL_CFG no longer pending", (unsigned)l->cell_id);
+    l->cfg_pending = 0;
+}
+
+static void send_cfg(oc_core_t *k, oc_core_link_t *l, const oc_sig_chan_list_t *list)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = OC_CORE_CELL_CFG;
-    if (list_id == 0 || k->st.list_get(k->st.ctx, list_id, &m.u.cell_cfg.list) != 0) return;
+    m.u.cell_cfg.list = *list;
     send_link(k, l, &m);
+    cfg_done(k, l);
+}
+
+/* CELL_CFG with list group list_id's channel list, if the group has one;
+ * owed (above) if the list can't be read. */
+static void send_list(oc_core_t *k, oc_core_link_t *l, uint16_t list_id, uint64_t now)
+{
+    oc_sig_chan_list_t list;
+    int got = list_id != 0 ? k->st.list_get(k->st.ctx, list_id, &list) : OC_CORE_STORE_NONE;
+    if (got == OC_CORE_STORE_FAILED) {
+        cfg_owed(k, l, now, "channel list");
+    } else if (got == 0) {
+        send_cfg(k, l, &list);
+    } else {
+        cfg_done(k, l); /* no list: nothing owed */
+    }
+}
+
+/* oc_core_tick: a retry that is due, from the cell's own record (its group
+ * may have changed meanwhile). */
+static void cfg_retry(oc_core_t *k, oc_core_link_t *l, uint64_t now)
+{
+    oc_core_cell_t c;
+    if (!l->cfg_pending || l->cell_id == 0 || now < l->cfg_retry_at) return;
+    int got = k->st.cell_get(k->st.ctx, l->cell_id, &c);
+    if (got == OC_CORE_STORE_FAILED) {
+        cfg_owed(k, l, now, "cell");
+    } else if (got == 0) {
+        send_list(k, l, c.list_id, now);
+    } else {
+        cfg_done(k, l);
+    }
 }
 
 static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, uint64_t now)
@@ -169,17 +231,27 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     oc_core_msg_t r;
     uint32_t id = m->u.hello.cell_id;
     uint8_t reason = 0;
+    int got_cell = OC_CORE_STORE_NONE, got_key = OC_CORE_STORE_NONE;
     memset(&r, 0, sizeof(r));
+    memset(&key, 0, sizeof(key));
     if (m->u.hello.proto != OC_CORE_PROTO) {
         reason = OC_CORE_NAK_VERSION;
-    } else if (id == 0 || k->st.cell_get(k->st.ctx, id, &c) != 0) {
+    } else if (id == 0 || (got_cell = k->st.cell_get(k->st.ctx, id, &c)) == OC_CORE_STORE_NONE) {
         reason = OC_CORE_NAK_UNKNOWN_CELL;
-    } else if (!c.enabled) {
+    } else if (got_cell == 0 && !c.enabled) {
         reason = OC_CORE_NAK_DISABLED;
-    } else if (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
+    } else if (got_cell == 0 && (got_key = k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key)) == OC_CORE_STORE_NONE) {
         reason = OC_CORE_NAK_DISABLED; /* the core itself can't serve: no network key */
     }
     oc_sig_wipe(key.sk, sizeof(key.sk)); /* only period_s is wanted from it */
+    if (got_cell == OC_CORE_STORE_FAILED || got_key == OC_CORE_STORE_FAILED) {
+        /* a store failure, not a verdict on the cell: no HELLO_NAK or
+         * CELL_REJECT audit to say otherwise; the link closes, it retries */
+        oc_core_logf(k, "cell %u: HELLO: %s read FAILED, link closed", (unsigned)id,
+                     got_cell == OC_CORE_STORE_FAILED ? "cell" : "network key");
+        drop(k, l, now);
+        return;
+    }
     if (reason != 0) {
         char d[48];
         snprintf(d, sizeof(d), "HELLO refused (%u)", reason);
@@ -193,7 +265,14 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     }
     oc_core_link_t *old = link_of_cell(k, id);
     if (old != NULL && old != l) drop(k, old, now); /* one link per cell: the newest wins */
-    if (l->cell_id != 0 && l->cell_id != id) cell_gone(k, l->cell_id, now);
+    if (l->cell_id != 0 && l->cell_id != id) {
+        cell_gone(k, l->cell_id, now);
+        /* final review M6: a report of record from l->cell_id must not be
+         * shown as id's once the link re-HELLOs as a different cell */
+        memset(&l->tel, 0, sizeof(l->tel));
+        memset(&l->tel_in, 0, sizeof(l->tel_in));
+        l->tel_next = 0xFF;
+    }
     if (c.boot_id != m->u.hello.boot_id) {
         /* the cell process restarted: its registrations and the vectors it
          * never used went with it (network-core spec §7.9) */
@@ -212,7 +291,43 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     r.u.hello_ack.key_id = k->cfg.key_id;
     memcpy(r.u.hello_ack.echo_number, k->cfg.echo_number, OC_SIG_NUMBER_LEN);
     send_link(k, l, &r);
-    send_list(k, l, c.list_id);
+    send_list(k, l, c.list_id, now);
+}
+
+/* CELL_STATUS: parts 0, 1, ... gathered in tel_in, published in tel at the
+ * last. A part out of order drops what was gathered (the next report
+ * starts again at part 0); what does not fit the core's room is left out. */
+static void on_status(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m)
+{
+    uint8_t idx = (uint8_t)(m->u.cell_status.part & ~OC_CORE_STATUS_LAST);
+    if (idx == 0) {
+        memset(&l->tel_in, 0, sizeof(l->tel_in));
+        l->tel_next = 0;
+    }
+    if (idx != l->tel_next) {
+        l->tel_next = 0xFF;
+        return;
+    }
+    oc_core_tel_t *t = &l->tel_in;
+    for (uint8_t i = 0; i < m->u.cell_status.nradio && t->nradio < OC_CORE_TEL_RADIOS; i++) {
+        t->radio[t->nradio++] = m->u.cell_status.radio[i];
+    }
+    for (uint8_t i = 0; i < m->u.cell_status.nterm && t->nterm < OC_CORE_TEL_TERMS; i++) {
+        t->term[t->nterm++] = m->u.cell_status.term[i];
+    }
+    if (m->u.cell_status.part & OC_CORE_STATUS_LAST) {
+        t->at = k->io.unix_now(k->io.ctx);
+        l->tel = *t;
+        l->tel_next = 0xFF;
+    } else {
+        l->tel_next = (uint8_t)(idx + 1u);
+    }
+}
+
+const oc_core_tel_t *oc_core_cell_tel(const oc_core_t *k, uint32_t cell_id)
+{
+    const oc_core_link_t *l = link_of_cell((oc_core_t *)k, cell_id);
+    return l != NULL && l->tel.at != 0 ? &l->tel : NULL;
 }
 
 void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us)
@@ -250,6 +365,9 @@ void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t no
     case OC_CORE_MEDIA:
         oc_core_sw_rx(k, l->cell_id, m);
         break;
+    case OC_CORE_CELL_STATUS:
+        on_status(k, l, m);
+        break;
     default:
         break;
     }
@@ -270,25 +388,32 @@ void oc_core_tick(oc_core_t *k, uint64_t now_us)
             p.type = OC_CORE_PING;
             send_link(k, l, &p);
         }
+        if (l->used) cfg_retry(k, l, now_us);
     }
     if (now_us >= k->prune_at) {
         k->prune_at = now_us + OC_CORE_US(3600);
         oc_core_reg_tick(k);
     }
+    oc_core_peer_tick(k);
     oc_core_sw_tick(k);
 }
 
 int oc_core_cell_add(oc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id)
 {
     oc_core_cell_t c;
-    if (cell_id == 0 || k->st.cell_get(k->st.ctx, cell_id, &c) == 0) return -1;
+    /* only a cell known not to exist: one whose record could not be read
+     * is not written over (oc_core_store.h) */
+    if (cell_id == 0) return -1;
+    int got = k->st.cell_get(k->st.ctx, cell_id, &c);
+    if (got == 0) return -1;
+    if (got != OC_CORE_STORE_NONE) return -2;
     memset(&c, 0, sizeof(c));
     c.cell_id = cell_id;
     snprintf(c.name, sizeof(c.name), "%s", name);
     c.mode = mode;
     c.enabled = 1;
     c.list_id = list_id;
-    return k->st.cell_put(k->st.ctx, &c);
+    return k->st.cell_put(k->st.ctx, &c) == 0 ? 0 : -2;
 }
 
 int oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us)
@@ -303,7 +428,29 @@ int oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us)
     return 0;
 }
 
-int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us)
+int oc_core_cell_mode(oc_core_t *k, uint32_t cell_id, uint8_t mode, uint64_t now_us)
+{
+    oc_core_cell_t c;
+    k->now = now_us;
+    if (mode != OC_SIG_MODE_PART15 && mode != OC_SIG_MODE_PART97) return -1;
+    int got = cell_id == 0 ? OC_CORE_STORE_NONE : k->st.cell_get(k->st.ctx, cell_id, &c);
+    if (got == OC_CORE_STORE_NONE) return -1;
+    if (got != 0) return -2;
+    if (!c.enabled) return -3;
+    if (c.mode == mode) return 1; /* already that mode (final review M4): no drop, a retry is harmless */
+    c.mode = mode;
+    if (k->st.cell_put(k->st.ctx, &c) != 0) return -2;
+    oc_core_link_t *l = link_of_cell(k, cell_id);
+    if (l != NULL) drop(k, l, now_us);
+    oc_core_logf(k, "cell %u: mode %s; it takes it at its next HELLO", (unsigned)cell_id,
+                 mode == OC_SIG_MODE_PART97 ? "part97" : "part15");
+    return 0;
+}
+
+/* set, or (force) replace: a list whose stored row can't be read is
+ * replaced at the version after the last one written (list_ver_get, kept
+ * apart from the row), so every cell of the group takes it as a change. */
+static int list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us, int force)
 {
     oc_sig_chan_list_t l, old;
     k->now = now_us;
@@ -312,15 +459,48 @@ int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list
     l.count = list->count;
     memcpy(l.freq_hz, list->freq_hz, sizeof(l.freq_hz[0]) * l.count);
     memcpy(l.flags, list->flags, l.count);
-    l.ver = k->st.list_get(k->st.ctx, list_id, &old) == 0 && old.ver != 255u ? (uint8_t)(old.ver + 1u) : 1u;
+    uint8_t prev = 0;
+    int got = k->st.list_get(k->st.ctx, list_id, &old);
+    if (got == 0) {
+        prev = old.ver;
+    } else if (got == OC_CORE_STORE_FAILED) {
+        /* the version could go backwards: refused, unless forced and the
+         * last version written can be read */
+        if (!force || (got = k->st.list_ver_get(k->st.ctx, list_id, &prev)) == OC_CORE_STORE_FAILED) return -1;
+        /* NONE: no version was ever recorded for list_id. Either there is
+         * no row at all (list_get failed on the query, not on a row), and
+         * version 1 is right, or a row is there whose version was lost
+         * with it (chan_list_ver damaged too). Then the replacement starts
+         * again at version 1, and a cell of the group that holds a
+         * version-1 list keeps it until the next set (version 2), which
+         * the operator can run at once; refusing instead would leave no
+         * repair short of editing the database. */
+        if (got != 0) prev = 0;
+        oc_core_logf(k, "channel list %u: unreadable, replaced after version %u", (unsigned)list_id, (unsigned)prev);
+    }
+    l.ver = prev != 0 && prev != 255u ? (uint8_t)(prev + 1u) : 1u;
     if (k->st.list_put(k->st.ctx, list_id, &l) != 0) return -1;
-    for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) { /* the list just written: nothing read back */
         oc_core_link_t *ln = &k->links[i];
         oc_core_cell_t c;
-        if (ln->used && ln->cell_id != 0 && k->st.cell_get(k->st.ctx, ln->cell_id, &c) == 0 && c.list_id == list_id) {
-            send_list(k, ln, list_id);
+        if (!ln->used || ln->cell_id == 0) continue;
+        int got_c = k->st.cell_get(k->st.ctx, ln->cell_id, &c);
+        if (got_c == OC_CORE_STORE_FAILED) {
+            cfg_owed(k, ln, now_us, "cell"); /* maybe of this group: the retry reads it again */
+        } else if (got_c == 0 && c.list_id == list_id) {
+            send_cfg(k, ln, &l);
         }
     }
     oc_core_logf(k, "channel list %u: version %u, %u entries", (unsigned)list_id, (unsigned)l.ver, (unsigned)l.count);
     return l.ver;
+}
+
+int oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us)
+{
+    return list_set(k, list_id, list, now_us, 0);
+}
+
+int oc_core_chan_list_replace(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us)
+{
+    return list_set(k, list_id, list, now_us, 1);
 }

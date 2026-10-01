@@ -339,6 +339,10 @@ static void n_call(void *ctx, const oc_sig_net_call_ev_t *e)
              * and it would forget one that the terminal and this cell still
              * hold. Only on_offer's immediate answer says 4 (§7.4 step 3). */
             uint8_t cause = l->mt && e->cause == OC_SIG_CAUSE_UNREACHABLE ? OC_SIG_CAUSE_LINK_LOST : e->cause;
+            if (l->refused != 0) {
+                logf_(c, "call %u: ended, %u MEDIA refused while the leg was not active", (unsigned)l->ref,
+                      (unsigned)l->refused);
+            }
             l->used = 0;
             call_msg(c, OC_CORE_CALL_RELEASE, l->ref, cause);
         }
@@ -469,7 +473,16 @@ void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
     switch (m->type) {
     case OC_CORE_HELLO_ACK:
         c->ready = 1;
-        c->net.cfg.mode = m->u.hello_ack.mode;
+        /* the mode through oc_sig_net_set_mode, never cfg.mode directly: a
+         * call registered in the other mode ends (media-gate review I2) */
+        if (m->u.hello_ack.mode != c->net.cfg.mode) {
+            if (oc_sig_net_set_mode(&c->net, m->u.hello_ack.mode, now_us) == 0) {
+                logf_(c, "core: mode %s; calls in the other mode end", m->u.hello_ack.mode == OC_SIG_MODE_PART97
+                                                                           ? "part97" : "part15");
+            } else {
+                logf_(c, "core: unknown mode %u, kept %u", m->u.hello_ack.mode, c->net.cfg.mode);
+            }
+        }
         c->net.cfg.period_s = m->u.hello_ack.period_s;
         memcpy(c->echo_number, m->u.hello_ack.echo_number, OC_SIG_NUMBER_LEN);
         for (unsigned i = 0; i < OC_SIG_NET_TERMS; i++) { /* the core may have lost them (§7.10, §14.6) */
@@ -574,6 +587,15 @@ void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
             uint8_t out[OC_SIG_LINK_MAX], on;
             if (oc_sig_net_data_out(&c->net, l->tmid, m->u.media.data, m->u.media.len, out, &on) == 0) {
                 c->io.radio_send(c->io.ctx, l->tmid, out, on);
+            } else {
+                /* the media gate: the leg isn't active yet (the far end
+                 * answered, the terminal hasn't confirmed) or no longer is:
+                 * never on the air (core-test-services spec §14 F1) */
+                c->media_refused++;
+                if (l->refused++ == 0) {
+                    logf_(c, "call %u: MEDIA refused, leg not active (cell total %u)", (unsigned)l->ref,
+                          (unsigned)c->media_refused);
+                }
             }
         }
         break;

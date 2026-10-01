@@ -61,6 +61,40 @@ done:
     return ret;
 }
 
+/* A new token for number in block b, not yet stored: an id known to be
+ * free (one whose token could not be read is not taken), a secret, an
+ * expiry. 0, or -1 (the store failed, or 8 ids in a row were taken).
+ * other is the caller's scratch record, for it to wipe. */
+static int token_new(oc_core_t *k, const oc_core_block_t *b, const uint8_t number[OC_SIG_NUMBER_LEN],
+                     uint32_t valid_s, oc_core_token_t *t, oc_core_token_t *other)
+{
+    int tries = 0, got;
+    do {
+        uint8_t r6[6];
+        if (++tries > 8) return -1;
+        k->io.random(k->io.ctx, r6, sizeof(r6));
+        oc_core_token_id(b->block_idx, r6, t->token_id);
+        got = k->st.token_get(k->st.ctx, t->token_id, other);
+        if (got == OC_CORE_STORE_FAILED) return -1;
+    } while (got != OC_CORE_STORE_NONE);
+    memcpy(t->number, number, OC_SIG_NUMBER_LEN);
+    k->io.random(k->io.ctx, t->secret, sizeof(t->secret));
+    t->expiry = oc_core_unix(k) + valid_s;
+    return 0;
+}
+
+/* What the token's QR code carries (activation spec §3.1). */
+static void qr_fill(oc_core_t *k, const oc_core_netkey_t *key, const oc_core_token_t *t, oc_sig_qr_t *qr)
+{
+    memset(qr, 0, sizeof(*qr));
+    qr->key_id = k->cfg.key_id;
+    memcpy(qr->pkn, key->pk, 32);
+    memcpy(qr->token_id, t->token_id, 8);
+    memcpy(qr->token_secret, t->secret, 16);
+    memcpy(qr->number, t->number, OC_SIG_NUMBER_LEN);
+    qr->expiry = t->expiry;
+}
+
 /* Single exit: the network key, the new token's secret, and whatever
  * records were read (a subscriber's K/OPc, another token's secret) are
  * wiped on every path; the QR is the only copy that leaves. */
@@ -79,28 +113,13 @@ int oc_core_token_issue(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], u
         s.state != OC_CORE_SUB_ACTIVE || k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
         goto done;
     }
-    int tries = 0;
-    do {
-        uint8_t r6[6];
-        if (++tries > 8) goto done;
-        k->io.random(k->io.ctx, r6, sizeof(r6));
-        oc_core_token_id(b->block_idx, r6, t.token_id);
-    } while (k->st.token_get(k->st.ctx, t.token_id, &other) == 0);
-    memcpy(t.number, number, OC_SIG_NUMBER_LEN);
-    k->io.random(k->io.ctx, t.secret, sizeof(t.secret));
-    t.expiry = oc_core_unix(k) + valid_s;
+    if (token_new(k, b, number, valid_s, &t, &other) != 0) goto done;
     if (oc_core_begin(k) != 0) goto done;
     k->st.token_void(k->st.ctx, number); /* at most one unused token per number */
     k->st.token_put(k->st.ctx, &t);
     if (k->st.commit(k->st.ctx) != 0) goto done;
     oc_core_audit(k, OC_CORE_AUDIT_TOKEN_ISSUE, number, 0, 0, NULL);
-    memset(qr, 0, sizeof(*qr));
-    qr->key_id = k->cfg.key_id;
-    memcpy(qr->pkn, key.pk, 32);
-    memcpy(qr->token_id, t.token_id, 8);
-    memcpy(qr->token_secret, t.secret, 16);
-    memcpy(qr->number, number, OC_SIG_NUMBER_LEN);
-    qr->expiry = t.expiry;
+    qr_fill(k, &key, &t, qr);
     ret = 0;
 done:
     oc_sig_wipe(key.sk, sizeof(key.sk));
@@ -149,6 +168,103 @@ done:
     return ret;
 }
 
+/* Single exit: as oc_core_token_issue. A number whose record could not be
+ * read is never taken for a free one (oc_core_store.h). */
+int oc_core_sub_create(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint32_t valid_s, oc_sig_qr_t *qr)
+{
+    oc_core_sub_t s;
+    oc_core_netkey_t key;
+    oc_core_token_t t, other;
+    int ret = OC_CORE_E_STORE;
+    memset(&s, 0, sizeof(s));
+    memset(&key, 0, sizeof(key));
+    memset(&t, 0, sizeof(t));
+    memset(&other, 0, sizeof(other));
+    const oc_core_block_t *b = oc_core_route_find(&k->route, number);
+    if (!oc_sig_number_valid(number)) {
+        ret = OC_CORE_E_INVALID;
+        goto done;
+    }
+    if (oc_core_number_reserved(number) || !oc_core_route_home(&k->route, b)) {
+        ret = OC_CORE_E_NOT_ASSIGNABLE;
+        goto done;
+    }
+    int got = k->st.sub_get(k->st.ctx, number, &s);
+    if (got == 0) ret = OC_CORE_E_TAKEN;
+    if (got != OC_CORE_STORE_NONE) goto done;
+    if (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0 || token_new(k, b, number, valid_s, &t, &other) != 0) {
+        goto done;
+    }
+    memset(&s, 0, sizeof(s));
+    memcpy(s.number, number, OC_SIG_NUMBER_LEN);
+    s.state = OC_CORE_SUB_ACTIVE;
+    s.created = s.updated = oc_core_unix(k);
+    if (oc_core_begin(k) != 0) goto done;
+    k->st.sub_put(k->st.ctx, &s);
+    k->st.token_put(k->st.ctx, &t);
+    if (k->st.commit(k->st.ctx) != 0) goto done;
+    oc_core_audit(k, OC_CORE_AUDIT_TOKEN_ISSUE, number, 0, 0, NULL);
+    qr_fill(k, &key, &t, qr);
+    ret = 0;
+done:
+    oc_sig_wipe(key.sk, sizeof(key.sk));
+    oc_sig_wipe(t.secret, sizeof(t.secret));
+    oc_sig_wipe(other.secret, sizeof(other.secret));
+    oc_sig_wipe(s.k, sizeof(s.k));
+    oc_sig_wipe(s.opc, sizeof(s.opc));
+    return ret;
+}
+
+/* Single exit: the subscriber's K and OPc are wiped. */
+int oc_core_sub_release(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], const char *why)
+{
+    oc_core_sub_t s;
+    int ret = OC_CORE_E_STORE;
+    memset(&s, 0, sizeof(s));
+    int got = k->st.sub_get(k->st.ctx, number, &s);
+    if (got == OC_CORE_STORE_NONE) ret = OC_CORE_E_NOT_FOUND;
+    if (got != 0) goto done;
+    if (s.activated) {
+        ret = OC_CORE_E_ACTIVATED;
+        goto done;
+    }
+    if (oc_core_begin(k) != 0) goto done;
+    k->st.token_void(k->st.ctx, number);
+    k->st.av_del_number(k->st.ctx, number); /* none, unless its terminal moved to another number */
+    k->st.sub_del(k->st.ctx, number);
+    if (k->st.commit(k->st.ctx) != 0) goto done;
+    oc_core_audit(k, OC_CORE_AUDIT_SUB_RELEASE, number, 0, 0, why);
+    ret = 0;
+done:
+    oc_sig_wipe(s.k, sizeof(s.k));
+    oc_sig_wipe(s.opc, sizeof(s.opc));
+    return ret;
+}
+
+/* Single exit: the subscriber's K and OPc are wiped. */
+int oc_core_sub_enable(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN])
+{
+    oc_core_sub_t s;
+    int ret = OC_CORE_E_STORE;
+    memset(&s, 0, sizeof(s));
+    int got = k->st.sub_get(k->st.ctx, number, &s);
+    if (got == OC_CORE_STORE_NONE) ret = OC_CORE_E_NOT_FOUND;
+    if (got != 0) goto done;
+    if (s.state == OC_CORE_SUB_ACTIVE) {
+        ret = 0;
+        goto done;
+    }
+    s.state = OC_CORE_SUB_ACTIVE;
+    s.updated = oc_core_unix(k);
+    if (k->st.sub_put(k->st.ctx, &s) != 0) goto done;
+    oc_core_audit(k, OC_CORE_AUDIT_SUB_ENABLE, number, s.tmid, 0, NULL);
+    ret = 0;
+done:
+    oc_sig_wipe(s.k, sizeof(s.k));
+    oc_sig_wipe(s.opc, sizeof(s.opc));
+    return ret;
+}
+
 static int num_eq(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, OC_SIG_NUMBER_LEN) == 0; }
 
 /* §7.1: the plan-5 checks, then bind, all in one commit (the old locations'
@@ -180,15 +296,32 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     memset(&loc_other, 0, sizeof(loc_other));
     memset(kk, 0, sizeof(kk));
     memset(opc, 0, sizeof(opc));
-    if (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) != 0) {
-        oc_core_logf(k, "activation: no network key %u", k->cfg.key_id);
+    int got_key = k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key);
+    if (got_key != 0) {
+        oc_core_logf(k, got_key == OC_CORE_STORE_FAILED ? "activation: network key %u read FAILED"
+                                                        : "activation: no network key %u",
+                     k->cfg.key_id);
         goto done;
     }
     /* the token id's block says which core holds it (§14.3): one core, so
      * a token of a block this core isn't home for is unknown here */
-    int known = oc_core_route_home(&k->route, oc_core_route_block(&k->route, oc_core_token_block(tid))) &&
-                k->st.token_get(k->st.ctx, tid, &tok) == 0 && k->st.sub_get(k->st.ctx, tok.number, &sub) == 0 &&
-                sub.state == OC_CORE_SUB_ACTIVE;
+    int known = oc_core_route_home(&k->route, oc_core_route_block(&k->route, oc_core_token_block(tid)));
+    if (known) {
+        int got = k->st.token_get(k->st.ctx, tid, &tok);
+        if (got == OC_CORE_STORE_FAILED) { /* not "unknown token": no answer, it retries */
+            oc_core_logf(k, "activation of %08x: token read FAILED, no answer", (unsigned)tmid);
+            goto done;
+        }
+        known = got == 0;
+    }
+    if (known) {
+        int got = k->st.sub_get(k->st.ctx, tok.number, &sub);
+        if (got == OC_CORE_STORE_FAILED) { /* not "unknown token" (oc_core_store.h): no answer, it retries */
+            oc_core_logf(k, "activation of %08x: subscriber read FAILED, no answer", (unsigned)tmid);
+            goto done;
+        }
+        known = got == 0 && sub.state == OC_CORE_SUB_ACTIVE;
+    }
     if (known) {
         t.known = 1;
         t.used = tok.used_at != 0;
@@ -207,7 +340,14 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         snprintf(d, sizeof(d), "reason %u", r.u.act_res.msg.u.act_nak.reason);
         oc_core_audit(k, OC_CORE_AUDIT_ACT_FAIL, known ? sub.number : NULL, tmid, cell, d);
     } else if (res == OC_SIG_ACT_FRESH) {
-        int had_other = k->st.sub_by_tmid(k->st.ctx, tmid, &other) == 0 && !num_eq(other.number, sub.number);
+        int got_tmid = k->st.sub_by_tmid(k->st.ctx, tmid, &other);
+        if (got_tmid == OC_CORE_STORE_FAILED) {
+            /* fail closed (plan 8 amendment 3): the TMID may be bound to
+             * another subscriber, which would keep it too */
+            oc_core_logf(k, "activation of %08x: TMID read FAILED, no answer", (unsigned)tmid);
+            goto done;
+        }
+        int had_other = got_tmid == 0 && !num_eq(other.number, sub.number);
         int got_self = k->st.loc_get(k->st.ctx, sub.number, &loc_self);
         int got_other = had_other ? k->st.loc_get(k->st.ctx, other.number, &loc_other) : OC_CORE_STORE_NONE;
         if (got_self == OC_CORE_STORE_FAILED || got_other == OC_CORE_STORE_FAILED) {
@@ -260,6 +400,10 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
                                     NULL);
         }
         oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, NULL);
+    } else if (res == OC_SIG_ACT_AGAIN) {
+        /* the bound terminal asking again (its ACT_ACK was lost): nothing
+         * changes, but the answer it gets is on record */
+        oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, "again");
     }
     oc_core_send(k, cell, &r);
 done:
@@ -278,7 +422,12 @@ done:
 /* 0 (and the subscriber) when tmid may have vectors, else the status. */
 static uint8_t av_status(oc_core_t *k, uint32_t tmid, oc_core_sub_t *sub)
 {
-    if (k->st.sub_by_tmid(k->st.ctx, tmid, sub) != 0) return OC_CORE_AV_NOT_ACTIVATED;
+    int got = k->st.sub_by_tmid(k->st.ctx, tmid, sub);
+    if (got == OC_CORE_STORE_FAILED) {
+        oc_core_logf(k, "vectors for %08x: subscriber read FAILED", (unsigned)tmid);
+        return OC_CORE_AV_UNAVAILABLE; /* a store failure, not "never activated" */
+    }
+    if (got != 0) return OC_CORE_AV_NOT_ACTIVATED;
     if (sub->state != OC_CORE_SUB_ACTIVE) return OC_CORE_AV_DISABLED;
     if (!home_number(k, sub->number)) return OC_CORE_AV_UNAVAILABLE;
     return OC_CORE_AV_OK;
@@ -314,7 +463,12 @@ static void answer_av(oc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
     int resynced = 0;
     if (st == OC_CORE_AV_OK && auts != NULL) {
         oc_core_av_issued_t seen;
-        if (k->st.av_get(k->st.ctx, sub.number, rand, &seen) != 0) {
+        memset(&seen, 0, sizeof(seen));
+        int got = k->st.av_get(k->st.ctx, sub.number, rand, &seen);
+        if (got == OC_CORE_STORE_FAILED) {
+            oc_core_logf(k, "resync for %08x: vector read FAILED", (unsigned)tmid);
+            st = OC_CORE_AV_UNAVAILABLE; /* a store failure, not a failed authentication */
+        } else if (got != 0) {
             st = OC_CORE_AV_AUTH_FAILED;
             oc_core_audit(k, OC_CORE_AUDIT_AUTH_FAIL, sub.number, tmid, cell, "RAND not issued to this number");
         } else if (oc_sig_av_auts(sub.k, sub.opc, rand, auts, ms) != 0) {

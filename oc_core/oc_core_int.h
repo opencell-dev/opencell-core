@@ -43,4 +43,17 @@ void     oc_core_sw_rx(oc_core_t *k, uint32_t cell_id, const oc_core_msg_t *m);
 void     oc_core_sw_tick(oc_core_t *k);
 void     oc_core_sw_cell_gone(oc_core_t *k, uint32_t cell_id);
 
+/* oc_core_peer.c: to core_id's link if it is up: 0, or -1 */
+int      oc_core_peer_send(oc_core_t *k, uint16_t core_id, const oc_core_msg_t *m);
+/* the peers' liveness, from oc_core_tick */
+void     oc_core_peer_tick(oc_core_t *k);
+/* 1 if core_id's CALL_SETUP budget has a token now (and one is spent), else
+ * 0 (logged, at most once a second): review M3. 0 too if core_id is not an
+ * up peer (on_setup only calls this for one, so that should not happen). */
+int      oc_core_peer_setup_allowed(oc_core_t *k, uint16_t core_id);
+/* oc_core_switch.c: OCSS call control from an up peer, and a peer whose
+ * link went (every call with a leg on it ends, cause 5) */
+void     oc_core_sw_peer_rx(oc_core_t *k, uint16_t core_id, const oc_core_msg_t *m);
+void     oc_core_sw_peer_gone(oc_core_t *k, uint16_t core_id);
+
 #endif

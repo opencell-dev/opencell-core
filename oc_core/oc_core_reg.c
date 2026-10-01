@@ -60,15 +60,25 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     memset(&a, 0, sizeof(a));
     memset(&s, 0, sizeof(s));
     memset(&key, 0, sizeof(key));
-    int proven = k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a) == 0 && a.cell_id == cell &&
-                 oc_sig_ct_equal(m->u.loc_update.res, a.xres, 8);
+    /* the vector read stays three-way: a stale binding is cancelled back
+     * without needing the proof; only what does need it fails closed */
+    int got_av = k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a);
+    int proven = got_av == 0 && a.cell_id == cell && oc_sig_ct_equal(m->u.loc_update.res, a.xres, 8);
     int got = k->st.sub_get(k->st.ctx, num, &s);
     if (got == OC_CORE_STORE_FAILED) { /* fail closed (oc_core_store.h): no cancel, no location */
         oc_core_logf(k, "cell %u: location claim for %08x: subscriber read FAILED", (unsigned)cell, (unsigned)tmid);
         goto done;
     }
     int known = got == 0;
-    if ((known && (!s.activated || s.tmid != tmid || s.state != OC_CORE_SUB_ACTIVE)) || (proven && !known)) {
+    int stale = known && (!s.activated || s.tmid != tmid || s.state != OC_CORE_SUB_ACTIVE);
+    if (!stale && got_av == OC_CORE_STORE_FAILED) {
+        /* what is left needs the proof (a claim for a number with no
+         * subscriber, AUTH_FAIL, REGISTER): refused, and no AUTH_FAIL -
+         * nothing failed to authenticate */
+        oc_core_logf(k, "cell %u: location claim for %08x: vector read FAILED", (unsigned)cell, (unsigned)tmid);
+        goto done;
+    }
+    if (stale || (proven && !known)) {
         /* a claim for a binding the core has since cancelled (re-activated
          * or disabled while the cell was cut off): the cell drops it now.
          * Proven or not - re-activation deleted the old binding's vectors
@@ -78,8 +88,11 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
          * cancel ("unproven stale claim"): a cell cut off through the
          * re-activation sends one, and so does a cell probing TMIDs. */
         int off = known && s.state == OC_CORE_SUB_DISABLED;
+        const char *why = proven                             ? NULL
+                          : got_av == OC_CORE_STORE_FAILED ? "stale claim, proof unknown"
+                                                           : "unproven stale claim";
         oc_core_loc_send_cancel(k, num, cell, tmid, off ? OC_CORE_CANCEL_DISABLED : OC_CORE_CANCEL_REACTIVATED, NULL,
-                                proven ? NULL : "unproven stale claim");
+                                why);
         goto done;
     }
     if (!proven) {
@@ -123,11 +136,26 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         }
     }
     int moved = had && (old.cell_id != cell || old.tmid != tmid);
+    /* REGISTER is audited when the location changes - the first one, a
+     * move or a new binding, or one that had lapsed (a new boot purged it,
+     * or it expired) - or when a fresh authentication proves it (the
+     * proving SQN rises: a re-registration there, periodic or not). A
+     * replay of a proof already on record - the one a cell sends after
+     * every HELLO_ACK (§7.10), or an older one - writes none. */
+    /* `moved` is belt and braces, unreachable today: a move always raises
+     * the SQN (the floor above), and a new binding follows a re-activation,
+     * which deletes the location. */
+    int changed = !had || moved || old.expires <= oc_core_unix(k) || a.sqn > old.sqn;
     memset(&l, 0, sizeof(l));
     memcpy(l.number, num, OC_SIG_NUMBER_LEN);
     l.cell_id = cell;
     l.tmid = tmid;
-    l.expires = oc_core_unix(k) + 2u * (k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key) == 0 ? key.period_s : 1800u);
+    got = k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key);
+    if (got == OC_CORE_STORE_FAILED) { /* the period the location lasts: refused, not guessed */
+        oc_core_logf(k, "cell %u: location claim for %08x: network key read FAILED", (unsigned)cell, (unsigned)tmid);
+        goto done;
+    }
+    l.expires = oc_core_unix(k) + 2u * (got == 0 ? key.period_s : 1800u);
     /* the newest vector that proved it: the same cell re-sending an older
      * claim refreshes the location without lowering it */
     int keep = had && !moved && old.sqn > a.sqn;
@@ -144,7 +172,7 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     /* §7.8, naming the registration it cancels: if the terminal has since
      * registered there again (a LOC_UPDATE still on its way), that one stays */
     if (moved) oc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, OC_CORE_CANCEL_MOVED, old.rand, NULL);
-    oc_core_audit(k, OC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
+    if (changed) oc_core_audit(k, OC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
 done:
     oc_sig_wipe(a.xres, sizeof(a.xres));
     oc_sig_wipe(s.k, sizeof(s.k));

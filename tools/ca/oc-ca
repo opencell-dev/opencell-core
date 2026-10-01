@@ -13,7 +13,9 @@
 #
 # Roles (a policy OID under OpenCell's arc, 2.25.<UUID>, plus an extended
 # key usage), subject CN=NAME, ECDSA P-256 keys only, SHA-256:
-#   core    ARC.1.1  serverAuth  730 days (§17.6)  --dns/--ip: at least one (the names clients dial)
+#   core    ARC.1.1  serverAuth, 730 days (§17.6)  --dns/--ip: at least one (the names clients dial);
+#                    clientAuth                     clientAuth too since OCSS: a core dials another
+#                                                   core with its certificate (core test services §6.4)
 #   portal  ARC.1.2  clientAuth  365 days (§7)     the portal's admin-API client certificate
 #   cell    ARC.1.3  clientAuth  730 days (§17.6)  a cell's (plan 9 checks it; P3's intermediate
 #                                                  CA issues them online later)
@@ -67,7 +69,7 @@ cmd_sign() {
     shift 5
     local san=() policy eku days
     case $role in
-        core) policy=$ARC.1.1; eku=serverAuth; days=730 ;;
+        core) policy=$ARC.1.1; eku="serverAuth, clientAuth"; days=730 ;;
         portal) policy=$ARC.1.2; eku=clientAuth; days=365 ;;
         cell) policy=$ARC.1.3; eku=clientAuth; days=730 ;;
         *) die "role '$role': core, portal or cell" ;;

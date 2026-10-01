@@ -8,7 +8,8 @@
 #   expired.key/.crt, expired.fpr          role portal, expired in 2025
 #   cell.key/.crt, cell.fpr                role cell (clientAuth, wrong role for the API)
 #   rogue.key/.crt                         role portal from another root
-#   core-client.fpr                        core.crt's fingerprint (serverAuth only)
+#   core-client.fpr                        core.crt's fingerprint
+#   core2.key/.crt, core2.fpr, core.fpr    a second core (localhost), and both cores' fingerprints (OCSS)
 # usage: test_oc_ca.sh OC_CA OUT
 set -euo pipefail
 OC_CA=$1
@@ -42,6 +43,7 @@ check "the root is a CA with room for one intermediate" \
 key_csr core
 check "a core certificate" "$OC_CA" sign ca core core.csr core.crt localhost --dns localhost --ip 127.0.0.1
 check "it chains to the root, for a server" openssl verify -CAfile ca.crt -purpose sslserver core.crt
+check "...and for a client (a core dials a core: OCSS)" openssl verify -CAfile ca.crt -purpose sslclient core.crt
 check "it carries the core role" bash -c "openssl x509 -in core.crt -noout -text | grep -q '$ARC.1.1'"
 check "its names" bash -c "openssl x509 -in core.crt -noout -ext subjectAltName | grep -q 'DNS:localhost, IP Address:127.0.0.1'"
 check "valid 730 days" bash -c "openssl x509 -in core.crt -noout -checkend $((729 * 86400)) && ! openssl x509 -in core.crt -noout -checkend $((731 * 86400))"
@@ -77,6 +79,10 @@ key_csr cell
 check "a cell certificate carries the cell role" bash -c "openssl x509 -in cell.crt -noout -text | grep -q '$ARC.1.3'"
 "$OC_CA" fpr cell.crt > cell.fpr
 "$OC_CA" fpr core.crt > core-client.fpr
+"$OC_CA" fpr core.crt > core.fpr
+key_csr core2
+"$OC_CA" sign ca core core2.csr core2.crt oc-core-2 --dns localhost --ip 127.0.0.1 >/dev/null
+"$OC_CA" fpr core2.crt > core2.fpr
 
 key_csr rsa rsa
 refuse "an RSA key is refused" "$OC_CA" sign ca portal rsa.csr x.crt p

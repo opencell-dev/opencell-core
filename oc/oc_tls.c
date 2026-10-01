@@ -59,16 +59,17 @@ static int has_policy(X509 *x, const char *oid)
     return found;
 }
 
-/* The chain was checked by OpenSSL (preverify_ok): at the client's own
+/* The chain was checked by OpenSSL (preverify_ok): at the peer's own
  * certificate (depth 0), its pin and its role too. */
 static int verify_cb(int ok, X509_STORE_CTX *st)
 {
     SSL *ssl = X509_STORE_CTX_get_ex_data(st, SSL_get_ex_data_X509_STORE_CTX_idx());
     oc_tls_conn_t *c = SSL_get_ex_data(ssl, conn_idx);
     oc_tls_t *t = SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl));
+    const char *who = t->cfg.client ? "server" : "client";
     if (!ok) {
         int e = X509_STORE_CTX_get_error(st);
-        snprintf(c->why, sizeof(c->why), "client certificate refused: %s (depth %d)",
+        snprintf(c->why, sizeof(c->why), "%s certificate refused: %s (depth %d)", who,
                  X509_verify_cert_error_string(e), X509_STORE_CTX_get_error_depth(st));
         return 0;
     }
@@ -77,7 +78,7 @@ static int verify_cb(int ok, X509_STORE_CTX *st)
     uint8_t md[32];
     unsigned mdn = 0;
     if (X509_digest(x, EVP_sha256(), md, &mdn) != 1 || mdn != 32) {
-        snprintf(c->why, sizeof(c->why), "client certificate refused: no fingerprint");
+        snprintf(c->why, sizeof(c->why), "%s certificate refused: no fingerprint", who);
         return 0;
     }
     char hex[65];
@@ -85,11 +86,11 @@ static int verify_cb(int ok, X509_STORE_CTX *st)
     int pinned = 0;
     for (unsigned i = 0; i < t->cfg.npin; i++) pinned |= memcmp(md, t->cfg.pin[i], 32) == 0;
     if (!pinned) {
-        snprintf(c->why, sizeof(c->why), "client certificate %.16s... is not pinned", hex);
+        snprintf(c->why, sizeof(c->why), "%s certificate %.16s... is not pinned", who, hex);
         return 0;
     }
     if (!has_policy(x, t->cfg.role)) {
-        snprintf(c->why, sizeof(c->why), "client certificate %.16s... lacks the role %s", hex, t->cfg.role);
+        snprintf(c->why, sizeof(c->why), "%s certificate %.16s... lacks the role %s", who, hex, t->cfg.role);
         return 0;
     }
     memcpy(c->peer, hex, sizeof(hex));
@@ -114,7 +115,7 @@ oc_tls_t *oc_tls_new(const oc_tls_cfg_t *cfg, char *err, size_t cap)
 {
     if (cfg->npin == 0 || cfg->npin > OC_TLS_PINS || cfg->alpn == NULL || strlen(cfg->alpn) == 0 ||
         strlen(cfg->alpn) > 60 || cfg->role == NULL) {
-        snprintf(err, cap, "TLS: a pinned client certificate, an ALPN protocol and a role are needed");
+        snprintf(err, cap, "TLS: a pinned peer certificate, an ALPN protocol and a role are needed");
         return NULL;
     }
     if (conn_idx < 0) conn_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
@@ -127,7 +128,7 @@ oc_tls_t *oc_tls_new(const oc_tls_cfg_t *cfg, char *err, size_t cap)
     t->alpn_wire[0] = (uint8_t)strlen(cfg->alpn);
     memcpy(t->alpn_wire + 1, cfg->alpn, t->alpn_wire[0]);
     t->alpn_n = 1u + t->alpn_wire[0];
-    t->ctx = SSL_CTX_new(TLS_server_method());
+    t->ctx = SSL_CTX_new(cfg->client ? TLS_client_method() : TLS_server_method());
     STACK_OF(X509_NAME) *names = NULL;
     if (t->ctx == NULL) {
         ssl_err(err, cap, "TLS: no context");
@@ -148,15 +149,28 @@ oc_tls_t *oc_tls_new(const oc_tls_cfg_t *cfg, char *err, size_t cap)
         ssl_err(err, cap, what);
         goto fail;
     }
-    if (SSL_CTX_load_verify_locations(t->ctx, cfg->ca, NULL) != 1 || (names = SSL_load_client_CA_file(cfg->ca)) == NULL) {
+    if (SSL_CTX_load_verify_locations(t->ctx, cfg->ca, NULL) != 1) {
         ssl_err(err, cap, cfg->ca);
         goto fail;
     }
-    SSL_CTX_set_client_CA_list(t->ctx, names);
-    X509_VERIFY_PARAM_set_purpose(SSL_CTX_get0_param(t->ctx), X509_PURPOSE_SSL_CLIENT);
-    SSL_CTX_set_verify(t->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, verify_cb);
+    if (cfg->client) { /* offer the one protocol; the server's certificate is for a server */
+        X509_VERIFY_PARAM_set_purpose(SSL_CTX_get0_param(t->ctx), X509_PURPOSE_SSL_SERVER);
+        SSL_CTX_set_verify(t->ctx, SSL_VERIFY_PEER, verify_cb);
+        if (SSL_CTX_set_alpn_protos(t->ctx, t->alpn_wire, (unsigned)t->alpn_n) != 0) {
+            ssl_err(err, cap, "TLS: ALPN");
+            goto fail;
+        }
+    } else {
+        if ((names = SSL_load_client_CA_file(cfg->ca)) == NULL) {
+            ssl_err(err, cap, cfg->ca);
+            goto fail;
+        }
+        SSL_CTX_set_client_CA_list(t->ctx, names);
+        X509_VERIFY_PARAM_set_purpose(SSL_CTX_get0_param(t->ctx), X509_PURPOSE_SSL_CLIENT);
+        SSL_CTX_set_verify(t->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, verify_cb);
+        SSL_CTX_set_alpn_select_cb(t->ctx, alpn_cb, t);
+    }
     SSL_CTX_set_verify_depth(t->ctx, 2);
-    SSL_CTX_set_alpn_select_cb(t->ctx, alpn_cb, t);
     SSL_CTX_set_session_cache_mode(t->ctx, SSL_SESS_CACHE_OFF);
     SSL_CTX_set_options(t->ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_num_tickets(t->ctx, 0);
@@ -184,8 +198,13 @@ int oc_tls_conn_start(oc_tls_t *t, oc_tls_conn_t *c, int fd)
         oc_tls_conn_close(c);
         return -1;
     }
-    SSL_set_accept_state(c->ssl);
-    c->want = POLLIN;
+    if (t->cfg.client) {
+        SSL_set_connect_state(c->ssl);
+        c->want = POLLOUT; /* the ClientHello goes first */
+    } else {
+        SSL_set_accept_state(c->ssl);
+        c->want = POLLIN;
+    }
     return 0;
 }
 
@@ -213,12 +232,13 @@ int oc_tls_conn_handshake(oc_tls_conn_t *c)
         const unsigned char *p = NULL;
         unsigned n = 0;
         SSL_get0_alpn_selected(c->ssl, &p, &n);
-        if (n == 0) { /* a client offering no ALPN at all never reaches alpn_cb */
-            snprintf(c->why, sizeof(c->why), "the client offered no ALPN protocol");
+        if (n == 0) { /* a client offering no ALPN at all never reaches alpn_cb; a server may choose none */
+            snprintf(c->why, sizeof(c->why), SSL_is_server(c->ssl) ? "the client offered no ALPN protocol"
+                                                                    : "the server chose no ALPN protocol");
             return -1;
         }
         if (c->peer[0] == '\0') { /* verify_cb always sets it: belt and braces */
-            snprintf(c->why, sizeof(c->why), "no verified client certificate");
+            snprintf(c->why, sizeof(c->why), "no verified peer certificate");
             return -1;
         }
         c->want = POLLIN;

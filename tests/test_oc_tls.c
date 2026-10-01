@@ -26,10 +26,10 @@ static const char *PKI = "build/pki";
 /* PKI/name, in a buffer of its own for each of the few names used. */
 static const char *f(const char *name)
 {
-    static char path[16][256];
-    static const char *names[16];
+    static char path[32][256]; /* room for every name the tests use (22 with OCSS's) */
+    static const char *names[32];
     int i = 0;
-    while (i < 15 && names[i] != NULL && strcmp(names[i], name) != 0) i++;
+    while (i < 31 && names[i] != NULL && strcmp(names[i], name) != 0) i++;
     names[i] = name;
     snprintf(path[i], sizeof(path[i]), "%s/%s", PKI, name);
     return path[i];
@@ -191,11 +191,11 @@ static void test_a_pinned_certificate_without_the_portal_role_is_refused(void)
     cl.key = "cell.key";
     TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &cl, why, sizeof(why)));
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "lacks the role"), why);
-    read_fpr("core-client.fpr", cfg.pin[1]); /* a server certificate: not for clients */
+    read_fpr("core-client.fpr", cfg.pin[1]); /* a core's certificate (clientAuth too, for OCSS): not the portal's role */
     cl.cert = "core.crt";
     cl.key = "core.key";
     TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &cl, why, sizeof(why)));
-    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "client certificate refused"), why);
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "lacks the role"), why);
 }
 
 /* An expired certificate is refused by the chain check, even pinned (a
@@ -256,6 +256,111 @@ static void test_a_server_that_cant_start_says_why(void)
     TEST_ASSERT_EQUAL_INT(-1, oc_tls_fpr_parse("zz112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff", b));
 }
 
+/* OCSS (core test services spec §6.4): both ends are oc_tls, the dialling
+ * core a client. Each pins the other core's certificate and wants the core
+ * role. Returns the server's result; *cli the client's; whys for both. */
+static oc_tls_cfg_t ocss_cfg(const char *crt, const char *key, const char *peer_fpr, int client)
+{
+    oc_tls_cfg_t c;
+    memset(&c, 0, sizeof(c));
+    c.cert = f(crt);
+    c.key = f(key);
+    c.ca = f("ca.crt");
+    c.alpn = "ocss/1";
+    c.role = OC_TLS_ROLE_CORE;
+    read_fpr(peer_fpr, c.pin[0]);
+    c.npin = 1;
+    c.client = client;
+    return c;
+}
+
+static int ocss_pair(const oc_tls_cfg_t *scfg, const oc_tls_cfg_t *ccfg, int *cli, char *swhy, char *cwhy, size_t cap)
+{
+    char err[256];
+    int sv[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sv));
+    oc_tls_t *ts = oc_tls_new(scfg, err, sizeof(err));
+    TEST_ASSERT_NOT_NULL_MESSAGE(ts, err);
+    oc_tls_t *tc = oc_tls_new(ccfg, err, sizeof(err));
+    TEST_ASSERT_NOT_NULL_MESSAGE(tc, err);
+    oc_tls_conn_t s, c;
+    TEST_ASSERT_EQUAL_INT(0, oc_tls_conn_start(ts, &s, sv[0]));
+    TEST_ASSERT_EQUAL_INT(0, oc_tls_conn_start(tc, &c, sv[1]));
+    int rs = 0, rc = 0;
+    for (int i = 0; i < 200 && (rs == 0 || rc == 0); i++) {
+        if (rc == 0) rc = oc_tls_conn_handshake(&c);
+        if (rs == 0) rs = oc_tls_conn_handshake(&s);
+        if (rc < 0 && rs == 0) rs = -2; /* the client gave up: the server's side is moot */
+        if (rs < 0 && rc == 0) rc = -2;
+    }
+    if (rs == 1 && rc == 1) { /* each knows the other by its pin */
+        uint8_t ping[3] = { 0, 1, 0x44 }, got[8];
+        TEST_ASSERT_EQUAL_INT(3, oc_tls_conn_write(&c, ping, 3));
+        long n = 0;
+        for (int i = 0; i < 200 && n <= 0; i++) n = oc_tls_conn_read(&s, got, sizeof(got));
+        TEST_ASSERT_EQUAL_INT(3, n);
+        TEST_ASSERT_EQUAL_UINT(64, strlen(s.peer));
+        TEST_ASSERT_EQUAL_UINT(64, strlen(c.peer));
+    }
+    snprintf(swhy, cap, "%s", s.why);
+    snprintf(cwhy, cap, "%s", c.why);
+    *cli = rc;
+    oc_tls_conn_close(&s);
+    oc_tls_conn_close(&c);
+    oc_tls_free(ts);
+    oc_tls_free(tc);
+    ERR_clear_error();
+    return rs;
+}
+
+static void test_ocss_two_cores_know_each_other_by_pin(void)
+{
+    oc_tls_cfg_t s = ocss_cfg("core2.crt", "core2.key", "core.fpr", 0), c = ocss_cfg("core.crt", "core.key", "core2.fpr", 1);
+    char sw[160], cw[160];
+    int cli;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, ocss_pair(&s, &c, &cli, sw, cw, sizeof(sw)), sw);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, cli, cw);
+}
+
+static void test_ocss_the_dialler_refuses_a_server_it_has_not_pinned(void)
+{
+    oc_tls_cfg_t s = ocss_cfg("core2.crt", "core2.key", "core.fpr", 0), c = ocss_cfg("core.crt", "core.key", "core.fpr", 1); /* pins itself */
+    char sw[160], cw[160];
+    int cli;
+    ocss_pair(&s, &c, &cli, sw, cw, sizeof(sw));
+    TEST_ASSERT_EQUAL_INT(-1, cli);
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(cw, "server certificate"), cw);
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(cw, "is not pinned"), cw);
+}
+
+static void test_ocss_a_portal_or_cell_certificate_is_not_a_core(void)
+{
+    char sw[160], cw[160];
+    int cli;
+    oc_tls_cfg_t s = ocss_cfg("core2.crt", "core2.key", "cell.fpr", 0), c = ocss_cfg("core.crt", "core.key", "core2.fpr", 1);
+    c.cert = f("cell.crt"); /* a cell dials, pinned by mistake: not the core role */
+    c.key = f("cell.key");
+    TEST_ASSERT_EQUAL_INT(-1, ocss_pair(&s, &c, &cli, sw, cw, sizeof(sw)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(sw, "lacks the role"), sw);
+    s = ocss_cfg("core2.crt", "core2.key", "core.fpr", 0);
+    s.cert = f("portal.crt"); /* a client-only certificate as the server */
+    s.key = f("portal.key");
+    c = ocss_cfg("core.crt", "core.key", "portal.fpr", 1);
+    ocss_pair(&s, &c, &cli, sw, cw, sizeof(sw));
+    TEST_ASSERT_EQUAL_INT(-1, cli);
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(cw, "server certificate refused"), cw);
+}
+
+static void test_ocss_the_admin_api_does_not_speak_ocss(void)
+{
+    char sw[160], cw[160];
+    int cli;
+    oc_tls_cfg_t s = ocss_cfg("core2.crt", "core2.key", "core.fpr", 0), c = ocss_cfg("core.crt", "core.key", "core2.fpr", 1);
+    s.alpn = "oc-admin/1";
+    TEST_ASSERT_EQUAL_INT(-1, ocss_pair(&s, &c, &cli, sw, cw, sizeof(sw)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(sw, "does not speak oc-admin/1"), sw);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -270,5 +375,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_the_wrong_alpn_or_none_is_refused);
     RUN_TEST(test_tls_1_2_is_refused);
     RUN_TEST(test_a_server_that_cant_start_says_why);
+    RUN_TEST(test_ocss_two_cores_know_each_other_by_pin);
+    RUN_TEST(test_ocss_the_dialler_refuses_a_server_it_has_not_pinned);
+    RUN_TEST(test_ocss_a_portal_or_cell_certificate_is_not_a_core);
+    RUN_TEST(test_ocss_the_admin_api_does_not_speak_ocss);
     return UNITY_END();
 }

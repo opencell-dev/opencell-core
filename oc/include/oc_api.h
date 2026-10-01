@@ -96,12 +96,15 @@
  * Every operation has its rate limit, route.offer too; op 0 and unknown
  * ops share one of their own, named "unknown" (api_rate = unknown ...).
  *
- * A read-only status call that names no number and no cell (core.status,
- * cell.status 0: the NOC's polls, NOC design §7) is audited once a minute
- * per (operation, actor): the first call as itself, the rest of that
- * minute counted into one record, "a<actor> <op> ok x<N> in 60 s". Any
- * other status, or a call that names a number or a cell, is audited as
- * itself.
+ * A read-only call that names no number and no cell, of one of the NOC's
+ * poll operations (core.status, cell.status 0, cell.radio 0, reg.list 0,
+ * cdr.recent, audit.list with no number, ocss.status, core.blocks; NOC
+ * design §7) is audited once a minute per (operation, actor): the first
+ * call as itself, the rest of that minute counted into one record,
+ * "a<actor> <op> ok x<N> in 60 s". Any other call of one of these -
+ * naming a cell, naming a cursor that targets one subscriber (reg.list's
+ * after), naming a number, or failing - is audited as itself, never
+ * folded into that count (quiet_op, final review Focus 3 / I1).
  *
  * An unactivated number whose token has expired is released before any
  * call about it (sub.release_expired, network-core spec §18.3), and every

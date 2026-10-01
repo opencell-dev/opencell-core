@@ -2,11 +2,12 @@
 
 The central network software of [OpenCell](https://github.com/opencell-dev/opencell): the subscriber database (HSS/AuC with MILENAGE), activation, registration, the location registry, call routing and switching between cells, and the echo service. Later, for several servers: asynchronous replication, block (NPA) transfer between tenants, and OCSS, the core-to-core signalling system.
 
-- `oc_core/`: the core as a portable C11 library (no OS calls): the cell-core codec, HSS/AuC, registry, switch, echo service, a channel list per group of cells.
+- `oc_core/`: the core as a portable C11 library (no OS calls): the cell-core and OCSS codec, HSS/AuC, registry, switch, the echo and playback services, OCSS links to other cores, a channel list per group of cells.
 - `oc_cell/`: a cell's network side (`oc_sig_net` and the core client), which `oc-cell` in [opencell-pi](https://github.com/opencell-dev/opencell-pi) runs.
 - `oc/`: the Linux side: the `oc-core` program (the daemon and `oc-core admin ...`), the SQLite store with AES-256-GCM sealed keys, and `oc_util` (config files, the framing on Unix sockets, logging), which `oc-cell` shares.
 - `tools/deploy/oc-deploy`: installs a tagged revision of `oc-core` or `oc-cell` on a host over SSH (`oc-deploy deploy REPO_DIR TAG HOST`; `rollback`/`list`/`status` manage what is already there), builds it on the target, and keeps the previous build for `rollback`.
-- `dist/`: the systemd unit and an example `/etc/opencell/oc-core.conf`.
+- `dist/`: the systemd unit, an example `/etc/opencell/oc-core.conf`, and `clips/`: each core's playback clip (`coreN-playback.bit`, with `SHA256SUMS`).
+- `tools/clip/oc-clip-gen`: makes a playback clip on the laptop (flite through `libflite1`, numpy, scipy), then `c2enc 1200 OUT.raw OUT.bit`.
 - `third_party/opencell-firmware`: the firmware repository (for `oc_sig`), a submodule pinned to a commit.
 
 Build and test (Debian 13: `cmake gcc libssl-dev libsqlite3-dev`):
@@ -33,5 +34,7 @@ oc-core admin sub add +883-1-606-555-01234 && oc-core admin sub issue +883-1-606
 Schema upgrades: the daemon migrates its database at start (`PRAGMA user_version`), after a `.backup` next to it (`core.db.v1.<time>`). Schema v2 (v0.2.0, the admin API) only adds four indexes, so rolling back to v0.1.x needs no restore and loses nothing written since: stop `oc-core`, run `sqlite3 /var/lib/opencell/core/core.db "DROP INDEX audit_number; DROP INDEX cdr_caller; DROP INDEX cdr_called; DROP INDEX token_unused_expiry; PRAGMA user_version = 1;"` (`OC_SQL_V2_TO_V1` in `oc/include/oc_sql.h`, pinned by `test_oc_sql`), then start the old build. Keep the backup for a damaged database.
 
 The running daemon takes `oc-core admin ...` over a local Unix socket (`/run/opencell/admin.sock`, group `oc-admin`); every admin command is audited. A single site's cells connect to `/run/opencell/core.sock` (group `oc-cell`) on the same host. On the bench, the core instead runs on a separate VM: the Pi reaches it by holding a persistent SSH forward of that socket (`oc-core-link.service`, see [opencell-pi](https://github.com/opencell-dev/opencell-pi)'s README and `docs/bench/network-core-bench.md` there) — plan 9 replaces this with a TCP/TLS link the cell dials directly.
+
+Test services and OCSS (`docs/superpowers/specs/2026-09-30-core-test-services-design.md` in the docs repository): each core answers its echo number (subscriber 00100) and its playback number (00101: the clip of `playback_clip`, one 18-byte Codec2 1200 payload per 120 ms, looped, 10 min at most). Calls to a block another core is home for (`block = PREFIX INDEX HOME_CORE`) go to that core over OCSS: TLS 1.3 on 7443, ALPN `ocss/1`, both cores' certificates of the core role pinned by `peer` lines; the lower core id dials. `oc-core admin status` shows the playback clip and whether each such block's core is linked. A new clip or pin takes effect at a restart.
 
 Design: `docs/superpowers/specs/2026-09-27-network-core-design.md` (§17 for these programs). Plans: `docs/superpowers/plans/2026-09-27-net-core-1-lc-core.md` (the libraries) and `docs/superpowers/plans/2026-09-28-oc-core-oc-cell-bench.md` (the programs, on the Pi bench).

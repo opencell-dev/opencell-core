@@ -3,8 +3,16 @@
 core_id = 1
 key_id = 1
 echo = +883160655500100
-# PREFIX INDEX: a numbering block this core is home for (one line each)
+# The playback service (core test services spec §5): a second service
+# number in this core's block, and its clip (headerless Codec2 1200, whole
+# 18-byte payloads: dist/clips/, tools/clip/oc-clip-gen). Both or neither.
+#playback = +883160655500101
+#playback_clip = /etc/opencell/playback.bit
+# PREFIX INDEX [HOME_CORE]: a numbering block (one line each). Without
+# HOME_CORE it is this core's; with another core's id, calls to its numbers
+# go to that core over OCSS, which needs a peer line for it.
 block = 8831606 1
+#block = 8831503 2 2
 db = /var/lib/opencell/core/core.db
 cell_socket = /run/opencell/core.sock
 cell_group = oc-cell
@@ -29,3 +37,14 @@ admin_group = oc-admin
 # Per-operation rate limits (OP PER_HOUR BURST); the defaults are in oc_api.c.
 # "unknown" is op 0 and any operation the core does not have.
 #api_rate = sub.disable 30 10
+# OCSS, the links to other cores (core test services spec §6-7): one line
+# per core, CORE_ID ADDRESS|- SHA256. The lower core_id dials: give the
+# address of a core with a higher id, "-" for one with a lower id (it dials
+# here, so ocss_listen is needed). SHA256: `oc-ca fpr` of that core's OCSS
+# certificate (role core). The ocss_* files as the api_* ones; a pin change
+# takes effect at a restart.
+#peer = 2 10.99.0.2:7443 <64 hex digits>
+#ocss_listen = 10.99.0.2:7443
+#ocss_cert = /etc/opencell/tls/ocss.crt
+#ocss_key = ocss.key
+#ocss_ca = /etc/opencell/tls/ca.crt

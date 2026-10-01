@@ -19,7 +19,8 @@
 # (flock) serialises them, so a drill may wait behind the other one.
 #
 # Environment (tests override): OC_DRILL_DIR (/var/lib/oc-db-drill),
-# OC_DRILL_CONF (/etc/pgbackrest/drill.conf), OC_PG_BIN (/usr/lib/postgresql/17/bin),
+# OC_DRILL_CONF (/etc/pgbackrest/drill.conf), OC_DRILL_INCLUDE (/etc/pgbackrest/conf.d),
+# OC_PG_BIN (/usr/lib/postgresql/17/bin),
 # OC_DRILL_RUNAS (postgres; empty = the calling user), OC_DRILL_PORT (5499),
 # OC_DRILL_SOCK (/run/oc-db-drill).
 set -uo pipefail
@@ -42,6 +43,10 @@ case $STANZA in
 esac
 DIR=${OC_DRILL_DIR:-/var/lib/oc-db-drill}
 CONF=${OC_DRILL_CONF:-/etc/pgbackrest/drill.conf}
+# With an explicit --config, pgBackRest no longer reads its default include
+# directory, which holds the repository's passphrase (conf.d/cipher.conf):
+# name it beside --config, in the restore and in the restore_command.
+INCLUDE=${OC_DRILL_INCLUDE:-/etc/pgbackrest/conf.d}
 BIN=${OC_PG_BIN:-/usr/lib/postgresql/17/bin}
 RUNAS=${OC_DRILL_RUNAS-postgres}
 PORT=${OC_DRILL_PORT:-5499}
@@ -101,9 +106,9 @@ t0=$(date +%s)
 # OC_DRILL_DIR override, an edited drill.conf), the drill would check one
 # directory and leave a clear-text copy of a production database in the
 # other. Never run this restore without it (runbook R4).
-as pgbackrest --config="$CONF" --stanza="$STANZA" --pg1-path="$PGDATA" --type=time "--target=$target" \
+as pgbackrest --config="$CONF" --config-include-path="$INCLUDE" --stanza="$STANZA" --pg1-path="$PGDATA" --type=time "--target=$target" \
     --target-action=promote \
-    "--recovery-option=restore_command=pgbackrest --config=$CONF --stanza=$STANZA archive-get %f \"%p\"" \
+    "--recovery-option=restore_command=pgbackrest --config=$CONF --config-include-path=$INCLUDE --stanza=$STANZA archive-get %f \"%p\"" \
     restore >"$LOG" 2>&1 || finish fail "pgbackrest restore failed: $(tail -1 "$LOG")"
 restore_s=$(($(date +%s) - t0))
 

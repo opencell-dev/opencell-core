@@ -124,7 +124,15 @@ expect "a good restore passes (exit 0)" test "$(cat "$OUT/drill.rc")" = 0
 expect "...and says so in last-oc-east.json" test "$(field result)" = pass
 expect "...with last_pass set" test "$(field last_pass)" = "$(field at)"
 expect "it restored to a time with the drill config and promotes" \
-    grep -q -- "--config=/etc/pgbackrest/drill.conf --stanza=oc-east --pg1-path=$OUT/drill/oc-east --type=time --target=.* --target-action=promote" "$FAKE_CALLS"
+    grep -q -- "--config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east --pg1-path=$OUT/drill/oc-east --type=time --target=.* --target-action=promote" "$FAKE_CALLS"
+# With an explicit --config, pgBackRest skips its default include directory,
+# where the repository's passphrase lives (conf.d/cipher.conf): both the
+# restore and the restore_command it writes must name it (found on oc-ldn-1,
+# 2026-09-30: "restore command requires option: repo1-cipher-pass").
+expect "the restore reads the passphrase's include directory" \
+    grep -q -- "^pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east --pg1-path=" "$FAKE_CALLS"
+expect "...and so does the restore_command it writes" \
+    grep -q -- "restore_command=pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east archive-get" "$FAKE_CALLS"
 expect "it started the copy off the network, without a sync standby" \
     grep -q -- "listen_addresses='' .*synchronous_standby_names=" "$FAKE_CALLS"
 expect "it stopped the copy and deleted it" bash -c "grep -q 'pg_ctl -D $OUT/drill/oc-east -m fast' '$FAKE_CALLS' && [ ! -e '$OUT/drill/oc-east' ]"

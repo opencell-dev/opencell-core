@@ -8,9 +8,13 @@
  * fake (NOW, advanced every turn): the sockets are real. */
 #include "unity.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <openssl/err.h>
 
@@ -283,6 +287,32 @@ static void test_a_peer_configured_to_be_dialled_refuses_an_inbound_link(void)
     done();
 }
 
+/* Review M4: OC_OCSS_CONNS is shared by every connection in handshake, with
+ * no per-source limit, so a second TCP connection from the same address
+ * while the first is still handshaking (never finishing one) could hold
+ * every slot. At most one handshake per address at once. */
+static void test_a_second_handshake_from_the_same_address_is_refused(void)
+{
+    world("core.fpr");
+    int a = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int b = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    TEST_ASSERT_TRUE(a >= 0 && b >= 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(C2.o.port);
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    connect(a, (struct sockaddr *)&sa, sizeof(sa)); /* non-blocking: EINPROGRESS, fine */
+    connect(b, (struct sockaddr *)&sa, sizeof(sa));
+    for (int i = 0; i < 20; i++) turn(50000u); /* give core 2's listener a chance to accept both */
+    char buf[4];
+    TEST_ASSERT_TRUE(recv(a, buf, sizeof(buf), MSG_DONTWAIT) < 0); /* a: still in handshake, not closed */
+    TEST_ASSERT_EQUAL_INT(0, recv(b, buf, sizeof(buf), MSG_DONTWAIT)); /* b: refused, closed at once (EOF) */
+    close(a);
+    close(b);
+    done();
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -293,5 +323,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_core_that_has_not_pinned_the_other_refuses_it);
     RUN_TEST(test_a_link_whose_peer_goes_is_reported_and_dialled_again);
     RUN_TEST(test_a_peer_configured_to_be_dialled_refuses_an_inbound_link);
+    RUN_TEST(test_a_second_handshake_from_the_same_address_is_refused);
     return UNITY_END();
 }

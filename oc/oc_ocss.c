@@ -177,14 +177,54 @@ static void addr_text(const struct sockaddr_storage *sa, char *out, size_t cap)
     }
 }
 
+/* addr's host part (no port), as addr_text wrote it ("HOST:PORT" or
+ * "[V6]:PORT"). */
+static void host_only(const char *addr, char *out, size_t cap)
+{
+    size_t n;
+    if (addr[0] == '[') {
+        const char *end = strchr(addr, ']');
+        n = end != NULL ? (size_t)(end - addr - 1) : 0;
+        addr++;
+    } else {
+        const char *colon = strrchr(addr, ':');
+        n = colon != NULL ? (size_t)(colon - addr) : strlen(addr);
+    }
+    if (n >= cap) n = cap - 1;
+    memcpy(out, addr, n);
+    out[n] = '\0';
+}
+
+/* 1 if some other connection from host is already accepted and not yet
+ * open (review M4): at most one handshake per source address at once, so
+ * a host that can reach this core's listener can't hold every slot by
+ * reconnecting without ever finishing TLS. */
+static int handshaking_from(const oc_ocss_t *s, const char *host)
+{
+    for (unsigned i = 0; i < OC_OCSS_CONNS; i++) {
+        const oc_ocss_conn_t *c = &s->c[i];
+        if (c->state == C_FREE || c->state == C_OPEN || c->dialled) continue;
+        char h[64];
+        host_only(c->addr, h, sizeof(h));
+        if (strcmp(h, host) == 0) return 1;
+    }
+    return 0;
+}
+
 static void accept_one(oc_ocss_t *s)
 {
     struct sockaddr_storage sa;
     socklen_t len = sizeof(sa);
     int fd = accept4(s->lfd, (struct sockaddr *)&sa, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) return;
-    char addr[64];
+    char addr[64], host[64];
     addr_text(&sa, addr, sizeof(addr));
+    host_only(addr, host, sizeof(host));
+    if (handshaking_from(s, host)) { /* review M4 */
+        oc_log(OC_LOG_WARNING, "ocss: %s: refused, already handshaking from this address", addr);
+        close(fd);
+        return;
+    }
     oc_ocss_conn_t *c = free_conn(s);
     if (c == NULL) {
         oc_log(OC_LOG_WARNING, "ocss: %s: refused, %u links open already", addr, OC_OCSS_CONNS);

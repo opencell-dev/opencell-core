@@ -384,8 +384,8 @@ The user accepted every recommended answer of the draft, with the changes marked
 
 Settled afterwards (2026-09-27):
 - the VM is ID 115 at 10.0.0.60 (§16.2; both checked free on the host);
-- the additional IPv4 15.204.144.144 is **not available** to OpenCell (the user), so option (b) of §16.3 is dropped;
-- the routing authority key is held by the user **on the laptop and on the Proxmox host (147.135.11.61), never inside the oc-core VM** (§14.2; the user, 2026-09-27).
+- the host's second public IPv4 is **not available** to OpenCell (the user), so option (b) of §16.3 is dropped;
+- the routing authority key is held by the user **on the laptop and on the Proxmox host (the `ovh-pve` alias in the operator's SSH config), never inside the oc-core VM** (§14.2; the user, 2026-09-27).
 
 ## 14. Several cores: home core and asynchronous replicas
 
@@ -556,11 +556,11 @@ Message layouts, state machines, version negotiation, the replication record for
 
 | Item | Value |
 |---|---|
-| Host | Proxmox VE 9.2.10; SSH `root@147.135.11.61`, port 222, keys on the laptop |
+| Host | Proxmox VE 9.2.10; SSH via the `ovh-pve` alias in the operator's SSH config, keys on the laptop |
 | CPU, RAM | 8 cores; 31 GB, about 13 GB available |
 | Storage | `local` (directory), about 1.7 TB free |
-| Bridges | `vmbr0` public: 147.135.11.61/24, plus an additional IPv4 15.204.144.144/32 and IPv6 2604:2dc0:100:23d::1/128; `internal`: 10.0.0.1/24, private, NAT; `vmbr1` |
-| Other | Tailscale on the host (100.90.73.42); an `nginx-proxy` LXC (100); guest IDs in use 100–114, 200–203, 500–501 |
+| Bridges | `vmbr0` public: the host's main public IPv4/24, plus a second public IPv4/32 and a public IPv6/128; `internal`: 10.0.0.1/24, private, NAT; `vmbr1` |
+| Other | Tailscale on the host; an `nginx-proxy` LXC (100); guest IDs in use 100–114, 200–203, 500–501 |
 
 ### 16.2 The VM
 
@@ -572,7 +572,7 @@ Message layouts, state machines, version negotiation, the replication record for
 | Provisioning | cloud-init: user `opencell` with the laptop's SSH key, a static address, packages (`sqlite3`, `openssl`, `chrony`, `nftables`, `unattended-upgrades`, `qemu-guest-agent`) |
 | Network | one virtio NIC on `internal`, fixed address **10.0.0.60/24** (to be checked free against the other guests), gateway 10.0.0.1 |
 
-Provisioning sketch, run on the host (plan 9 turns it into `tools/deploy/pve-oc-core.sh`, driven from the laptop over `ssh -p 222`):
+Provisioning sketch, run on the host (plan 9 turns it into `tools/deploy/pve-oc-core.sh`, driven from the laptop over the `ovh-pve` SSH alias):
 
 ```
 qm create 115 --name oc-core-1 --cores 2 --cpu host --memory 2048 --agent 1 \
@@ -591,8 +591,8 @@ An ISO install works too. The cloud image is recommended because the same script
 
 | Option | How | For | Against |
 |---|---|---|---|
-| **(a) Port forward on the main address (recommended now)** | A host nftables rule, next to the existing NAT for `internal`: TCP `147.135.11.61:7443` → `10.0.0.60:7443`, plus a forward accept for that port only | One rule; the VM stays private; nothing else on the host changes | A non-standard port, which some guest networks block |
-| ~~(b) The additional IPv4~~ | Dropped: `15.204.144.144` is not available to OpenCell (the user, 2026-09-27) | | |
+| **(a) Port forward on the main address (recommended now)** | A host nftables rule, next to the existing NAT for `internal`: TCP the host's public address:`7443` → `10.0.0.60:7443`, plus a forward accept for that port only | One rule; the VM stays private; nothing else on the host changes | A non-standard port, which some guest networks block |
+| ~~(b) The additional IPv4~~ | Dropped: the host's second public IPv4 is not available to OpenCell (the user, 2026-09-27) | | |
 | (c) Tailscale | Tailscale in the VM, or the host advertising 10.0.0.0/24 as a subnet route; Pis join the tailnet | No public port; convenient for the user's own Pis | Every cell needs a tailnet login; not for other tenants' cells |
 
 - **Decision:** (a). If port 7443 proves blocked on guest networks, a later change can add 443 on the main address only if the host's existing services leave it free (it is not checked here). (c) serves admin SSH (the VM's SSH is reachable only from the host and the tailnet) and, optionally, the user's own Pis during bring-up.

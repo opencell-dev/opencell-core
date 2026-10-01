@@ -429,11 +429,11 @@ echo "ok   leftover processes, rollback without current"
 unset OC_DEPLOY_LOCAL
 mkdir -p "$T/x/short" "$T/x/sym/target" && ln -s "$T/x/sym/target" "$T/x/sym/oc-deploy-ssh"
 rm -f "$FAKE_SD/ssh-args"
-out=$(cd "$T/x" && XDG_RUNTIME_DIR=short OC_DEPLOY_JUMP=root@147.135.11.61:222 "$DEPLOY" status opencell@10.0.0.60 2>&1) &&
+out=$(cd "$T/x" && XDG_RUNTIME_DIR=short OC_DEPLOY_JUMP=root@198.51.100.10:222 "$DEPLOY" status opencell@10.0.0.60 2>&1) &&
     fail "status through a failing ssh succeeded"
 A=$(cat "$FAKE_SD/ssh-args" 2>/dev/null) || fail "ssh was not called: $out"
 for want in BatchMode=yes ConnectTimeout=10 ServerAliveInterval=15 ServerAliveCountMax=4 ControlMaster=auto \
-    ControlPath=short/oc-deploy-ssh/%C ControlPersist=60 -J root@147.135.11.61:222; do
+    ControlPath=short/oc-deploy-ssh/%C ControlPersist=60 -J root@198.51.100.10:222; do
     grep -qx -- "$want" <<<"$A" || fail "ssh lacks $want: $A"
 done
 [ "$(tail -3 <<<"$A" | head -2 | tr '\n' ' ')" = "-- opencell@10.0.0.60 " ] || fail "the host is not last: $A"

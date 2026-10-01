@@ -1,0 +1,215 @@
+#!/bin/bash
+# oc-db-drill: the restore drill (postgres-ha spec §10.5). On the repository
+# host (oc-ldn-1): restore a stanza's backups and WAL to a point in time into a
+# scratch Postgres, start it, check it, then delete it. Nothing leaves this
+# host, and the live clusters are never touched.
+#
+#   oc-db-drill STANZA [--age MINUTES]     STANZA oc-east or oc-west; the point in
+#                                          time is MINUTES ago (default 60)
+#   oc-db-drill STANZA --target T --keep   runbook R4a: restore to the moment T
+#                                          ('YYYY-MM-DD HH:MM:SS+00') into
+#                                          $OC_DRILL_DIR/manual-STANZA, start it on
+#                                          port 5498 (local socket only) and leave
+#                                          it running; no checks, no drill result
+#   oc-db-drill STANZA --cleanup           stop and delete that kept copy
+#   ... --repo PATH                        runbook R4c: restore from another
+#                                          repository path (a clone of a ZFS
+#                                          snapshot), not drill.conf's repo1-path
+#
+# --keep shares the drill's own pgBackRest call (include path, --pg1-path
+# guard) so the runbook cannot drift from the drill again (review final C1).
+#
+# Checks: the restore reaches the target and promotes; pg_amcheck finds no
+# corruption; the newest heartbeat row (oc-db-check writes one a minute on each
+# primary) lies within 3 minutes before the target; every database of the
+# stanza exists. The result goes to $OC_DRILL_DIR/last-STANZA.json, which
+# oc-db-check reads ("drill" alerts): {"result", "at", "target", "detail",
+# "restore_s", "last_pass"}. Exit 0 on pass, 1 on fail, 2 on usage.
+#
+# oc-east's and oc-west's drills share this host's one scratch port and
+# socket, and their timers can fire at the same second: $OC_DRILL_DIR/.lock
+# (flock) serialises them, so a drill may wait behind the other one.
+#
+# Environment (tests override): OC_DRILL_DIR (/var/lib/oc-db-drill),
+# OC_DRILL_CONF (/etc/pgbackrest/drill.conf), OC_DRILL_INCLUDE (/etc/pgbackrest/conf.d),
+# OC_PG_BIN (/usr/lib/postgresql/17/bin),
+# OC_DRILL_RUNAS (postgres; empty = the calling user), OC_DRILL_PORT (5499),
+# OC_DRILL_SOCK (/run/oc-db-drill).
+set -uo pipefail
+
+usage() { echo "usage: oc-db-drill oc-east|oc-west [--age MINUTES] | --target 'YYYY-MM-DD HH:MM:SS+00' --keep | --cleanup" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+STANZA=$1
+shift
+AGE=60
+TARGET=
+KEEP=0
+REPO=
+CLEANUP=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        --age) [ $# -ge 2 ] && [[ $2 =~ ^[0-9]+$ ]] || usage; AGE=$2; shift 2 ;;
+        --target) [ $# -ge 2 ] && [[ $2 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\+00$ ]] &&
+                      date -u -d "$2" +%s >/dev/null 2>&1 || usage
+                  TARGET=$2; shift 2 ;;
+        --keep) KEEP=1; shift ;;
+        --cleanup) CLEANUP=1; shift ;;
+        --repo) [ $# -ge 2 ] && [[ $2 == /* ]] || usage; REPO=$2; shift 2 ;;
+        *) usage ;;
+    esac
+done
+[ "$KEEP" = 0 ] || [ -n "$TARGET" ] || usage   # a kept copy is always of a chosen moment
+case $STANZA in
+    oc-east) DBS="oc_portal oc_core1 oc_drill" ;;
+    oc-west) DBS="oc_core2 oc_drill" ;;
+    *) usage ;;
+esac
+DIR=${OC_DRILL_DIR:-/var/lib/oc-db-drill}
+CONF=${OC_DRILL_CONF:-/etc/pgbackrest/drill.conf}
+# With an explicit --config, pgBackRest no longer reads its default include
+# directory, which holds the repository's passphrase (conf.d/cipher.conf):
+# name it beside --config, in the restore and in the restore_command.
+INCLUDE=${OC_DRILL_INCLUDE:-/etc/pgbackrest/conf.d}
+PGBR="--config=$CONF --config-include-path=$INCLUDE${REPO:+ --repo1-path=$REPO}"
+BIN=${OC_PG_BIN:-/usr/lib/postgresql/17/bin}
+RUNAS=${OC_DRILL_RUNAS-postgres}
+PORT=${OC_DRILL_PORT:-5499}
+SOCK=${OC_DRILL_SOCK:-/run/oc-db-drill}
+PGDATA=$DIR/$STANZA
+RESULT=$DIR/last-$STANZA.json
+LOG=$DIR/$STANZA.log
+if [ "$KEEP" = 1 ] || [ "$CLEANUP" = 1 ]; then
+    PGDATA=$DIR/manual-$STANZA
+    LOG=$DIR/manual-$STANZA.log
+    PORT=${OC_DRILL_KEEP_PORT:-5498}
+fi
+
+as() { if [ -n "$RUNAS" ]; then runuser -u "$RUNAS" -- "$@"; else "$@"; fi; }
+sql() { as "$BIN/psql" -h "$SOCK" -p "$PORT" -U postgres -XAtq -d "$1" -c "$2"; }
+
+if [ "$CLEANUP" = 1 ]; then
+    if [ -d "$PGDATA" ]; then
+        as "$BIN/pg_ctl" -D "$PGDATA" -m fast -w -t 120 stop >/dev/null 2>&1 || true
+    fi
+    rm -rf "$PGDATA" "$LOG" "$LOG.pg"
+    echo "oc-db-drill $STANZA: the kept copy is stopped and deleted"
+    exit 0
+fi
+
+now=$(date -u +%s)
+if [ -n "$TARGET" ]; then
+    target_s=$(date -u -d "$TARGET" +%s)
+else
+    target_s=$((now - AGE * 60))
+fi
+target=$(date -u -d "@$target_s" '+%Y-%m-%d %H:%M:%S+00')
+started=0
+restore_s=0
+
+finish() { # pass|fail DETAIL
+    local result=$1 detail=$2
+    if [ "$KEEP" = 1 ]; then
+        if [ "$result" = pass ]; then
+            echo "oc-db-drill $STANZA: restored to $target (${restore_s} s) and kept running on socket $SOCK port $PORT:"
+            echo "  sudo -u postgres psql -h $SOCK -p $PORT -d <database>"
+            echo "  data $PGDATA; stop and delete it with: oc-db-drill $STANZA --cleanup"
+            exit 0
+        fi
+        [ "$started" = 1 ] && as "$BIN/pg_ctl" -D "$PGDATA" -m fast -w -t 120 stop >/dev/null 2>&1
+        rm -rf "$PGDATA"
+        echo "oc-db-drill $STANZA: FAILED to keep a copy at $target: $detail"
+        exit 1
+    fi
+    if [ "$started" = 1 ]; then
+        as "$BIN/pg_ctl" -D "$PGDATA" -m fast -w -t 120 stop >/dev/null 2>&1 || true
+    fi
+    rm -rf "$PGDATA"
+    python3 - "$RESULT" "$result" "$now" "$target" "$detail" "$restore_s" <<'EOF'
+import json, os, sys
+path, result, at, target, detail, restore_s = sys.argv[1:]
+try:
+    last_pass = json.load(open(path)).get("last_pass")
+except (OSError, ValueError):
+    last_pass = None
+if result == "pass":
+    last_pass = int(at)
+tmp = path + ".tmp"
+json.dump({"result": result, "at": int(at), "target": target, "detail": detail,
+           "restore_s": int(restore_s), "last_pass": last_pass}, open(tmp, "w"))
+os.replace(tmp, path)
+EOF
+    echo "oc-db-drill $STANZA: ${result^^} (target $target, restore ${restore_s} s): $detail"
+    [ "$result" = pass ] && exit 0
+    exit 1
+}
+trap 'finish fail "interrupted"' INT TERM
+
+mkdir -p "$DIR" "$SOCK"
+[ -z "$RUNAS" ] || chown "$RUNAS" "$DIR" "$SOCK"
+# I3: oc-east's and oc-west's drills run on independent monthly timers that
+# fire at the same second and would otherwise share this host's one scratch
+# port and socket -- serialise so only one restored copy is ever live.
+if [ "$KEEP" = 1 ] && [ -e "$PGDATA" ]; then
+    # a kept copy is someone's inspection in progress: never overwrite it
+    echo "oc-db-drill $STANZA: $PGDATA exists (a kept copy): look at it, then oc-db-drill $STANZA --cleanup" >&2
+    exit 1
+fi
+exec 9>"$DIR/.lock"
+flock 9
+[ "$KEEP" = 1 ] || rm -rf "$PGDATA" # a drill that died left its scratch copy
+as mkdir -m 0700 "$PGDATA" || finish fail "cannot make $PGDATA"
+
+t0=$(date +%s)
+# --pg1-path (M3): without it, the restore target comes only from drill.conf,
+# while this script stops and deletes $PGDATA -- if the two ever diverge (an
+# OC_DRILL_DIR override, an edited drill.conf), the drill would check one
+# directory and leave a clear-text copy of a production database in the
+# other. Never run this restore without it (runbook R4).
+# The restore_command names --pg1-path too: archive-get chdir()s to the
+# stanza's pg1-path, and drill.conf's is the monthly drill's directory, not a
+# kept copy's (found in the first R4a drill, 2026-10-01).
+# shellcheck disable=SC2086 # $PGBR: options with no spaces in them
+as pgbackrest $PGBR --stanza="$STANZA" --pg1-path="$PGDATA" --type=time "--target=$target" \
+    --target-action=promote \
+    "--recovery-option=restore_command=pgbackrest $PGBR --stanza=$STANZA --pg1-path=$PGDATA archive-get %f \"%p\"" \
+    restore >"$LOG" 2>&1 || finish fail "pgbackrest restore failed: $(tail -1 "$LOG")"
+restore_s=$(($(date +%s) - t0))
+
+# The restored configuration is the live member's (Patroni's): point it at this
+# copy, keep it off the network, and never wait for a synchronous standby.
+# primary_conninfo= (M3, belt-and-braces): a restored recovery.signal carries
+# no primary_conninfo (this is a --type=time/promote restore, not a standby
+# clone), but clearing it here makes "never touches production" structural
+# rather than incidental.
+# A fresh Postgres log per run, owned by the user pg_ctl runs as: an old one
+# may be root's (a unit's StateDirectory= once chowned the directory: the
+# 2026-10-01 04:00 drills failed on it), and a failure must not quote a line
+# from an earlier run.
+: >"$LOG.pg"
+[ -z "$RUNAS" ] || chown "$RUNAS" "$LOG.pg"
+opts="-c port=$PORT -c listen_addresses='' -c unix_socket_directories=$SOCK -c hba_file=$PGDATA/pg_hba.conf"
+opts="$opts -c ident_file=$PGDATA/pg_ident.conf -c archive_mode=off -c ssl=off -c shared_buffers=128MB"
+opts="$opts -c synchronous_standby_names= -c primary_conninfo= -c cluster_name=$([ "$KEEP" = 1 ] && echo manual || echo drill)-$STANZA"
+as "$BIN/pg_ctl" -D "$PGDATA" -o "$opts" -l "$LOG.pg" -w -t 1800 start >/dev/null 2>&1 ||
+    finish fail "the scratch copy did not start: $(tail -1 "$LOG.pg" 2>/dev/null)"
+started=1
+for _ in $(seq 1 600); do
+    [ "$(sql postgres 'SELECT pg_is_in_recovery()' 2>/dev/null)" = f ] && break
+    sleep 1
+done
+[ "$(sql postgres 'SELECT pg_is_in_recovery()' 2>/dev/null)" = f ] ||
+    finish fail "recovery did not reach $target within 10 min"
+restore_s=$(($(date +%s) - t0))
+[ "$KEEP" = 0 ] || finish pass "kept"
+
+as "$BIN/pg_amcheck" -h "$SOCK" -p "$PORT" -U postgres --all --install-missing >>"$LOG" 2>&1 ||
+    finish fail "pg_amcheck found a problem (see $LOG)"
+for db in $DBS; do
+    [ "$(sql postgres "SELECT count(*) FROM pg_database WHERE datname = '$db'")" = 1 ] ||
+        finish fail "database $db is missing"
+done
+hb=$(sql oc_drill "SELECT coalesce(extract(epoch FROM max(at))::bigint, 0) FROM heartbeat") ||
+    finish fail "cannot read the heartbeat"
+[ "$hb" -le "$target_s" ] && [ "$hb" -ge $((target_s - 180)) ] ||
+    finish fail "newest heartbeat $(date -u -d "@$hb" '+%F %T') is not within 3 min before the target"
+finish pass "heartbeat $(date -u -d "@$hb" '+%F %T'), databases $DBS, pg_amcheck clean"

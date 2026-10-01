@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly full backup of %i
+
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

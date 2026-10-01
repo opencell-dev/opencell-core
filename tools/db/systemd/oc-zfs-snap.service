@@ -1,0 +1,14 @@
+# Snapshots of the pgBackRest repository's dataset (postgres-ha spec §10.2),
+# on pvelondon itself: the container cannot touch them.
+[Unit]
+Description=Snapshots of esas/opencell-pgbackrest
+# M1: a catch-up run at boot must not fire before the pool is imported.
+After=zfs-mount.service
+# I1/M2: nothing else watches this unit (it runs on the host, not oc-ldn-1,
+# so oc-db-check cannot see it) -- mail on a failed run, same env file as
+# oc-db-check's other alerts.
+OnFailure=oc-db-alert-failure@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oc-zfs-snap esas/opencell-pgbackrest

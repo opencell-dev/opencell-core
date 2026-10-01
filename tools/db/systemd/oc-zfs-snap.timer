@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily snapshots of esas/opencell-pgbackrest
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

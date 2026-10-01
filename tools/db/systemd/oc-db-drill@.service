@@ -1,0 +1,13 @@
+# The monthly restore drill of one stanza (postgres-ha spec §10.5), on oc-ldn-1.
+[Unit]
+Description=Restore drill of %i
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oc-db-drill %i
+# No StateDirectory=: as root it would chown /var/lib/oc-db-drill and its
+# files back to root on every start, while the restore and the scratch Postgres
+# run as postgres (the 2026-10-01 04:00 drills failed on it). oc-db-drill makes
+# and owns its directories itself.
+TimeoutStartSec=3h

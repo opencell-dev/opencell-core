@@ -1,0 +1,12 @@
+[Unit]
+Description=Run oc-db-check every minute
+
+[Timer]
+OnBootSec=2min
+# I1: from when the previous run finished, not when it started -- a run that
+# takes close to its 180 s budget must not overlap the next one.
+OnUnitInactiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

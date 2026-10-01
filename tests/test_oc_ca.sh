@@ -10,6 +10,9 @@
 #   rogue.key/.crt                         role portal from another root
 #   core-client.fpr                        core.crt's fingerprint
 #   core2.key/.crt, core2.fpr, core.fpr    a second core (localhost), and both cores' fingerprints (OCSS)
+#   db-ca/ca.crt                           the OpenCell Database CA (self-signed; postgres-ha
+#                                          review final I3: the database layer trusts only it)
+#   db.key/.crt                            role db, oc-db-1 (serverAuth and clientAuth), from db-ca
 # usage: test_oc_ca.sh OC_CA OUT
 set -euo pipefail
 OC_CA=$1
@@ -83,6 +86,29 @@ check "a cell certificate carries the cell role" bash -c "openssl x509 -in cell.
 key_csr core2
 "$OC_CA" sign ca core core2.csr core2.crt oc-core-2 --dns localhost --ip 127.0.0.1 >/dev/null
 "$OC_CA" fpr core2.crt > core2.fpr
+
+# review final I3: the database layer's own trust anchor -- a separate,
+# self-signed CA (an intermediate under the root cannot be the only anchor:
+# OpenSSL, so Postgres and libpq, verify a chain only up to a self-signed root)
+check "init-db makes the database CA" "$OC_CA" init-db db-ca
+refuse "init-db refuses a second one in the same place" "$OC_CA" init-db db-ca
+check "it is self-signed, a CA for leaf certificates only" bash -c "openssl verify -CAfile db-ca/ca.crt db-ca/ca.crt && openssl x509 -in db-ca/ca.crt -noout -ext basicConstraints | grep -q 'CA:TRUE, pathlen:0'"
+check "...named the OpenCell Database CA" bash -c "openssl x509 -in db-ca/ca.crt -noout -subject | grep -q 'CN=OpenCell Database CA'"
+key_csr db
+refuse "the root no longer issues db certificates" "$OC_CA" sign ca db db.csr x.crt oc-db-1 --dns oc-db-1.wg.opencell.k4ozi.com
+check "a db certificate, from the database CA" "$OC_CA" sign db-ca db db.csr db.crt oc-db-1 --dns oc-db-1.wg.opencell.k4ozi.com --ip 10.99.0.4 --ip 10.0.0.62
+check "it chains to the database CA, for a server" openssl verify -CAfile db-ca/ca.crt -purpose sslserver db.crt
+check "...and for a client (etcd peers, replication, pgBackRest)" openssl verify -CAfile db-ca/ca.crt -purpose sslclient db.crt
+refuse "it does not chain to the OpenCell root" openssl verify -CAfile ca.crt db.crt
+refuse "the database CA issues nothing but db certificates" "$OC_CA" sign db-ca cell cell.csr x.crt c
+key_csr imposter
+"$OC_CA" sign ca core imposter.csr imposter.crt oc-db-1 --dns oc-db-1.wg.opencell.k4ozi.com >/dev/null
+refuse "a root-issued certificate named oc-db-1 does not chain to the database CA" openssl verify -CAfile db-ca/ca.crt imposter.crt
+check "it carries the db role" bash -c "openssl x509 -in db.crt -noout -text | grep -q '$ARC.1.4'"
+check "its names, in order" bash -c "openssl x509 -in db.crt -noout -ext subjectAltName | grep -q 'DNS:oc-db-1.wg.opencell.k4ozi.com, IP Address:10.99.0.4, IP Address:10.0.0.62'"
+check "its subject is the host (pg_ident maps the CN)" bash -c "openssl x509 -in db.crt -noout -subject | grep -q 'CN=oc-db-1\$'"
+check "valid 730 days" bash -c "openssl x509 -in db.crt -noout -checkend $((729 * 86400)) && ! openssl x509 -in db.crt -noout -checkend $((731 * 86400))"
+refuse "a db certificate needs a name" "$OC_CA" sign db-ca db db.csr x.crt oc-db-1
 
 key_csr rsa rsa
 refuse "an RSA key is refused" "$OC_CA" sign ca portal rsa.csr x.crt p

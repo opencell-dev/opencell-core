@@ -1,0 +1,54 @@
+#!/bin/bash
+# oc-db-writer: the failover drill's witness of "no committed row lost"
+# (postgres-ha spec §1 "done means", §7). It writes numbered rows into
+# oc_drill.drill_rows, one new connection per row so it follows the primary
+# through a failover, and records each id whose COMMIT returned.
+#
+#   oc-db-writer write CONNINFO LOG [--every SECONDS] [--count N]
+#   oc-db-writer verify CONNINFO LOG
+#
+# CONNINFO names both members with target_session_attrs=read-write. write
+# appends one committed id per line to LOG and prints a line per failed
+# attempt (the failover window); it stops after N rows (default: never).
+# verify checks that every id in LOG is in drill_rows: "N committed, M missing",
+# exit 1 if any is missing. PSQL overrides psql (tests).
+set -uo pipefail
+PSQL=${PSQL:-psql}
+usage() { echo "usage: oc-db-writer write CONNINFO LOG [--every S] [--count N] | verify CONNINFO LOG" >&2; exit 2; }
+[ $# -ge 3 ] || usage
+cmd=$1 conn=$2 log=$3
+shift 3
+q() { $PSQL "$conn connect_timeout=3" -XAtqc "$1"; }
+case $cmd in
+    write)
+        every=0.2 count=0
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --every) [ $# -ge 2 ] || usage; every=$2; shift 2 ;;
+                --count) [ $# -ge 2 ] && [[ $2 =~ ^[0-9]+$ ]] || usage; count=$2; shift 2 ;;
+                *) usage ;;
+            esac
+        done
+        id=$(q "SELECT coalesce(max(id), 0) FROM drill_rows") || { echo "oc-db-writer: cannot read drill_rows" >&2; exit 1; }
+        n=0
+        while [ "$count" = 0 ] || [ "$n" -lt "$count" ]; do
+            id=$((id + 1))
+            if out=$(q "INSERT INTO drill_rows (id) VALUES ($id)" 2>&1); then
+                echo "$id" >>"$log"
+                n=$((n + 1))
+            else
+                echo "$(date -u +%T) id $id not committed: ${out##*$'\n'}"
+            fi
+            sleep "$every"
+        done
+        ;;
+    verify)
+        [ $# -eq 0 ] || usage
+        total=$(grep -c . "$log" || true)
+        missing=$(q "SELECT count(*) FROM unnest('{$(paste -sd, "$log")}'::bigint[]) AS c(id) WHERE NOT EXISTS (SELECT 1 FROM drill_rows d WHERE d.id = c.id)") ||
+            { echo "oc-db-writer: cannot read drill_rows" >&2; exit 1; }
+        echo "$total committed, $missing missing"
+        [ "$missing" = 0 ]
+        ;;
+    *) usage ;;
+esac

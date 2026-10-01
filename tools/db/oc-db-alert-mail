@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""oc-db-alert-mail: the OnFailure mailer shared by oc-db-check, oc-zfs-snap and
+oc-etcd-defrag (review I1, M2). Their units nothing else watches -- a killed
+oc-db-check never reaches its own send_mail, and oc-zfs-snap/oc-etcd-defrag
+have no monitoring at all -- so systemd's own OnFailure= calls this instead.
+
+  oc-db-alert-mail UNIT [--env FILE] [--state-dir DIR] [--sendmail-to WHO]
+                                       UNIT is the failing unit's name (%I)
+
+Rate-limited (review N1): at most one mail per unit per hour (a per-unit
+stamp file under --state-dir, StateDirectory=oc-db-alert-mail in the unit).
+The first-ever failure always mails; every other failure inside that hour is
+only counted, and folded into the next mail's "N failure(s) since ..." once
+the hour has elapsed. oc-db-alert-failure@.service's StartLimitBurst is a
+separate, coarser backstop against a runaway loop -- this stamp is the real
+limit on mail actually sent.
+
+Delivery (review N2, N5), in this order:
+  1. a systemd credential named "smtp" ($CREDENTIALS_DIRECTORY/smtp, from
+     LoadCredential=smtp:/etc/opencell/alert-smtp.env in the unit) --
+     oc-ldn-1, oc-db-1, oc-core-2, without the service needing root;
+  2. --env FILE (default /etc/opencell/alert-smtp.env), read directly if it
+     exists -- a fallback for a manual run with no credential loaded;
+  3. otherwise the local mail path (/usr/sbin/sendmail -t, addressed to
+     --sendmail-to, default root) -- pvelondon, which carries no SMTP secret
+     at all (spec Sec9.3 places it only on the three database hosts);
+     Proxmox forwards root's local mail to whatever address the user has
+     configured there (tools/db/README.md).
+
+A failed send is logged to stderr and exits 1; nothing here retries one (the
+next real failure of the watched unit will try again, or mailed once the
+stamp clears).
+
+Standard library only (Debian 13's python3).
+"""
+import argparse
+import json
+import os
+import smtplib
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from email.message import EmailMessage
+
+WINDOW = 3600  # N1: at most one mail per unit per this many seconds
+
+
+def read_env(path):
+    env = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    return env
+
+
+def find_env(env_path, credentials_dir):
+    """Where to read SMTP credentials from, or None for the sendmail fallback
+    (review N2, N5). A systemd credential wins over --env, so a host carrying
+    both (it should not) prefers the one systemd itself vetted."""
+    if credentials_dir:
+        cred = os.path.join(credentials_dir, "smtp")
+        if os.path.isfile(cred):
+            return cred
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    return None
+
+
+def read_stamp(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def update_stamp(stamp, now, window=WINDOW):
+    """(stamp_or_None, now) -> (send: bool, count: int, since: int, new_stamp).
+    Pure (review N1). stamp is {"since": epoch, "count": int} | None. The
+    first-ever failure (no stamp) always sends: there is nothing yet to rate
+    limit. After that, at most one send per window: a failure inside the
+    window only increments "count" (returned, and kept in the stamp); once a
+    failure lands at or past "since" + window, it sends, reports every
+    failure counted since the window opened (including this one), and opens
+    a fresh window starting now."""
+    if stamp is None:
+        return True, 1, now, {"since": now, "count": 0}
+    since, count = stamp["since"], stamp.get("count", 0) + 1
+    if now - since >= window:
+        return True, count, since, {"since": now, "count": 0}
+    return False, count, since, {"since": since, "count": count}
+
+
+def write_stamp(path, stamp):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(stamp, f)
+    os.replace(tmp, path)
+
+
+def stamp_path(state_dir, unit):
+    # A unit name is already a safe filename component (systemd itself
+    # restricts what %I can be); belt-and-braces against a "/" escaping state_dir.
+    return os.path.join(state_dir, f"{unit.replace('/', '_')}.json")
+
+
+def compose(unit, host, count, since):
+    subject = f"[OpenCell db] {unit} failed on {host}"
+    since_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(since))
+    body = (f"systemd reports {unit} failed on {host}: {count} failure(s) since {since_str}.\n\n"
+            "Further failures in the next hour are counted, not mailed again.\n\n"
+            f"journalctl -u {unit} for the reason; runbooks: "
+            "docs/ops/postgres-runbooks.md in the docs repository.\n")
+    return subject, body
+
+
+def send_smtp(env_path, subject, body):
+    env = read_env(env_path)
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = env["SMTP_USER"], env["ALERT_TO"], subject
+    msg.set_content(body)
+    with smtplib.SMTP(env["SMTP_HOST"], int(env.get("SMTP_PORT", "587")), timeout=20) as s:
+        s.starttls(context=ssl.create_default_context())
+        s.login(env["SMTP_USER"], env["SMTP_TOKEN"])
+        s.send_message(msg)
+
+
+def send_sendmail(to, subject, body):
+    sendmail = os.environ.get("OC_SENDMAIL", "/usr/sbin/sendmail")
+    msg = EmailMessage()
+    msg["To"], msg["Subject"] = to, subject
+    msg.set_content(body)
+    r = subprocess.run([sendmail, "-t", "-oi"], input=msg.as_string(), text=True,
+                        capture_output=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"sendmail exit {r.returncode}")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description="mail that UNIT failed, for OnFailure= (rate-limited)")
+    ap.add_argument("unit")
+    ap.add_argument("--env", default="/etc/opencell/alert-smtp.env")
+    ap.add_argument("--state-dir", default=os.environ.get("STATE_DIRECTORY", "/var/lib/oc-db-alert-mail"))
+    ap.add_argument("--sendmail-to", default="root")
+    a = ap.parse_args(argv)
+    host = socket.gethostname()
+    now = int(time.time())
+    path = stamp_path(a.state_dir, a.unit)
+    send, count, since, stamp = update_stamp(read_stamp(path), now)
+    write_stamp(path, stamp)
+    if not send:
+        print(f"oc-db-alert-mail: {a.unit} failed again ({count} so far this hour); not mailed")
+        return 0
+    subject, body = compose(a.unit, host, count, since)
+    env_path = find_env(a.env, os.environ.get("CREDENTIALS_DIRECTORY"))
+    try:
+        if env_path:
+            send_smtp(env_path, subject, body)
+        else:
+            send_sendmail(a.sendmail_to, subject, body)
+    except Exception as e:  # noqa: BLE001 -- this IS the alerting path: log clearly, do not retry
+        print(f"oc-db-alert-mail: could not mail that {a.unit} failed: {e}", file=sys.stderr)
+        return 1
+    print(f"oc-db-alert-mail: mailed that {a.unit} failed ({count} failure(s) since {since})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

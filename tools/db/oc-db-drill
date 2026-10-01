@@ -181,6 +181,12 @@ restore_s=$(($(date +%s) - t0))
 # no primary_conninfo (this is a --type=time/promote restore, not a standby
 # clone), but clearing it here makes "never touches production" structural
 # rather than incidental.
+# A fresh Postgres log per run, owned by the user pg_ctl runs as: an old one
+# may be root's (a unit's StateDirectory= once chowned the directory: the
+# 2026-10-01 04:00 drills failed on it), and a failure must not quote a line
+# from an earlier run.
+: >"$LOG.pg"
+[ -z "$RUNAS" ] || chown "$RUNAS" "$LOG.pg"
 opts="-c port=$PORT -c listen_addresses='' -c unix_socket_directories=$SOCK -c hba_file=$PGDATA/pg_hba.conf"
 opts="$opts -c ident_file=$PGDATA/pg_ident.conf -c archive_mode=off -c ssl=off -c shared_buffers=128MB"
 opts="$opts -c synchronous_standby_names= -c primary_conninfo= -c cluster_name=$([ "$KEEP" = 1 ] && echo manual || echo drill)-$STANZA"

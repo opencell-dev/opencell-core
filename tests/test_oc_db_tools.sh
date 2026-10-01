@@ -158,6 +158,16 @@ expect "a failed restore fails, without starting anything" \
 drill oc-north
 expect "an unknown stanza is a usage error" test "$(cat "$OUT/drill.rc")" = 2
 
+# The first timer-run drill on oc-ldn-1 (2026-10-01 04:00) failed: the unit's
+# StateDirectory= had chowned /var/lib/oc-db-drill and its old logs to root, so
+# pg_ctl (as postgres) could not open its log, and the failure quoted a stale
+# line of an earlier run. Each run starts its own Postgres log, and the unit
+# leaves the directory's ownership to the script.
+echo "SENTINEL from an older run" >"$OUT/drill/oc-east.log.pg"
+FAKE_HB=$(($(date +%s) - 3600 - 60)) drill oc-east
+expect "each drill starts its own Postgres log" bash -c "! grep -q SENTINEL '$OUT/drill/oc-east.log.pg'"
+expect "the drill unit does not manage the directory's ownership" bash -c "! grep -q '^StateDirectory=' '$TOOLS/systemd/oc-db-drill@.service'"
+
 # ---- oc-db-drill --keep / --cleanup: runbook R4a (review final C1) ------------
 # R4a restores to a chosen moment and leaves the copy running to look at; it
 # must use the drill's own pgBackRest call (include path, --pg1-path guard), so

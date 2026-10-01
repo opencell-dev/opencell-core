@@ -328,6 +328,91 @@ static void test_cell_cfg(void)
     TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(cut, sizeof(cut), &back));
 }
 
+/* OCSS (core test services spec §6): the link and call-control frames. */
+static void test_ocss_golden_bytes(void)
+{
+    oc_core_msg_t m;
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_HELLO;
+    m.u.peer_hello.proto = OC_OCSS_PROTO;
+    m.u.peer_hello.core_id = 0x0102;
+    m.u.peer_hello.table_ver = 0x03040506u;
+    static const uint8_t hello[] = { 0x00, 0x08, 0x41, 0x01, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03 };
+    golden(&m, hello, sizeof(hello));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_HELLO_ACK;
+    m.u.peer_hello.core_id = 2;
+    static const uint8_t ack[] = { 0x00, 0x07, 0x42, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    golden(&m, ack, sizeof(ack));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_HELLO_NAK;
+    m.u.hello_nak.reason = OC_OCSS_NAK_WRONG_CORE;
+    static const uint8_t nak[] = { 0x00, 0x02, 0x43, 0x01 };
+    golden(&m, nak, sizeof(nak));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_PING;
+    static const uint8_t ping[] = { 0x00, 0x01, 0x44 };
+    golden(&m, ping, sizeof(ping));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CALL_SETUP;
+    m.u.setup.call_ref = OC_CORE_REF_CORE | 1u;
+    num("+883160655501234", m.u.setup.caller);
+    num("+883150355500101", m.u.setup.called);
+    static const uint8_t setup[] = { 0x00, 0x16, 0x60, 0x01, 0x00, 0x00, 0x80, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23,
+                                     0x4F, 0x88, 0x31, 0x50, 0x35, 0x55, 0x00, 0x10, 0x1F, 0x00 };
+    golden(&m, setup, sizeof(setup));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CALL_RELEASE;
+    m.u.call.ref = OC_CORE_REF_CORE | 1u;
+    m.u.call.cause = OC_SIG_CAUSE_NET_FAILURE;
+    static const uint8_t rel[] = { 0x00, 0x06, 0x64, 0x01, 0x00, 0x00, 0x80, 0x05 };
+    golden(&m, rel, sizeof(rel));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_MEDIA;
+    m.u.media.ref = OC_CORE_REF_CORE | 1u;
+    m.u.media.seq = 0x0102;
+    m.u.media.len = 2;
+    memcpy(m.u.media.data, "HI", 2);
+    static const uint8_t media[] = { 0x00, 0x09, 0x68, 0x01, 0x00, 0x00, 0x80, 0x02, 0x01, 0x48, 0x49 };
+    golden(&m, media, sizeof(media));
+
+    static const uint8_t types[] = { OC_OCSS_PONG, OC_OCSS_CALL_ALERT, OC_OCSS_CALL_ANSWER };
+    for (unsigned i = 0; i < sizeof(types); i++) { /* the rest round-trip */
+        uint8_t buf[OC_CORE_FRAME_MAX];
+        oc_core_msg_t back;
+        memset(&m, 0, sizeof(m));
+        m.type = types[i];
+        m.u.call.ref = types[i] == OC_OCSS_PONG ? 0 : 9;
+        size_t n = oc_core_encode(&m, buf, sizeof(buf));
+        TEST_ASSERT_NOT_EQUAL(0, n);
+        TEST_ASSERT_EQUAL_INT(0, oc_core_decode(buf, n, &back));
+        TEST_ASSERT_EQUAL_HEX8_ARRAY(&m, &back, sizeof(back));
+    }
+}
+
+static void test_ocss_what_does_not_decode(void)
+{
+    oc_core_msg_t m;
+    static const uint8_t short_hello[] = { 0x00, 0x07, 0x41, 0x01, 0x02, 0x01, 0x06, 0x05, 0x04 };
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(short_hello, sizeof(short_hello), &m));
+    static const uint8_t long_ack[] = { 0x00, 0x08, 0x42, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(long_ack, sizeof(long_ack), &m));
+    static const uint8_t bad_called[] = { 0x00, 0x16, 0x60, 0x01, 0x00, 0x00, 0x80, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01,
+                                          0x23, 0x4F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(bad_called, sizeof(bad_called), &m));
+    uint8_t big[2 + 1 + 4 + 2 + OC_SIG_APP_MAX + 1] = { 0x00, sizeof(big) - 2u, OC_OCSS_MEDIA };
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(big, sizeof(big), &m));
+    static const uint8_t free_type[] = { 0x00, 0x01, 0x46 }; /* kept for routing (plan 10): not this build's */
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(free_type, sizeof(free_type), &m));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -337,5 +422,7 @@ int main(void)
     RUN_TEST(test_proto_2_and_the_old_av_res_does_not_decode);
     RUN_TEST(test_what_does_not_decode);
     RUN_TEST(test_cell_cfg);
+    RUN_TEST(test_ocss_golden_bytes);
+    RUN_TEST(test_ocss_what_does_not_decode);
     return UNITY_END();
 }

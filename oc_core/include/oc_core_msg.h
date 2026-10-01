@@ -13,6 +13,14 @@
  * a CHAN_LIST body exactly as oc_sig encodes it (oc_sig_body_encode: its
  * frequencies are big-endian, as everywhere in oc_sig).
  *
+ * OCSS, the core <-> core protocol (network-core spec §15; core test
+ * services spec §6), shares this codec and frame shape with its own type
+ * space, 0x40-0x7F: each type is its §6 analogue + 0x40 (HELLO 0x41 ...
+ * MEDIA 0x68). 0x46-0x4F are kept for routing, 0x50-0x5F for mobility,
+ * 0x70-0x7F for replication (plan 10). A cell link ignores OCSS types and
+ * an OCSS link ignores cell types. OCSS call refs: every message about a
+ * call carries the call_ref its CALL_SETUP gave it (the calling core's).
+ *
  * Types not listed here are free. */
 #ifndef OC_CORE_MSG_H
 #define OC_CORE_MSG_H
@@ -24,6 +32,7 @@
 #define OC_CORE_PROTO     2u /* 2: AV_RES carries HXRES, not XRES (§19.1); LOC_CANCEL names its RAND (§19 follow-ups) */
 #define OC_CORE_AV_MAX    4u
 #define OC_CORE_REF_CORE  0x80000000u
+#define OC_OCSS_PROTO     1u /* OCSS HELLO's proto (the test-services slice: link and call control only) */
 
 typedef enum {
     OC_CORE_HELLO = 0x01, OC_CORE_HELLO_ACK = 0x02, OC_CORE_HELLO_NAK = 0x03, OC_CORE_PING = 0x04, OC_CORE_PONG = 0x05,
@@ -32,8 +41,15 @@ typedef enum {
     OC_CORE_RESYNC = 0x14,
     OC_CORE_LOC_UPDATE = 0x18, OC_CORE_LOC_PURGE = 0x19, OC_CORE_LOC_CANCEL = 0x1A,
     OC_CORE_CALL_ROUTE = 0x20, OC_CORE_CALL_OFFER = 0x21, OC_CORE_CALL_ALERT = 0x22, OC_CORE_CALL_ANSWER = 0x23,
-    OC_CORE_CALL_RELEASE = 0x24, OC_CORE_MEDIA = 0x28
+    OC_CORE_CALL_RELEASE = 0x24, OC_CORE_MEDIA = 0x28,
+    /* OCSS (core <-> core) */
+    OC_OCSS_HELLO = 0x41, OC_OCSS_HELLO_ACK = 0x42, OC_OCSS_HELLO_NAK = 0x43, OC_OCSS_PING = 0x44, OC_OCSS_PONG = 0x45,
+    OC_OCSS_CALL_SETUP = 0x60, OC_OCSS_CALL_ALERT = 0x62, OC_OCSS_CALL_ANSWER = 0x63, OC_OCSS_CALL_RELEASE = 0x64,
+    OC_OCSS_MEDIA = 0x68
 } oc_core_type_t;
+
+/* OCSS HELLO_NAK reasons */
+typedef enum { OC_OCSS_NAK_WRONG_CORE = 1, OC_OCSS_NAK_VERSION = 2 } oc_ocss_nak_t;
 
 typedef enum { OC_CORE_NAK_UNKNOWN_CELL = 1, OC_CORE_NAK_DISABLED = 2, OC_CORE_NAK_VERSION = 3 } oc_core_nak_t;
 
@@ -97,7 +113,12 @@ typedef struct {
         struct { uint32_t leg_ref; uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN]; } call_route;
         struct { uint32_t call_ref; uint8_t callee[OC_SIG_NUMBER_LEN], caller[OC_SIG_NUMBER_LEN]; } call_offer;
         struct { uint32_t ref; uint8_t cause; } call; /* CALL_ALERT, CALL_ANSWER (no cause), CALL_RELEASE */
-        struct { uint32_t ref; uint16_t seq; uint8_t len; uint8_t data[OC_SIG_APP_MAX]; } media;
+        struct { uint32_t ref; uint16_t seq; uint8_t len; uint8_t data[OC_SIG_APP_MAX]; } media; /* and OCSS MEDIA */
+        /* OCSS HELLO and HELLO_ACK: the sender's core_id and the version of
+         * the block table it routes by (0: its config, no signed table yet) */
+        struct { uint8_t proto; uint16_t core_id; uint32_t table_ver; } peer_hello; /* HELLO_ACK: no proto */
+        struct { uint32_t call_ref; uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN]; uint8_t hop; } setup;
+        /* OCSS HELLO_NAK uses hello_nak; CALL_ALERT, _ANSWER, _RELEASE use call */
     } u;
 } oc_core_msg_t;
 

@@ -95,6 +95,24 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         break;
     case OC_CORE_PING:
     case OC_CORE_PONG:
+    case OC_OCSS_PING:
+    case OC_OCSS_PONG:
+        break;
+    case OC_OCSS_HELLO:
+        w8(&w, m->u.peer_hello.proto);
+        /* fall through */
+    case OC_OCSS_HELLO_ACK:
+        w16(&w, m->u.peer_hello.core_id);
+        w32(&w, m->u.peer_hello.table_ver);
+        break;
+    case OC_OCSS_HELLO_NAK:
+        w8(&w, m->u.hello_nak.reason);
+        break;
+    case OC_OCSS_CALL_SETUP:
+        w32(&w, m->u.setup.call_ref);
+        wb(&w, m->u.setup.caller, OC_SIG_NUMBER_LEN);
+        wb(&w, m->u.setup.called, OC_SIG_NUMBER_LEN);
+        w8(&w, m->u.setup.hop);
         break;
     case OC_CORE_CELL_CFG: {
         oc_sig_msg_t cl;
@@ -169,13 +187,17 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         break;
     case OC_CORE_CALL_ALERT:
     case OC_CORE_CALL_ANSWER:
+    case OC_OCSS_CALL_ALERT:
+    case OC_OCSS_CALL_ANSWER:
         w32(&w, m->u.call.ref);
         break;
     case OC_CORE_CALL_RELEASE:
+    case OC_OCSS_CALL_RELEASE:
         w32(&w, m->u.call.ref);
         w8(&w, m->u.call.cause);
         break;
     case OC_CORE_MEDIA:
+    case OC_OCSS_MEDIA:
         if (m->u.media.len > OC_SIG_APP_MAX) return 0;
         w32(&w, m->u.media.ref);
         w16(&w, m->u.media.seq);
@@ -214,6 +236,24 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         break;
     case OC_CORE_PING:
     case OC_CORE_PONG:
+    case OC_OCSS_PING:
+    case OC_OCSS_PONG:
+        break;
+    case OC_OCSS_HELLO:
+        m->u.peer_hello.proto = r8(&r);
+        /* fall through */
+    case OC_OCSS_HELLO_ACK:
+        m->u.peer_hello.core_id = r16(&r);
+        m->u.peer_hello.table_ver = r32(&r);
+        break;
+    case OC_OCSS_HELLO_NAK:
+        m->u.hello_nak.reason = r8(&r);
+        break;
+    case OC_OCSS_CALL_SETUP:
+        m->u.setup.call_ref = r32(&r);
+        rnum(&r, m->u.setup.caller);
+        rnum(&r, m->u.setup.called);
+        m->u.setup.hop = r8(&r);
         break;
     case OC_CORE_CELL_CFG: {
         oc_sig_msg_t cl;
@@ -291,13 +331,17 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         break;
     case OC_CORE_CALL_ALERT:
     case OC_CORE_CALL_ANSWER:
+    case OC_OCSS_CALL_ALERT:
+    case OC_OCSS_CALL_ANSWER:
         m->u.call.ref = r32(&r);
         break;
     case OC_CORE_CALL_RELEASE:
+    case OC_OCSS_CALL_RELEASE:
         m->u.call.ref = r32(&r);
         m->u.call.cause = r8(&r);
         break;
     case OC_CORE_MEDIA:
+    case OC_OCSS_MEDIA:
         m->u.media.ref = r32(&r);
         m->u.media.seq = r16(&r);
         if (r.bad || len - r.at > OC_SIG_APP_MAX) return -1;

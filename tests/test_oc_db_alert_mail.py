@@ -163,5 +163,70 @@ class Main(unittest.TestCase):
             self.assertIn("not mailed", r2.stdout)
 
 
+UNIT = os.path.join(os.path.dirname(os.path.abspath(PATH)), "systemd", "oc-db-alert-failure@.service")
+
+
+def systemd_unescape(s):
+    """%I: the instance unescaped as systemd does ("-" -> "/", "\\xNN" -> byte)."""
+    import shutil
+    import subprocess
+    if shutil.which("systemd-escape"):
+        return subprocess.run(["systemd-escape", "--unescape", s], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    out, i = [], 0
+    while i < len(s):
+        if s.startswith("\\x", i):
+            out.append(chr(int(s[i + 2:i + 4], 16)))
+            i += 4
+        else:
+            out.append("/" if s[i] == "-" else s[i])
+            i += 1
+    return "".join(out)
+
+
+def expand(arg, instance):
+    """The two instance specifiers systemd would expand in ExecStart=."""
+    return arg.replace("%i", instance).replace("%I", systemd_unescape(instance))
+
+
+class UnitSubject(unittest.TestCase):
+    """The OnFailure= mailer unit must hand the mailer the failed unit's name as
+    is: OnFailure=oc-db-alert-failure@%n.service makes the instance
+    "oc-db-check.service", and %I would unescape its dashes into
+    "oc/db/check.service" (seen live on oc-ldn-1, 2026-09-30)."""
+
+    def exec_args(self):
+        with open(UNIT) as f:
+            line = next(l for l in f if l.startswith("ExecStart="))
+        return line.split("=", 1)[1].split()[1:]
+
+    def test_the_unit_passes_the_raw_instance(self):
+        self.assertEqual(self.exec_args(), ["%i"])
+
+    def test_a_dashed_unit_name_reaches_the_subject_intact(self):
+        for failed in ("oc-db-check.service", "oc-zfs-snap.service", "oc-etcd-defrag.service",
+                       "pga-test.service"):
+            args = [expand(a, failed) for a in self.exec_args()]
+            self.assertEqual(args, [failed])
+            with tempfile.TemporaryDirectory() as d:
+                fake_bin = os.path.join(d, "fake-sendmail")
+                calls = os.path.join(d, "calls")
+                with open(fake_bin, "w") as f:
+                    f.write(f'#!/bin/bash\ncat >> "{calls}"\n')
+                os.chmod(fake_bin, 0o755)
+                env = dict(os.environ)
+                env["OC_SENDMAIL"] = fake_bin
+                env.pop("CREDENTIALS_DIRECTORY", None)
+                import subprocess
+                r = subprocess.run(
+                    [sys.executable, PATH, *args, "--env", os.path.join(d, "no-such-env"),
+                     "--state-dir", os.path.join(d, "state")],
+                    env=env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(calls) as f:
+                    sent = f.read()
+                self.assertIn(f"Subject: [OpenCell db] {failed} failed on ", sent)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

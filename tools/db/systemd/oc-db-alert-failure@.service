@@ -1,4 +1,4 @@
-# oc-db-alert-failure@: mails "%I failed on this host" when another oc-db-*
+# oc-db-alert-failure@: mails "%i failed on this host" when another oc-db-*
 # unit's OnFailure= fires (review I1, M2) -- oc-db-check.service (systemd
 # itself kills or fails a run), oc-zfs-snap.service and oc-etcd-defrag.service
 # (nothing else watches them). Triggering unit: OnFailure=oc-db-alert-failure@%n.service
@@ -10,7 +10,7 @@
 # /etc/systemd/system/oc-db-alert-failure@.service.d/pvelondon.conf, which
 # switches oc-db-alert-mail to its local-mail (sendmail) fallback.
 [Unit]
-Description=Mail that %I failed
+Description=Mail that %i failed
 # N1: a coarse backstop, independent of oc-db-alert-mail's own hourly stamp
 # (the real limit on mail actually sent). oc-db-check can legitimately fail
 # on every one-minute run during a real incident (about 60 starts/hour);
@@ -22,7 +22,9 @@ StartLimitBurst=100
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/oc-db-alert-mail %I
+# %i, not %I: the instance is the failed unit's name (OnFailure=...@%n.service), and
+# %I would unescape its dashes ("oc-db-check.service" -> "oc/db/check.service").
+ExecStart=/usr/local/sbin/oc-db-alert-mail %i
 StateDirectory=oc-db-alert-mail
 # N5: the SMTP mode needs only its credential and outbound TLS, so it never
 # needs root. LoadCredential's copy is exempt from ProtectSystem/ProtectHome,

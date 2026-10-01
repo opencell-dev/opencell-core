@@ -1,0 +1,17 @@
+# oc-db-digest: the daily "all quiet" summary (review final I2), on oc-ldn-1.
+# It mails what is running every day, so that the user notices its absence:
+# a stopped checker, a dead CT or a broken mail path all end in "no mail".
+[Unit]
+Description=OpenCell database daily summary
+After=network-online.target wg-quick@wg0.service
+OnFailure=oc-db-alert-failure@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oc-db-check --digest
+# reads the alert state that oc-db-check.service keeps; never writes it
+StateDirectory=oc-db-check
+TimeoutStartSec=180
+Nice=5
+ProtectSystem=full
+PrivateTmp=true

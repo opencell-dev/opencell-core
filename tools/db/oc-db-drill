@@ -6,6 +6,15 @@
 #
 #   oc-db-drill STANZA [--age MINUTES]     STANZA oc-east or oc-west; the point in
 #                                          time is MINUTES ago (default 60)
+#   oc-db-drill STANZA --target T --keep   runbook R4a: restore to the moment T
+#                                          ('YYYY-MM-DD HH:MM:SS+00') into
+#                                          $OC_DRILL_DIR/manual-STANZA, start it on
+#                                          port 5498 (local socket only) and leave
+#                                          it running; no checks, no drill result
+#   oc-db-drill STANZA --cleanup           stop and delete that kept copy
+#
+# --keep shares the drill's own pgBackRest call (include path, --pg1-path
+# guard) so the runbook cannot drift from the drill again (review final C1).
 #
 # Checks: the restore reaches the target and promotes; pg_amcheck finds no
 # corruption; the newest heartbeat row (oc-db-check writes one a minute on each
@@ -25,17 +34,26 @@
 # OC_DRILL_SOCK (/run/oc-db-drill).
 set -uo pipefail
 
-usage() { echo "usage: oc-db-drill oc-east|oc-west [--age MINUTES]" >&2; exit 2; }
+usage() { echo "usage: oc-db-drill oc-east|oc-west [--age MINUTES] | --target 'YYYY-MM-DD HH:MM:SS+00' --keep | --cleanup" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 STANZA=$1
 shift
 AGE=60
+TARGET=
+KEEP=0
+CLEANUP=0
 while [ $# -gt 0 ]; do
     case $1 in
         --age) [ $# -ge 2 ] && [[ $2 =~ ^[0-9]+$ ]] || usage; AGE=$2; shift 2 ;;
+        --target) [ $# -ge 2 ] && [[ $2 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\+00$ ]] &&
+                      date -u -d "$2" +%s >/dev/null 2>&1 || usage
+                  TARGET=$2; shift 2 ;;
+        --keep) KEEP=1; shift ;;
+        --cleanup) CLEANUP=1; shift ;;
         *) usage ;;
     esac
 done
+[ "$KEEP" = 0 ] || [ -n "$TARGET" ] || usage   # a kept copy is always of a chosen moment
 case $STANZA in
     oc-east) DBS="oc_portal oc_core1 oc_drill" ;;
     oc-west) DBS="oc_core2 oc_drill" ;;
@@ -54,18 +72,48 @@ SOCK=${OC_DRILL_SOCK:-/run/oc-db-drill}
 PGDATA=$DIR/$STANZA
 RESULT=$DIR/last-$STANZA.json
 LOG=$DIR/$STANZA.log
+if [ "$KEEP" = 1 ] || [ "$CLEANUP" = 1 ]; then
+    PGDATA=$DIR/manual-$STANZA
+    LOG=$DIR/manual-$STANZA.log
+    PORT=${OC_DRILL_KEEP_PORT:-5498}
+fi
 
 as() { if [ -n "$RUNAS" ]; then runuser -u "$RUNAS" -- "$@"; else "$@"; fi; }
 sql() { as "$BIN/psql" -h "$SOCK" -p "$PORT" -U postgres -XAtq -d "$1" -c "$2"; }
 
+if [ "$CLEANUP" = 1 ]; then
+    if [ -d "$PGDATA" ]; then
+        as "$BIN/pg_ctl" -D "$PGDATA" -m fast -w -t 120 stop >/dev/null 2>&1 || true
+    fi
+    rm -rf "$PGDATA" "$LOG" "$LOG.pg"
+    echo "oc-db-drill $STANZA: the kept copy is stopped and deleted"
+    exit 0
+fi
+
 now=$(date -u +%s)
-target_s=$((now - AGE * 60))
+if [ -n "$TARGET" ]; then
+    target_s=$(date -u -d "$TARGET" +%s)
+else
+    target_s=$((now - AGE * 60))
+fi
 target=$(date -u -d "@$target_s" '+%Y-%m-%d %H:%M:%S+00')
 started=0
 restore_s=0
 
 finish() { # pass|fail DETAIL
     local result=$1 detail=$2
+    if [ "$KEEP" = 1 ]; then
+        if [ "$result" = pass ]; then
+            echo "oc-db-drill $STANZA: restored to $target (${restore_s} s) and kept running on socket $SOCK port $PORT:"
+            echo "  sudo -u postgres psql -h $SOCK -p $PORT -d <database>"
+            echo "  data $PGDATA; stop and delete it with: oc-db-drill $STANZA --cleanup"
+            exit 0
+        fi
+        [ "$started" = 1 ] && as "$BIN/pg_ctl" -D "$PGDATA" -m fast -w -t 120 stop >/dev/null 2>&1
+        rm -rf "$PGDATA"
+        echo "oc-db-drill $STANZA: FAILED to keep a copy at $target: $detail"
+        exit 1
+    fi
     if [ "$started" = 1 ]; then
         as "$BIN/pg_ctl" -D "$PGDATA" -m fast -w -t 120 stop >/dev/null 2>&1 || true
     fi
@@ -95,9 +143,14 @@ mkdir -p "$DIR" "$SOCK"
 # I3: oc-east's and oc-west's drills run on independent monthly timers that
 # fire at the same second and would otherwise share this host's one scratch
 # port and socket -- serialise so only one restored copy is ever live.
+if [ "$KEEP" = 1 ] && [ -e "$PGDATA" ]; then
+    # a kept copy is someone's inspection in progress: never overwrite it
+    echo "oc-db-drill $STANZA: $PGDATA exists (a kept copy): look at it, then oc-db-drill $STANZA --cleanup" >&2
+    exit 1
+fi
 exec 9>"$DIR/.lock"
 flock 9
-rm -rf "$PGDATA" # a drill that died left its scratch copy
+[ "$KEEP" = 1 ] || rm -rf "$PGDATA" # a drill that died left its scratch copy
 as mkdir -m 0700 "$PGDATA" || finish fail "cannot make $PGDATA"
 
 t0=$(date +%s)
@@ -120,7 +173,7 @@ restore_s=$(($(date +%s) - t0))
 # rather than incidental.
 opts="-c port=$PORT -c listen_addresses='' -c unix_socket_directories=$SOCK -c hba_file=$PGDATA/pg_hba.conf"
 opts="$opts -c ident_file=$PGDATA/pg_ident.conf -c archive_mode=off -c ssl=off -c shared_buffers=128MB"
-opts="$opts -c synchronous_standby_names= -c primary_conninfo= -c cluster_name=drill-$STANZA"
+opts="$opts -c synchronous_standby_names= -c primary_conninfo= -c cluster_name=$([ "$KEEP" = 1 ] && echo manual || echo drill)-$STANZA"
 as "$BIN/pg_ctl" -D "$PGDATA" -o "$opts" -l "$LOG.pg" -w -t 1800 start >/dev/null 2>&1 ||
     finish fail "the scratch copy did not start: $(tail -1 "$LOG.pg" 2>/dev/null)"
 started=1
@@ -131,6 +184,7 @@ done
 [ "$(sql postgres 'SELECT pg_is_in_recovery()' 2>/dev/null)" = f ] ||
     finish fail "recovery did not reach $target within 10 min"
 restore_s=$(($(date +%s) - t0))
+[ "$KEEP" = 0 ] || finish pass "kept"
 
 as "$BIN/pg_amcheck" -h "$SOCK" -p "$PORT" -U postgres --all --install-missing >>"$LOG" 2>&1 ||
     finish fail "pg_amcheck found a problem (see $LOG)"

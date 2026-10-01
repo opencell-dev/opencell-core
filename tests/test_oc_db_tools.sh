@@ -158,6 +158,29 @@ expect "a failed restore fails, without starting anything" \
 drill oc-north
 expect "an unknown stanza is a usage error" test "$(cat "$OUT/drill.rc")" = 2
 
+# ---- oc-db-drill --keep / --cleanup: runbook R4a (review final C1) ------------
+# R4a restores to a chosen moment and leaves the copy running to look at; it
+# must use the drill's own pgBackRest call (include path, --pg1-path guard), so
+# the runbook and the drill cannot drift apart again.
+before=$(cat "$OUT/drill/last-oc-east.json")
+drill oc-east --target '2026-10-01 01:23:45+00' --keep
+expect "--keep restores and leaves the copy running (exit 0)" test "$(cat "$OUT/drill.rc")" = 0
+expect "...to the given moment, into its own directory, with the include path" \
+    grep -q -- "^pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east --pg1-path=$OUT/drill/manual-oc-east --type=time --target=2026-10-01 01:23:45+00 --target-action=promote" "$FAKE_CALLS"
+expect "...started on its own port, off the network" grep -q -- "pg_ctl -D $OUT/drill/manual-oc-east .*port=5498 -c listen_addresses=''.*cluster_name=manual-oc-east" "$FAKE_CALLS"
+expect "...not stopped, not deleted" bash -c "! grep -q 'pg_ctl -D .* stop' '$FAKE_CALLS' && [ -d '$OUT/drill/manual-oc-east' ]"
+expect "...and it is not a drill: last-oc-east.json unchanged" test "$(cat "$OUT/drill/last-oc-east.json")" = "$before"
+expect "...says how to connect and how to clean up" bash -c "grep -q 'port 5498' '$OUT/drill.out' && grep -q -- '--cleanup' '$OUT/drill.out'"
+drill oc-east --target '2026-10-01 01:23:45+00' --keep
+expect "a second --keep never overwrites a kept copy" bash -c "[ \$(cat '$OUT/drill.rc') = 1 ] && grep -q -- '--cleanup' '$OUT/drill.out' && ! grep -q '^pgbackrest' '$FAKE_CALLS'"
+drill oc-east --cleanup
+expect "--cleanup stops and deletes the kept copy" bash -c "[ \$(cat '$OUT/drill.rc') = 0 ] && grep -q 'pg_ctl -D $OUT/drill/manual-oc-east -m fast' '$FAKE_CALLS' && [ ! -e '$OUT/drill/manual-oc-east' ]"
+drill oc-east --target 'yesterday-ish'
+expect "an unreadable --target is a usage error" test "$(cat "$OUT/drill.rc")" = 2
+FAKE_RESTORE_RC=1 drill oc-east --target '2026-10-01 01:23:45+00' --keep
+expect "a failed --keep restore leaves nothing behind and no drill result" \
+    bash -c "[ \$(cat '$OUT/drill.rc') = 1 ] && [ ! -e '$OUT/drill/manual-oc-east' ] && [ \"\$(cat '$OUT/drill/last-oc-east.json')\" = '$before' ]"
+
 # ---- oc-db-drill: two stanzas' drills never collide (I3) ---------------------
 : >"$FAKE_CALLS"
 export FAKE_PORTLOCK=$OUT/portlock FAKE_DRILL_DELAY=0.3
@@ -197,6 +220,16 @@ expect "verify: nothing missing is a pass" bash -c "[ $? = 0 ] && grep -qx '3 co
 FAKE_MISSING=1 "$TOOLS/oc-db-writer" verify "host=a,b" "$OUT/w.log" >"$OUT/v.out"
 expect "verify: a missing committed row is a failure" test $? = 1
 unset PSQL
+
+# ---- units (review final I2, m7, m9) ------------------------------------------
+U=$TOOLS/systemd
+expect "the daily digest runs oc-db-check --digest" grep -qx 'ExecStart=/usr/local/sbin/oc-db-check --digest' "$U/oc-db-digest.service"
+expect "...at 12:00 UTC, caught up after downtime" bash -c "grep -qx 'OnCalendar=\*-\*-\* 12:00:00 UTC' '$U/oc-db-digest.timer' && grep -qx 'Persistent=true' '$U/oc-db-digest.timer'"
+expect "...and a failed digest is mailed by the OnFailure mailer" grep -qx 'OnFailure=oc-db-alert-failure@%n.service' "$U/oc-db-digest.service"
+# m7: a killed Patroni that holds the watchdog must be back well inside its 25 s
+expect "Patroni restarts within 2 s" grep -qx 'RestartSec=2s' "$U/patroni-opencell.conf"
+# m9: Debian's etcd unit restarts only on-abnormal; a bind failure (wg0 late) must retry
+expect "etcd and the pgBackRest server restart on failure" bash -c "grep -qx 'Restart=on-failure' '$U/after-wg.conf' && grep -qx 'RestartSec=5s' '$U/after-wg.conf'"
 
 [ "$fails" -eq 0 ] || { echo "$fails failed"; exit 1; }
 echo "all passed"

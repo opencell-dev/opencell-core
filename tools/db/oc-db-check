@@ -38,6 +38,12 @@ DAY = 86400
 # mail a CLEARED on every run it happens to be briefly absent.
 CLEAR_HOLD_MIN = 300
 
+# Review final I2 (the dead-man's switch): each checker that writes heartbeat
+# rows (London, the witness; oc-db-1, the member) watches the other's newest
+# row. Silent this long means the other's checks are not running (a stopped
+# timer, a hung unit, a dead host); the member then checks the clusters too.
+CHECKER_SILENT_S = 600
+
 # key prefix: (level, seconds the condition must last) -- spec §14.2
 RULES = {
     "no-leader": ("critical", 30),
@@ -58,6 +64,7 @@ RULES = {
     "etcd": ("warning", 120),
     "etcd-quorum": ("critical", 0),
     "london-silent": ("warning", 600),
+    "checker-silent": ("warning", 0),
     "wg": ("warning", 0),
     "disk": ("warning", 0),
     "cert": ("warning", 0),
@@ -90,6 +97,8 @@ def load_config(path):
         "filesystems": cp.get("local", "filesystems", fallback="/").split(),
         "certs": cp.get("local", "certs", fallback="").split(),
         "wg_peers": dict(cp["wg_peers"]) if cp.has_section("wg_peers") else {},
+        # the other checker whose heartbeat rows this one watches (review final I2)
+        "peer_checker": c.get("peer_checker", ""),
     }
     if cfg["role"] not in ("witness", "member", "local"):
         raise SystemExit(f"oc-db-check: role '{cfg['role']}': witness, member or local")
@@ -108,11 +117,42 @@ def london_is_ok(facts, cfg):
     return any(e.get("health") and e["endpoint"] == cfg["london_etcd"] for e in facts.get("etcd", []))
 
 
+def peer_checker_age(facts, cfg, now):
+    """Seconds since the other checker's newest heartbeat row on any cluster's
+    primary; None when there is no other checker or no primary was read."""
+    peer = cfg.get("peer_checker")
+    if not peer:
+        return None
+    seen = [f["heartbeats"] for f in facts.get("clusters", {}).values() if f.get("heartbeats") is not None]
+    if not seen:
+        return None
+    newest = max((h.get(peer) or 0 for h in seen), default=0)
+    return float("inf") if not newest else now - newest
+
+
+def peer_checker_silent(facts, cfg, now):
+    age = peer_checker_age(facts, cfg, now)
+    return age is not None and age > CHECKER_SILENT_S
+
+
+def london_covers(facts, cfg, now):
+    """A member leaves the clusters to London only while London's etcd answers
+    and London's own checker is writing its heartbeat (review final I2)."""
+    return london_is_ok(facts, cfg) and not peer_checker_silent(facts, cfg, now)
+
+
 def evaluate(facts, cfg, now):
     """facts (from collect) -> {key: message}. Levels and durations come from RULES."""
     out = {}
-    london_ok = london_is_ok(facts, cfg)
-    if cfg["role"] == "member" and cfg["london_etcd"] and not london_ok:
+    if peer_checker_silent(facts, cfg, now):
+        peer = cfg["peer_checker"]
+        age = peer_checker_age(facts, cfg, now)
+        since = "ever" if age == float("inf") else ago(now - age, now)
+        out[f"checker-silent:{peer}"] = (
+            f"oc-db-check on {peer} has written no heartbeat for {since}: its checks are not running"
+            + ("; this host checks the clusters meanwhile" if cfg["role"] == "member" else ""))
+    london_ok = london_covers(facts, cfg, now)
+    if cfg["role"] == "member" and cfg["london_etcd"] and not london_is_ok(facts, cfg):
         out["london-silent:"] = "London (oc-ldn-1) does not answer: no automatic failover if a second site fails"
     # The witness checks the clusters; oc-db-1 checks them too only while London is silent
     # (so one incident is mailed once, and a dead London is still noticed).
@@ -317,6 +357,48 @@ def mail_text(events, host):
     return subject, "\n".join(lines) + "\n"
 
 
+def digest_text(facts, cfg, state, current, now):
+    """The daily mail (review final I2): what is running, so that its absence,
+    not only an alert, tells the user something is wrong."""
+    def since(t):
+        return "never" if not t else f"{ago(t, now)} ago"
+
+    raised = sorted(k for k, c in state.get("conditions", {}).items() if c.get("raised"))
+    subject = (f"[OpenCell db] daily from {cfg['host']}: "
+               + (f"{len(raised)} alerting" if raised else "all quiet"))
+    lines = [f"Daily summary from oc-db-check on {cfg['host']} ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))}).", ""]
+    for name, cl in cfg["clusters"].items():
+        f = facts.get("clusters", {}).get(name, {})
+        members = f.get("members")
+        lines.append(f"{name}: {describe(members) if members is not None else 'no member answered'}"
+                     f" (home {cl['home']})")
+    if cfg["etcd"]:
+        ok = sum(1 for e in facts.get("etcd", []) if e.get("health"))
+        lines.append(f"etcd: {ok} of {len(cfg['etcd'])} healthy")
+    for name, st in sorted((facts.get("backups") or {}).items()):
+        lines.append(f"backups {name}: last full {since(st.get('last_full'))}, last backup "
+                     f"{since(st.get('last_any'))} ({st.get('message')})")
+    for name, d in sorted((facts.get("drills") or {}).items()):
+        d = d or {}
+        lines.append(f"restore drill {name}: last pass {since(d.get('last_pass'))}, last result {d.get('result')}")
+    newest = {}
+    for f in facts.get("clusters", {}).values():
+        for src, t in (f.get("heartbeats") or {}).items():
+            newest[src] = max(newest.get(src, 0), t or 0)
+    for src, t in sorted(newest.items()):
+        lines.append(f"checker heartbeat {src}: {since(t)}")
+    for peer, t in sorted((facts.get("wg") or {}).items()):
+        lines.append(f"WireGuard {peer}: last handshake {since(t)}")
+    lines.append("")
+    lines.append("Alerting now: " + (", ".join(raised) if raised else "nothing"))
+    pending = sorted(k for k in current if k not in raised)
+    if pending:
+        lines.append("Pending (not yet alerting): " + ", ".join(pending))
+    lines += ["", "No mail tomorrow around 12:00 UTC means this checker or its mail path is down.",
+              "Runbooks: docs/ops/postgres-runbooks.md in the docs repository."]
+    return subject[:160], "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------- collect (I/O)
 
 
@@ -346,9 +428,9 @@ def psql(host, port, db, user, sql, cfg):
             f"options='-c statement_timeout=8000'")
     cmd = ["psql", conn, "-XAtqc", sql]
     if os.geteuid() == 0:
-        # libpq refuses a key its own user owns with group access, which a
-        # root-owned 0640 key is when the caller is root: read it as postgres
-        # (group oc-db-tls), the way Postgres and Patroni do.
+        # Run as postgres (group oc-db-tls), the identity Postgres and Patroni
+        # use. (libpq would accept the root-owned 0640 key from root too --
+        # spec §20.4 -- so this is practice, not a requirement.)
         cmd = ["runuser", "-u", "postgres", "--"] + cmd
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
@@ -368,6 +450,10 @@ PRIMARY_SQL = """SELECT json_build_object(
 
 HEARTBEAT_SQL = ("WITH old AS (DELETE FROM heartbeat WHERE at < now() - interval '60 days') "
                  "INSERT INTO heartbeat (source) VALUES ('{host}') RETURNING 1")
+# each checker's newest row in the last day (review final I2)
+HEARTBEATS_SQL = ("SELECT coalesce(json_object_agg(source, t), '{}') FROM (SELECT source, "
+                  "extract(epoch FROM max(at))::bigint AS t FROM heartbeat "
+                  "WHERE at > now() - interval '1 day' GROUP BY source) x")
 
 
 def collect(cfg, prev_state):
@@ -393,6 +479,10 @@ def collect(cfg, prev_state):
                     f["heartbeat"] = {"ok": True}
                 except Exception as e:  # noqa: BLE001
                     f["heartbeat"] = {"ok": False, "error": str(e)}
+                try:
+                    f["heartbeats"] = json.loads(psql(host, cl["port"], "oc_drill", "oc_drill", HEARTBEATS_SQL, cfg))
+                except Exception:  # noqa: BLE001 -- unread: no verdict on the other checker
+                    pass
         # I1: a missing/hanging etcdctl must become a fact, not an uncaught
         # exception -- oc-db-check has to reach the bottom of main() (save
         # state, try to mail) on every run, including its worst ones.
@@ -521,6 +611,8 @@ def main(argv):
     ap.add_argument("--state", default="/var/lib/oc-db-check/state.json")
     ap.add_argument("--no-mail", action="store_true", help="log only; keep the events for the next run")
     ap.add_argument("--test-mail", action="store_true", help="send one test message and exit")
+    ap.add_argument("--digest", action="store_true",
+                    help="mail the daily summary (leaves the alert state alone) and exit")
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     if a.test_mail:
@@ -530,10 +622,23 @@ def main(argv):
     state = read_json(a.state) or {}
     now = int(time.time())
     facts = collect(cfg, state)
+    if a.digest:
+        subject, body = digest_text(facts, cfg, state, evaluate(facts, cfg, now), now)
+        print(subject)
+        if a.no_mail:
+            print(body, end="")
+            return 0
+        try:
+            send_mail(cfg["mail_env"], subject, body)
+        except Exception as e:  # noqa: BLE001 -- the unit fails, OnFailure= reports it
+            print(f"digest mail failed: {e}")
+            return 1
+        print("digest sent")
+        return 0
     # M10: once London answers again, a role=member run stops checking clusters
     # (evaluate() below) -- drop what it raised while covering without a CLEARED
     # mail, so the witness (which re-checks on its own hold) is the one voice.
-    if cfg["role"] == "member" and cfg["london_etcd"] and london_is_ok(facts, cfg):
+    if cfg["role"] == "member" and cfg["london_etcd"] and london_covers(facts, cfg, now):
         state = drop_handoff_conditions(state, cfg["clusters"])
     current = evaluate(facts, cfg, now)
     state, events = update_state(state, current, now)

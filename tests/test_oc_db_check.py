@@ -169,6 +169,101 @@ class Evaluate(unittest.TestCase):
         self.assertEqual(set(c), {"wg:oc-db-1", "wg:oc-ldn-1", "disk:/", "cert:/etc/opencell/db-tls/db.crt"})
 
 
+class DeadMan(unittest.TestCase):
+    """Review final I2: each checker watches the other's heartbeat rows, so a
+    stopped timer, a hung unit or a dead host's checker is noticed."""
+
+    @staticmethod
+    def with_heartbeats(f, **sources):
+        for c in f["clusters"].values():
+            c["heartbeats"] = dict(sources)
+        return f
+
+    def test_witness_quiet_while_the_member_checker_writes(self):
+        f = self.with_heartbeats(healthy(), **{"oc-db-1": NOW - 70, "oc-ldn-1": NOW - 10})
+        self.assertEqual(chk.evaluate(f, dict(cfg(), peer_checker="oc-db-1"), NOW), {})
+
+    def test_witness_raises_when_the_member_checker_is_stale(self):
+        f = self.with_heartbeats(healthy(), **{"oc-db-1": NOW - 700, "oc-ldn-1": NOW - 10})
+        c = chk.evaluate(f, dict(cfg(), peer_checker="oc-db-1"), NOW)
+        self.assertEqual(set(c), {"checker-silent:oc-db-1"})
+        self.assertIn("oc-db-1", c["checker-silent:oc-db-1"])
+
+    def test_a_checker_that_never_wrote_is_silent(self):
+        f = self.with_heartbeats(healthy(), **{"oc-ldn-1": NOW - 10})
+        self.assertIn("checker-silent:oc-db-1", chk.evaluate(f, dict(cfg(), peer_checker="oc-db-1"), NOW))
+
+    def test_no_heartbeat_read_means_no_verdict(self):
+        # no primary answered: the cluster conditions speak, not this one
+        self.assertNotIn("checker-silent:oc-db-1",
+                         chk.evaluate(healthy(), dict(cfg(), peer_checker="oc-db-1"), NOW))
+
+    def test_the_newest_row_on_any_cluster_counts(self):
+        f = self.with_heartbeats(healthy(), **{"oc-db-1": NOW - 700})
+        f["clusters"]["oc-west"]["heartbeats"] = {"oc-db-1": NOW - 60}
+        self.assertEqual(chk.evaluate(f, dict(cfg(), peer_checker="oc-db-1"), NOW), {})
+
+    def test_member_covers_when_londons_checker_is_stale_though_its_etcd_answers(self):
+        f = self.with_heartbeats(healthy(), **{"oc-ldn-1": NOW - 700, "oc-db-1": NOW - 10})
+        del f["backups"], f["drills"]
+        f["clusters"]["oc-east"]["members"][0]["state"] = "stopped"
+        c = chk.evaluate(f, dict(cfg("member"), peer_checker="oc-ldn-1"), NOW)
+        self.assertIn("checker-silent:oc-ldn-1", c)
+        self.assertIn("no-leader:oc-east", c)
+        self.assertNotIn("london-silent:", c)  # London's etcd is fine; its checker is not
+
+    def test_member_leaves_clusters_to_a_fresh_london(self):
+        f = self.with_heartbeats(healthy(), **{"oc-ldn-1": NOW - 30, "oc-db-1": NOW - 10})
+        del f["backups"], f["drills"]
+        f["clusters"]["oc-east"]["members"][0]["state"] = "stopped"
+        self.assertEqual(chk.evaluate(f, dict(cfg("member"), peer_checker="oc-ldn-1"), NOW), {})
+
+    def test_member_covering_is_not_a_handoff_back(self):
+        f = self.with_heartbeats(healthy(), **{"oc-ldn-1": NOW - 700})
+        self.assertFalse(chk.london_covers(f, dict(cfg("member"), peer_checker="oc-ldn-1"), NOW))
+        f = self.with_heartbeats(healthy(), **{"oc-ldn-1": NOW - 30})
+        self.assertTrue(chk.london_covers(f, dict(cfg("member"), peer_checker="oc-ldn-1"), NOW))
+
+
+class Digest(unittest.TestCase):
+    """Review final I2: a daily mail whose absence the user notices."""
+
+    def test_all_quiet(self):
+        f = DeadMan.with_heartbeats(healthy(), **{"oc-db-1": NOW - 70, "oc-ldn-1": NOW - 10})
+        subject, body = chk.digest_text(f, dict(cfg(), peer_checker="oc-db-1"), {}, {}, NOW)
+        self.assertIn("daily", subject)
+        self.assertIn("all quiet", subject)
+        for word in ("oc-east", "oc-west", "oc-db-1 leader/running", "oc-core-2 leader/running",
+                     "etcd: 3 of 3 healthy", "full", "drill", "oc-ldn-1", "1 min ago"):
+            self.assertIn(word, body)
+
+    def test_alerting_conditions_are_named(self):
+        f = healthy()
+        state = {"conditions": {"backup-diff:oc-west": {"raised": True, "level": "warning", "first": NOW - 90000,
+                                                        "message": "oc-west: no backup for 1 d"}}}
+        current = {"backup-diff:oc-west": "oc-west: no backup for 1 d"}
+        subject, body = chk.digest_text(f, cfg(), state, current, NOW)
+        self.assertIn("1 alerting", subject)
+        self.assertIn("backup-diff:oc-west", body)
+
+    def test_main_digest_without_mail_prints_and_exits_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "db-check.conf")
+            with open(conf, "w") as f:
+                f.write("[check]\nhost = oc-ldn-1\nrole = witness\npeer_checker = oc-db-1\n"
+                        f"[etcd]\nendpoints = {LDN}\n")
+            state_path = os.path.join(d, "state.json")
+            empty_bin = os.path.join(d, "bin")
+            os.mkdir(empty_bin)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = empty_bin
+            try:
+                rc = chk.main(["--config", conf, "--state", state_path, "--digest", "--no-mail"])
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(state_path))  # the digest never touches the alert state
+
 class State(unittest.TestCase):
     def test_raise_after_hold_then_clear_once(self):
         s = {}
@@ -259,7 +354,7 @@ class Parse(unittest.TestCase):
 
     def test_config(self):
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
-            f.write("[check]\nhost = oc-db-1\nrole = member\n"
+            f.write("[check]\nhost = oc-db-1\nrole = member\npeer_checker = oc-ldn-1\n"
                     "[clusters]\noc-east = 5432 8008 oc-db-1 sync\noc-west = 5433 8009 oc-core-2 async\n"
                     "[members]\noc-db-1 = 10.99.0.4\noc-core-2 = 10.99.0.2\n"
                     f"[etcd]\nendpoints = {','.join(ETCD)}\nlondon = {LDN}\n"
@@ -273,6 +368,7 @@ class Parse(unittest.TestCase):
         self.assertEqual(c["london_etcd"], LDN)
         self.assertEqual(c["filesystems"], ["/", "/var/lib/postgresql"])
         self.assertEqual(c["wg_peers"]["oc-core-2"], "gEIo3gPxNdIe6Vv+N9DQVAXBW3zOXebRw8m8IvvuhjU=")
+        self.assertEqual(c["peer_checker"], "oc-ldn-1")
 
 
 class Handoff(unittest.TestCase):

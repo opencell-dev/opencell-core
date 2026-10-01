@@ -181,6 +181,14 @@ FAKE_RESTORE_RC=1 drill oc-east --target '2026-10-01 01:23:45+00' --keep
 expect "a failed --keep restore leaves nothing behind and no drill result" \
     bash -c "[ \$(cat '$OUT/drill.rc') = 1 ] && [ ! -e '$OUT/drill/manual-oc-east' ] && [ \"\$(cat '$OUT/drill/last-oc-east.json')\" = '$before' ]"
 
+# ---- oc-db-drill --repo: runbook R4c, a repository clone from a ZFS snapshot (review final I4)
+drill oc-west --target '2026-10-01 01:23:45+00' --keep --repo /var/lib/pgbackrest-r4c
+expect "--repo restores from that repository" grep -q -- "^pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --repo1-path=/var/lib/pgbackrest-r4c --stanza=oc-west --pg1-path=$OUT/drill/manual-oc-west " "$FAKE_CALLS"
+expect "...and fetches its WAL from it too" grep -q -- "restore_command=pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --repo1-path=/var/lib/pgbackrest-r4c --stanza=oc-west archive-get" "$FAKE_CALLS"
+drill oc-west --cleanup
+drill oc-west --target '2026-10-01 01:23:45+00' --keep --repo relative/path
+expect "--repo must be an absolute path" test "$(cat "$OUT/drill.rc")" = 2
+
 # ---- oc-db-drill: two stanzas' drills never collide (I3) ---------------------
 : >"$FAKE_CALLS"
 export FAKE_PORTLOCK=$OUT/portlock FAKE_DRILL_DELAY=0.3

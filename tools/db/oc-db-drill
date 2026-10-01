@@ -165,10 +165,13 @@ t0=$(date +%s)
 # OC_DRILL_DIR override, an edited drill.conf), the drill would check one
 # directory and leave a clear-text copy of a production database in the
 # other. Never run this restore without it (runbook R4).
+# The restore_command names --pg1-path too: archive-get chdir()s to the
+# stanza's pg1-path, and drill.conf's is the monthly drill's directory, not a
+# kept copy's (found in the first R4a drill, 2026-10-01).
 # shellcheck disable=SC2086 # $PGBR: options with no spaces in them
 as pgbackrest $PGBR --stanza="$STANZA" --pg1-path="$PGDATA" --type=time "--target=$target" \
     --target-action=promote \
-    "--recovery-option=restore_command=pgbackrest $PGBR --stanza=$STANZA archive-get %f \"%p\"" \
+    "--recovery-option=restore_command=pgbackrest $PGBR --stanza=$STANZA --pg1-path=$PGDATA archive-get %f \"%p\"" \
     restore >"$LOG" 2>&1 || finish fail "pgbackrest restore failed: $(tail -1 "$LOG")"
 restore_s=$(($(date +%s) - t0))
 

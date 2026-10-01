@@ -167,6 +167,10 @@ drill oc-east --target '2026-10-01 01:23:45+00' --keep
 expect "--keep restores and leaves the copy running (exit 0)" test "$(cat "$OUT/drill.rc")" = 0
 expect "...to the given moment, into its own directory, with the include path" \
     grep -q -- "^pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east --pg1-path=$OUT/drill/manual-oc-east --type=time --target=2026-10-01 01:23:45+00 --target-action=promote" "$FAKE_CALLS"
+# found in the R4a drill on oc-ldn-1 (2026-10-01): archive-get chdir()s to
+# drill.conf's pg1-path, which is the monthly drill's directory, not this one
+expect "...and the copy's restore_command names its own data directory" \
+    grep -q -- "restore_command=pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east --pg1-path=$OUT/drill/manual-oc-east archive-get" "$FAKE_CALLS"
 expect "...started on its own port, off the network" grep -q -- "pg_ctl -D $OUT/drill/manual-oc-east .*port=5498 -c listen_addresses=''.*cluster_name=manual-oc-east" "$FAKE_CALLS"
 expect "...not stopped, not deleted" bash -c "! grep -q 'pg_ctl -D .* stop' '$FAKE_CALLS' && [ -d '$OUT/drill/manual-oc-east' ]"
 expect "...and it is not a drill: last-oc-east.json unchanged" test "$(cat "$OUT/drill/last-oc-east.json")" = "$before"
@@ -184,7 +188,7 @@ expect "a failed --keep restore leaves nothing behind and no drill result" \
 # ---- oc-db-drill --repo: runbook R4c, a repository clone from a ZFS snapshot (review final I4)
 drill oc-west --target '2026-10-01 01:23:45+00' --keep --repo /var/lib/pgbackrest-r4c
 expect "--repo restores from that repository" grep -q -- "^pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --repo1-path=/var/lib/pgbackrest-r4c --stanza=oc-west --pg1-path=$OUT/drill/manual-oc-west " "$FAKE_CALLS"
-expect "...and fetches its WAL from it too" grep -q -- "restore_command=pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --repo1-path=/var/lib/pgbackrest-r4c --stanza=oc-west archive-get" "$FAKE_CALLS"
+expect "...and fetches its WAL from it too" grep -q -- "restore_command=pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --repo1-path=/var/lib/pgbackrest-r4c --stanza=oc-west --pg1-path=$OUT/drill/manual-oc-west archive-get" "$FAKE_CALLS"
 drill oc-west --cleanup
 drill oc-west --target '2026-10-01 01:23:45+00' --keep --repo relative/path
 expect "--repo must be an absolute path" test "$(cat "$OUT/drill.rc")" = 2

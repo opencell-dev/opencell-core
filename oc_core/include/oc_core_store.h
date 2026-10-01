@@ -125,7 +125,8 @@ typedef enum {
     OC_CORE_AUDIT_CELL_REJECT, OC_CORE_AUDIT_ADMIN, /* an operator's command (oc-core admin) */
     OC_CORE_AUDIT_API,         /* a call on the admin API (portal spec §7): "a<account> <op> <result> ..." */
     OC_CORE_AUDIT_SUB_RELEASE, /* an unactivated number freed: "expired", "a<account>" or "u<uid>" */
-    OC_CORE_AUDIT_SUB_ENABLE
+    OC_CORE_AUDIT_SUB_ENABLE,
+    OC_CORE_AUDIT_PEER_REJECT  /* an OCSS peer refused at HELLO: "core <id> HELLO refused (<reason>)" */
 } oc_core_audit_event_t;
 
 typedef struct {

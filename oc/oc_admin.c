@@ -614,7 +614,7 @@ static const char *event_name(int e)
     static const char *const names[] = { "?",           "ACTIVATE",    "ACT_FAIL",   "REGISTER",
                                          "AUTH_FAIL",   "RESYNC",      "LOC_CANCEL", "TOKEN_ISSUE",
                                          "SUB_DISABLE", "CELL_REJECT", "ADMIN",       "API",
-                                         "SUB_RELEASE", "SUB_ENABLE" };
+                                         "SUB_RELEASE", "SUB_ENABLE",  "PEER_REJECT" };
     return e >= 0 && e < (int)(sizeof(names) / sizeof(names[0])) ? names[e] : "?";
 }
 

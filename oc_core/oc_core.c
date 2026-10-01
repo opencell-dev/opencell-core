@@ -347,6 +347,7 @@ void oc_core_tick(oc_core_t *k, uint64_t now_us)
         k->prune_at = now_us + OC_CORE_US(3600);
         oc_core_reg_tick(k);
     }
+    oc_core_peer_tick(k);
     oc_core_sw_tick(k);
 }
 

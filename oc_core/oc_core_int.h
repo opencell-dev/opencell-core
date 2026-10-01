@@ -43,4 +43,13 @@ void     oc_core_sw_rx(oc_core_t *k, uint32_t cell_id, const oc_core_msg_t *m);
 void     oc_core_sw_tick(oc_core_t *k);
 void     oc_core_sw_cell_gone(oc_core_t *k, uint32_t cell_id);
 
+/* oc_core_peer.c: to core_id's link if it is up: 0, or -1 */
+int      oc_core_peer_send(oc_core_t *k, uint16_t core_id, const oc_core_msg_t *m);
+/* the peers' liveness, from oc_core_tick */
+void     oc_core_peer_tick(oc_core_t *k);
+/* oc_core_switch.c: OCSS call control from an up peer, and a peer whose
+ * link went (every call with a leg on it ends, cause 5) */
+void     oc_core_sw_peer_rx(oc_core_t *k, uint16_t core_id, const oc_core_msg_t *m);
+void     oc_core_sw_peer_gone(oc_core_t *k, uint16_t core_id);
+
 #endif

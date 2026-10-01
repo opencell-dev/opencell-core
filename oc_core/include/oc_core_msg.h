@@ -33,6 +33,7 @@
 #define OC_CORE_AV_MAX    4u
 #define OC_CORE_REF_CORE  0x80000000u
 #define OC_OCSS_PROTO     1u /* OCSS HELLO's proto (the test-services slice: link and call control only) */
+#define OC_OCSS_OFFSET    0x40u /* an OCSS type is its §6 analogue + this */
 
 typedef enum {
     OC_CORE_HELLO = 0x01, OC_CORE_HELLO_ACK = 0x02, OC_CORE_HELLO_NAK = 0x03, OC_CORE_PING = 0x04, OC_CORE_PONG = 0x05,

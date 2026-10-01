@@ -21,6 +21,11 @@
 #define OC_CORE_PING_US  5000000u  /* PING when nothing was sent on a link for this long */
 #define OC_CORE_DEAD_US  15000000u /* a link that sent nothing for this long is down */
 #define OC_CORE_CALLS    32u
+/* OCSS peers (core test services spec §6): other cores this core has a
+ * link to. Calls go to a peer for a number in a block it is home for. */
+#define OC_CORE_PEERS      4u
+#define OC_CORE_PEER_CALLS 8u /* calls at once with a leg on one peer (spec §15.6's per-peer limit, as a count) */
+#define OC_CORE_HOP_MAX    2u /* a CALL_SETUP with a larger hop is refused (network-core spec §15.5) */
 #define OC_CORE_SETUP_US 10000000u /* CALL_ROUTE to the callee's alert or release (§7.4) */
 #define OC_CORE_ECHO_US  3000000u  /* the echo and playback services ring this long, then answer */
 /* The playback service (core test services spec §5): one payload of the
@@ -78,6 +83,19 @@ typedef struct {
     uint32_t ref;  /* CELL: the ref the leg started with; PEER: its CALL_SETUP's call_ref */
 } oc_core_leg_t;
 
+/* An OCSS link: the transport authenticated the core behind it (its
+ * pinned certificate, core_id); the link carries calls once HELLO and
+ * HELLO_ACK have agreed on that core_id ("up"). */
+typedef struct {
+    int      used;
+    uint32_t link;
+    uint16_t core_id;
+    uint8_t  dialer; /* this core dialled: it says HELLO */
+    uint8_t  up;
+    uint64_t since; /* link_up: a link not up 10 s later is dropped */
+    uint64_t last_rx, last_tx;
+} oc_core_peer_t;
+
 enum { OC_CORE_CALL_ROUTING = 1, OC_CORE_CALL_ALERTING = 2, OC_CORE_CALL_ACTIVE = 3 };
 
 typedef struct {
@@ -103,6 +121,7 @@ typedef struct {
     uint64_t        now;      /* the now_us of the call being served */
     uint64_t        prune_at; /* next pruning of issued vectors */
     oc_core_call_t  calls[OC_CORE_CALLS];
+    oc_core_peer_t  peers[OC_CORE_PEERS];
     uint32_t        next_ref; /* wraps at 2^31 (top bit is OC_CORE_REF_CORE); safe since calls[] does not survive a core restart (§7.10) */
 } oc_core_t;
 
@@ -125,6 +144,18 @@ int  oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *s
 void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_link_down(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
+
+/* OCSS links (core test services spec §6). The transport calls peer_up
+ * once TLS has shown the peer's pinned certificate (core_id is whose it
+ * is); dialer: this core dialled, and sends HELLO. Its frames go to
+ * peer_rx; a link that died goes to peer_down (calls on it end, cause 5).
+ * The links share io.send and io.close (and the transport's handle space)
+ * with the cells'. A second link to the same core replaces the first. */
+void oc_core_peer_up(oc_core_t *k, uint32_t link, uint16_t core_id, int dialer, uint64_t now_us);
+void oc_core_peer_down(oc_core_t *k, uint32_t link, uint64_t now_us);
+void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
+/* 1 if a link to core_id is up (HELLO done). */
+int  oc_core_peer_linked(const oc_core_t *k, uint16_t core_id);
 /* Liveness (PING, dead links), timers, pruning, and CELL_CFG a cell is owed:
  * a HELLO is acked even when its cell's channel list can't be read then -
  * the cell serves on the list it has (network-core spec §7.10) - and the

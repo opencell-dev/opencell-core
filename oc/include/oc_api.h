@@ -46,6 +46,22 @@
  *                                                        linked (4), activated subscribers (4), calls
  *                                                        (2), name (text), version (text)
  *   0x0F route.offer      (P5)                           always OC_API_UNSUPPORTED for now
+ *   0x10 cell.radio       cell id (4, 0: every cell)     rows, per radio of a linked cell that has
+ *                                                        reported (CELL_STATUS, NOC design §7.3): cell
+ *                                                        id (4), radio (1), role (1), band (1), fw (3),
+ *                                                        anchor (1), PPS (1), timebase (1), temp (1,
+ *                                                        int8), board uptime (4, s), reported at (4,
+ *                                                        unix s), schedules, rach, attach, grants, ACK
+ *                                                        errors, ACK late (4 each), late slots, radio
+ *                                                        errors (2 each), last radio error (2, int16),
+ *                                                        schedule misses, UART CRC errors (2 each),
+ *                                                        terminals heard (1)
+ *   0x11 reg.list         cell id (4, 0: every cell),    rows, by number, at most OC_API_REG_MAX: number,
+ *                         after (number; all zero: from  the TMID's top 16 bits (2), cell (4),
+ *                         the start)                     registered at (4, unix s: the newest REGISTER
+ *                                                        audit record, 0 none), expires (4), RSSI (2,
+ *                                                        int16 dBm), SNR (2, int16 quarter dB; both
+ *                                                        -32768: not reported), heard at (4, unix s, 0)
  *
  * The core never answers with K, OPc, SQN or a token secret; the QR text
  * of a token it has just issued is the one secret it gives (spec §7).
@@ -82,11 +98,13 @@
 #define OC_API_TOKEN_S   (72u * 3600u) /* a token the API issues: 72 h (portal spec §4.2) */
 #define OC_API_CDR_MAX   1000u
 #define OC_API_FREE_MAX  32u
+#define OC_API_REG_MAX   1000u
 
 enum {
     OC_API_NUM_FREE = 0x01, OC_API_NUM_CHECK, OC_API_SUB_CREATE, OC_API_SUB_REISSUE, OC_API_SUB_STATUS,
     OC_API_SUB_RELEASE, OC_API_SUB_DISABLE, OC_API_SUB_ENABLE, OC_API_CDR_LIST, OC_API_CELL_ADD,
     OC_API_CELL_SET_CERT, OC_API_CELL_REVOKE, OC_API_CELL_STATUS, OC_API_CORE_STATUS, OC_API_ROUTE_OFFER,
+    OC_API_CELL_RADIO, OC_API_REG_LIST,
     OC_API_OPS /* one past the last */
 };
 #define OC_API_ANSWER 0x80u /* | op */

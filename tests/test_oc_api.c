@@ -852,6 +852,181 @@ static void test_status_polls_are_audited_once_a_minute(void)
     done();
 }
 
+/* Cell `cell_id` links (link `link`) and says HELLO, then reports one radio
+ * and the terminals in tmids (RSSI -90 - i, SNR 20 + i, heard 3 s ago). */
+static void cell_reports(uint32_t link, uint32_t cell_id, const uint32_t *tmids, uint8_t nt)
+{
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_HELLO;
+    m.u.hello.proto = OC_CORE_PROTO;
+    m.u.hello.cell_id = cell_id;
+    m.u.hello.boot_id = 1;
+    oc_core_link_up(&core, link, mono);
+    oc_core_rx(&core, link, &m, mono);
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CELL_STATUS;
+    m.u.cell_status.ver = OC_CORE_STATUS_VER;
+    m.u.cell_status.part = OC_CORE_STATUS_LAST;
+    m.u.cell_status.nradio = 1;
+    oc_core_radio_t *x = &m.u.cell_status.radio[0];
+    x->role = 1;
+    x->fw[1] = 3;
+    x->anchor = 30;
+    x->pps = 1;
+    x->timebase = 1;
+    x->temp_c = 41;
+    x->uptime_s = 3600;
+    x->schedules = 30000;
+    x->rach = 12;
+    x->attach = 4;
+    x->grants = 4;
+    x->ack_err = 3;
+    x->ack_late = 2;
+    x->late_slots = 7;
+    x->radio_errors = 1;
+    x->last_radio_err = -2;
+    x->sched_misses = 5;
+    x->uart_crc = 0;
+    m.u.cell_status.nterm = nt;
+    for (uint8_t i = 0; i < nt; i++) {
+        m.u.cell_status.term[i].tmid = tmids[i];
+        m.u.cell_status.term[i].rssi_dbm = (int16_t)(-90 - i);
+        m.u.cell_status.term[i].snr_qdb = (int16_t)(20 + i);
+        m.u.cell_status.term[i].heard_age_s = 3;
+    }
+    oc_core_rx(&core, link, &m, mono);
+}
+
+/* A registration: number on cell_id as tmid, expiring at expires, with a REGISTER audit record at reg_ts. */
+static void registered(const char *number, uint32_t cell_id, uint32_t tmid, uint32_t expires, uint32_t reg_ts)
+{
+    oc_core_store_t st = oc_sql_store(sql);
+    oc_core_loc_t l;
+    memset(&l, 0, sizeof(l));
+    TEST_ASSERT_EQUAL_INT(0, oc_sig_number_to_bcd(number, strlen(number), l.number));
+    l.cell_id = cell_id;
+    l.tmid = tmid;
+    l.expires = expires;
+    TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
+    oc_core_audit_t a;
+    memset(&a, 0, sizeof(a));
+    a.ts = reg_ts;
+    a.event = OC_CORE_AUDIT_REGISTER;
+    memcpy(a.number, l.number, OC_SIG_NUMBER_LEN);
+    a.tmid = tmid;
+    a.cell_id = cell_id;
+    snprintf(a.detail, sizeof(a.detail), "test");
+    TEST_ASSERT_EQUAL_INT(0, st.audit_add(st.ctx, &a));
+}
+
+/* cell.radio (NOC design §7.1): each radio of each linked cell that has reported. */
+static void test_cell_radio(void)
+{
+    world();
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&core, 3, "Lancaster 1", OC_SIG_MODE_PART15, 0));
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&core, 4, "York 1", OC_SIG_MODE_PART15, 0));
+    req_t r;
+    begin(&r, OC_API_CELL_RADIO, 1, 0);
+    put32(&r, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(0, ANS[0].body[0]); /* nobody linked */
+    const uint32_t tmids[] = { 0x76ad0488u, 0x11220001u };
+    wall = UNIX0 + 50u;
+    cell_reports(1, 3, tmids, 2);
+    begin(&r, OC_API_CELL_RADIO, 1, 0);
+    put32(&r, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(1, ANS[0].body[0]);
+    const uint8_t *row = ANS[0].body + 1;
+    TEST_ASSERT_EQUAL_UINT32(3, get32(row));
+    TEST_ASSERT_EQUAL_UINT8(0, row[4]);                       /* radio */
+    TEST_ASSERT_EQUAL_UINT8(1, row[5]);                       /* role bs */
+    TEST_ASSERT_EQUAL_UINT8(3, row[8]);                       /* fw 0.3.0 */
+    TEST_ASSERT_EQUAL_UINT8(30, row[10]);                     /* anchor */
+    TEST_ASSERT_EQUAL_UINT8(1, row[11]);                      /* PPS locked */
+    TEST_ASSERT_EQUAL_INT8(41, (int8_t)row[13]);              /* temp */
+    TEST_ASSERT_EQUAL_UINT32(3600, get32(row + 14));          /* board uptime */
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 50u, get32(row + 18));   /* reported at */
+    TEST_ASSERT_EQUAL_UINT32(30000, get32(row + 22));         /* schedules */
+    TEST_ASSERT_EQUAL_UINT32(2, get32(row + 42));             /* ACK late */
+    TEST_ASSERT_EQUAL_UINT16(7, get16(row + 46));             /* late slots */
+    TEST_ASSERT_EQUAL_INT16(-2, (int16_t)get16(row + 50));    /* last radio error */
+    TEST_ASSERT_EQUAL_UINT16(5, get16(row + 52));             /* schedule misses */
+    TEST_ASSERT_EQUAL_UINT8(2, row[56]);                      /* terminals heard */
+    TEST_ASSERT_EQUAL_UINT(57, ANS[0].n - 1u);
+    begin(&r, OC_API_CELL_RADIO, 1, 0);
+    put32(&r, 4); /* exists, not linked: no rows */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(0, ANS[0].body[0]);
+    begin(&r, OC_API_CELL_RADIO, 1, 0);
+    put32(&r, 9);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, call1(&r));
+    begin(&r, OC_API_CELL_RADIO, 1, 0);
+    put16(&r, 0); /* too short */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    done();
+}
+
+/* reg.list (NOC design §7.1): the live registrations, by number, with
+ * their cell's signal for them and when they registered. */
+static void test_reg_list(void)
+{
+    world();
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&core, 3, "Lancaster 1", OC_SIG_MODE_PART15, 0));
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&core, 4, "York 1", OC_SIG_MODE_PART15, 0));
+    wall = UNIX0 + 100u;
+    const uint32_t tmids[] = { 0x76ad0488u };
+    cell_reports(1, 3, tmids, 1);
+    registered("+883171746412345", 3, 0x76ad0488u, UNIX0 + 3700u, UNIX0 + 90u);
+    registered("+883171746400777", 3, 0x11220001u, UNIX0 + 3700u, UNIX0 + 80u); /* not in the cell's report */
+    registered("+883171746455555", 4, 0x33440001u, UNIX0 + 3700u, UNIX0 + 70u);
+    registered("+883171746466666", 4, 0x55660001u, UNIX0 + 99u, UNIX0 + 10u); /* expired */
+    req_t r;
+    begin(&r, OC_API_REG_LIST, 1, 0);
+    put32(&r, 0);
+    put(&r, (uint8_t[OC_SIG_NUMBER_LEN]){ 0 }, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(3, ANS[0].body[0]);
+    const uint8_t *row = ANS[0].body + 1;
+    char t[OC_SIG_NUMBER_TEXT];
+    num_text(row, t);
+    TEST_ASSERT_EQUAL_STRING("+883171746400777", t); /* by number */
+    TEST_ASSERT_EQUAL_INT16(OC_CORE_STATUS_NONE, (int16_t)get16(row + 22));
+    TEST_ASSERT_EQUAL_UINT32(0, get32(row + 26));
+    row += 30;
+    num_text(row, t);
+    TEST_ASSERT_EQUAL_STRING("+883171746412345", t);
+    TEST_ASSERT_EQUAL_HEX16(0x76ad, get16(row + 8));
+    TEST_ASSERT_EQUAL_UINT32(3, get32(row + 10));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 90u, get32(row + 14));   /* registered at */
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 3700u, get32(row + 18)); /* expires */
+    TEST_ASSERT_EQUAL_INT16(-90, (int16_t)get16(row + 22));
+    TEST_ASSERT_EQUAL_INT16(20, (int16_t)get16(row + 24));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 97u, get32(row + 26));   /* heard 3 s before the report */
+    row += 30;
+    num_text(row, t);
+    TEST_ASSERT_EQUAL_STRING("+883171746455555", t);
+
+    begin(&r, OC_API_REG_LIST, 1, 0); /* one cell, after a number */
+    put32(&r, 3);
+    put_num(&r, "+883171746400777");
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(1, ANS[0].body[0]);
+    num_text(ANS[0].body + 1, t);
+    TEST_ASSERT_EQUAL_STRING("+883171746412345", t);
+
+    begin(&r, OC_API_REG_LIST, 1, 0);
+    put32(&r, 9);
+    put(&r, (uint8_t[OC_SIG_NUMBER_LEN]){ 0 }, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, call1(&r));
+    begin(&r, OC_API_REG_LIST, 1, 0);
+    put32(&r, 0);
+    put(&r, (uint8_t[OC_SIG_NUMBER_LEN]){ 0x12, 0x34, 0, 0, 0, 0, 0, 0 }, OC_SIG_NUMBER_LEN); /* not a number */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    done();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -871,5 +1046,7 @@ int main(void)
     RUN_TEST(test_unsupported_operations_are_rate_limited_too);
     RUN_TEST(test_releasing_a_free_number_is_ok);
     RUN_TEST(test_status_polls_are_audited_once_a_minute);
+    RUN_TEST(test_cell_radio);
+    RUN_TEST(test_reg_list);
     return UNITY_END();
 }

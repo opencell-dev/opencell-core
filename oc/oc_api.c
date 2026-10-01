@@ -27,6 +27,7 @@ static const struct {
     [OC_API_CELL_SET_CERT] = { "cell.set_cert", 20, 5 }, [OC_API_CELL_REVOKE] = { "cell.revoke", 10, 5 },
     [OC_API_CELL_STATUS] = { "cell.status", 1200, 60 },  [OC_API_CORE_STATUS] = { "core.status", 1200, 60 },
     [OC_API_ROUTE_OFFER] = { "route.offer", 10, 2 },
+    [OC_API_CELL_RADIO] = { "cell.radio", 1200, 60 },    [OC_API_REG_LIST] = { "reg.list", 600, 30 },
 };
 
 const char *oc_api_op_name(unsigned op)
@@ -661,6 +662,129 @@ static uint8_t op_cell_status(call_t *c)
     return OC_API_OK;
 }
 
+/* A cell named in a request exists: OK, NOT_FOUND or UNAVAILABLE (0: every cell). */
+static uint8_t cell_known(call_t *c, uint32_t id)
+{
+    if (id == 0) return OC_API_OK;
+    oc_core_store_t st = store(c->a);
+    oc_core_cell_t cell;
+    int g = st.cell_get(st.ctx, id, &cell);
+    if (g == OC_CORE_STORE_NONE) return fail(c, OC_API_NOT_FOUND, "no such cell");
+    return g == 0 ? OC_API_OK : fail(c, OC_API_UNAVAILABLE, "store error");
+}
+
+static uint8_t op_cell_radio(call_t *c)
+{
+    uint32_t id = rd_u32(&c->r);
+    if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
+    c->a->audit_cell = id;
+    uint8_t known = cell_known(c, id);
+    if (known != OC_API_OK) return known;
+    list_start(&c->w);
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
+        const oc_core_link_t *l = &c->a->core->links[i];
+        if (!l->used || l->cell_id == 0 || (id != 0 && l->cell_id != id)) continue;
+        const oc_core_tel_t *t = oc_core_cell_tel(c->a->core, l->cell_id);
+        for (uint8_t k = 0; t != NULL && k < t->nradio; k++) {
+            const oc_core_radio_t *x = &t->radio[k];
+            wr_t row = { .n = 0 };
+            wr_u32(&row, l->cell_id);
+            wr_u8(&row, x->radio);
+            wr_u8(&row, x->role);
+            wr_u8(&row, x->band);
+            wr_bytes(&row, x->fw, 3);
+            wr_u8(&row, x->anchor);
+            wr_u8(&row, x->pps);
+            wr_u8(&row, x->timebase);
+            wr_u8(&row, (uint8_t)x->temp_c);
+            wr_u32(&row, x->uptime_s);
+            wr_u32(&row, t->at);
+            wr_u32(&row, x->schedules);
+            wr_u32(&row, x->rach);
+            wr_u32(&row, x->attach);
+            wr_u32(&row, x->grants);
+            wr_u32(&row, x->ack_err);
+            wr_u32(&row, x->ack_late);
+            wr_u16(&row, x->late_slots);
+            wr_u16(&row, x->radio_errors);
+            wr_u16(&row, (uint16_t)x->last_radio_err);
+            wr_u16(&row, x->sched_misses);
+            wr_u16(&row, x->uart_crc);
+            wr_u8(&row, t->nterm);
+            list_row(&c->w, row.b, row.n);
+        }
+    }
+    return OC_API_OK;
+}
+
+/* A terminal's signal from its cell's latest report: RSSI, SNR, heard at. */
+static void signal_of(const oc_api_t *a, uint32_t cell_id, uint32_t tmid, int16_t *rssi, int16_t *snr, uint32_t *heard)
+{
+    const oc_core_tel_t *t = oc_core_cell_tel(a->core, cell_id);
+    *rssi = *snr = OC_CORE_STATUS_NONE;
+    *heard = 0;
+    for (uint8_t i = 0; t != NULL && i < t->nterm; i++) {
+        const oc_core_term_sig_t *s = &t->term[i];
+        if (s->tmid != tmid || s->rssi_dbm == OC_CORE_STATUS_NONE) continue;
+        *rssi = s->rssi_dbm;
+        *snr = s->snr_qdb;
+        *heard = s->heard_age_s == 65535u || s->heard_age_s > t->at ? 0 : t->at - s->heard_age_s;
+        return;
+    }
+}
+
+static uint8_t op_reg_list(call_t *c)
+{
+    static const uint8_t none[OC_SIG_NUMBER_LEN];
+    uint32_t id = rd_u32(&c->r);
+    const uint8_t *after = rd_bytes(&c->r, OC_SIG_NUMBER_LEN);
+    if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
+    int from_start = memcmp(after, none, sizeof(none)) == 0;
+    if (!from_start && !oc_sig_number_valid(after)) return fail(c, OC_API_INVALID, "after: not a full number");
+    c->a->audit_cell = id;
+    uint8_t known = cell_known(c, id);
+    if (known != OC_API_OK) return known;
+    char after_text[OC_SIG_NUMBER_TEXT] = "";
+    if (!from_start) oc_sig_number_to_text(after, after_text);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT l.number, l.tmid, l.cell_id, l.expires,"
+             " (SELECT max(a.ts) FROM audit a WHERE a.number = l.number AND a.event = %d)"
+             " FROM location l WHERE l.expires > ?1 AND (?2 = 0 OR l.cell_id = ?2) AND l.number > ?3"
+             " ORDER BY l.number LIMIT %u",
+             OC_CORE_AUDIT_REGISTER, OC_API_REG_MAX);
+    sqlite3_stmt *st = q(c->a, sql);
+    int rc = st != NULL ? sqlite3_bind_int64(st, 1, c->a->unix_now()) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, after_text, -1, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return fail(c, OC_API_UNAVAILABLE, "store error");
+    }
+    list_start(&c->w);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        uint8_t n[OC_SIG_NUMBER_LEN];
+        if (num_col(st, 0, n) != 0) continue; /* a row oc_core never wrote */
+        uint32_t tmid = (uint32_t)sqlite3_column_int64(st, 1), cell = (uint32_t)sqlite3_column_int64(st, 2);
+        int16_t rssi, snr;
+        uint32_t heard;
+        signal_of(c->a, cell, tmid, &rssi, &snr, &heard);
+        wr_t row = { .n = 0 };
+        wr_bytes(&row, n, OC_SIG_NUMBER_LEN);
+        wr_u16(&row, (uint16_t)(tmid >> 16));
+        wr_u32(&row, cell);
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 4));
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 3));
+        wr_u16(&row, (uint16_t)rssi);
+        wr_u16(&row, (uint16_t)snr);
+        wr_u32(&row, heard);
+        list_row(&c->w, row.b, row.n);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return fail(c, OC_API_UNAVAILABLE, "store error");
+    return OC_API_OK;
+}
+
 static uint8_t op_core_status(call_t *c)
 {
     if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
@@ -780,7 +904,7 @@ static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
  * audited once a minute per actor (oc_api.h). */
 static int quiet_op(unsigned op)
 {
-    return op == OC_API_CELL_STATUS || op == OC_API_CORE_STATUS;
+    return op == OC_API_CELL_STATUS || op == OC_API_CORE_STATUS || op == OC_API_CELL_RADIO || op == OC_API_REG_LIST;
 }
 
 /* The minute's count of op's quiet calls, as one record; the minute closed.
@@ -902,6 +1026,8 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         case OC_API_CELL_REVOKE: status = op_cell_change(&c, op); break;
         case OC_API_CELL_STATUS: status = op_cell_status(&c); break;
         case OC_API_CORE_STATUS: status = op_core_status(&c); break;
+        case OC_API_CELL_RADIO: status = op_cell_radio(&c); break;
+        case OC_API_REG_LIST: status = op_reg_list(&c); break;
         default: status = op_sub_change(&c, op, actor); break;
         }
         if (status == OC_API_OK && c.w.err) status = fail(&c, OC_API_UNAVAILABLE, "answer too long");

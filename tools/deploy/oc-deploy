@@ -12,8 +12,9 @@
 # submodules checked out; only tags vX.Y.Z are deployed. The tag's tree and
 # every submodule's tree at the commit the tag pins (recursively) are
 # packed, copied over SSH (HOST is [user@]host as in ~/.ssh/config, or a
-# Tailscale name; OC_DEPLOY_JUMP=user@jump:port adds a jump host, e.g. the
-# core VM: OC_DEPLOY_JUMP=root@147.135.11.61:222 ... opencell@10.0.0.60),
+# Tailscale name; OC_DEPLOY_JUMP=[user@]host[:port] (or a plain alias from
+# ~/.ssh/config) adds a jump host, e.g. the core VM: OC_DEPLOY_JUMP=ovh-pve
+# ... opencell@10.0.0.60),
 # built on the host as the SSH user with the tests off (Debian 13: cmake,
 # make, gcc, libssl-dev, libsqlite3-dev), and installed by root (the SSH
 # user needs passwordless sudo, or is root):

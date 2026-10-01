@@ -217,8 +217,10 @@ int  oc_core_cell_add(oc_core_t *k, uint32_t cell_id, const char *name, uint8_t 
 int  oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us);
 /* A cell's mode (OC_SIG_MODE_PART15 or _PART97), as `oc-core admin cell
  * mode` sets it: stored, and the cell's link dropped so it reconnects and
- * takes it from HELLO_ACK (its calls end). 0; -1 no such cell or a bad
- * mode; -2 the store failed; -3 the cell is revoked (nothing changed). */
+ * takes it from HELLO_ACK (its calls end). 0 changed; 1 it already had
+ * that mode (final review M4: idempotent, so a retried call does not drop
+ * a cell that already reconnected); -1 no such cell or a bad mode; -2 the
+ * store failed; -3 the cell is revoked (nothing changed). */
 int  oc_core_cell_mode(oc_core_t *k, uint32_t cell_id, uint8_t mode, uint64_t now_us);
 /* The linked cell's latest whole CELL_STATUS, or NULL (not linked, or no
  * report since it linked). */

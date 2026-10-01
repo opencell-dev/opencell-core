@@ -430,6 +430,7 @@ int oc_core_cell_mode(oc_core_t *k, uint32_t cell_id, uint8_t mode, uint64_t now
     if (got == OC_CORE_STORE_NONE) return -1;
     if (got != 0) return -2;
     if (!c.enabled) return -3;
+    if (c.mode == mode) return 1; /* already that mode (final review M4): no drop, a retry is harmless */
     c.mode = mode;
     if (k->st.cell_put(k->st.ctx, &c) != 0) return -2;
     oc_core_link_t *l = link_of_cell(k, cell_id);

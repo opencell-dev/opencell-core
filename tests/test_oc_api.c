@@ -1244,6 +1244,14 @@ static void test_cell_mode(void)
     TEST_ASSERT_EQUAL_INT(0, st.cell_get(st.ctx, 3, &cell));
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, cell.mode);
 
+    /* final review M4: already that mode - audited as unchanged, OK */
+    begin(&r, OC_API_CELL_MODE, 1, 42);
+    put32(&r, 3);
+    put8(&r, 2);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    last_audit(detail, sizeof(detail), number, sizeof(number));
+    TEST_ASSERT_EQUAL_STRING("a42 cell.mode ok part97 unchanged", detail);
+
     begin(&r, OC_API_CELL_MODE, 1, 42);
     put32(&r, 3);
     put8(&r, 3);

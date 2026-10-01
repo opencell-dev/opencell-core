@@ -503,6 +503,11 @@ static void test_a_mode_change_drops_the_link_and_the_next_hello_takes_it(void)
     hello(11, 1, 1);
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, sent(11, OC_CORE_HELLO_ACK)->u.hello_ack.mode);
 
+    /* final review M4: already that mode - no drop (a retried call is harmless) */
+    int closed_before = NCLOSED;
+    TEST_ASSERT_EQUAL_INT(1, oc_core_cell_mode(&K, 1, OC_SIG_MODE_PART97, NOW));
+    TEST_ASSERT_EQUAL_INT(closed_before, NCLOSED);
+
     TEST_ASSERT_EQUAL_INT(-1, oc_core_cell_mode(&K, 9, OC_SIG_MODE_PART97, NOW)); /* no such cell */
     TEST_ASSERT_EQUAL_INT(-1, oc_core_cell_mode(&K, 1, 7, NOW));                  /* no such mode */
     TEST_ASSERT_EQUAL_INT(0, oc_core_cell_revoke(&K, 2, NOW));

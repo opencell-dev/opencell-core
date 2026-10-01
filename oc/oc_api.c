@@ -953,6 +953,9 @@ static uint8_t op_cell_mode(call_t *c)
     snprintf(c->a->audit_what, sizeof(c->a->audit_what), "%s", mode == 2 ? "part97" : "part15");
     switch (oc_core_cell_mode(c->a->core, id, mode == 2 ? OC_SIG_MODE_PART97 : OC_SIG_MODE_PART15, c->a->now_us())) {
     case 0: return OC_API_OK;
+    case 1: /* final review M4: already that mode - no drop, audited as unchanged */
+        snprintf(c->a->audit_what, sizeof(c->a->audit_what), "%s unchanged", mode == 2 ? "part97" : "part15");
+        return OC_API_OK;
     case -1: return fail(c, OC_API_NOT_FOUND, "no such cell");
     case -3: return fail(c, OC_API_INVALID, "revoked");
     default: return fail(c, OC_API_UNAVAILABLE, "store error");

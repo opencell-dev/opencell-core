@@ -132,7 +132,7 @@ expect "it restored to a time with the drill config and promotes" \
 expect "the restore reads the passphrase's include directory" \
     grep -q -- "^pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east --pg1-path=" "$FAKE_CALLS"
 expect "...and so does the restore_command it writes" \
-    grep -q -- "restore_command=pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east archive-get" "$FAKE_CALLS"
+    grep -q -- "restore_command=pgbackrest --config=/etc/pgbackrest/drill.conf --config-include-path=/etc/pgbackrest/conf.d --stanza=oc-east --pg1-path=$OUT/drill/oc-east archive-get" "$FAKE_CALLS"
 expect "it started the copy off the network, without a sync standby" \
     grep -q -- "listen_addresses='' .*synchronous_standby_names=" "$FAKE_CALLS"
 expect "it stopped the copy and deleted it" bash -c "grep -q 'pg_ctl -D $OUT/drill/oc-east -m fast' '$FAKE_CALLS' && [ ! -e '$OUT/drill/oc-east' ]"

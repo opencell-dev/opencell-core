@@ -71,6 +71,33 @@ static void media_to(oc_core_t *k, const oc_core_leg_t *leg, uint16_t seq, const
     leg_send(k, leg, &m);
 }
 
+/* 1 if a MEDIA from a peer leg into a cell leg may go on now, else 0 (and
+ * counted in c->relay_dropped): review I2's token bucket, depth
+ * OC_CORE_RELAY_DEPTH, refilled one token every OC_CORE_PLAY_US. First use
+ * of a call (relay_refill_us still 0) starts full. */
+static int relay_allowed(oc_core_t *k, oc_core_call_t *c)
+{
+    const uint32_t max_x1000 = OC_CORE_RELAY_DEPTH * 1000u;
+    if (c->relay_refill_us == 0) {
+        c->relay_refill_us = k->now;
+        c->relay_tokens_x1000 = max_x1000;
+    } else if (k->now > c->relay_refill_us) {
+        uint64_t n = (k->now - c->relay_refill_us) / OC_CORE_PLAY_US;
+        if (n > 0) {
+            uint64_t add = n * 1000u;
+            c->relay_tokens_x1000 =
+                (uint32_t)(add >= max_x1000 - c->relay_tokens_x1000 ? max_x1000 : c->relay_tokens_x1000 + add);
+            c->relay_refill_us += n * OC_CORE_PLAY_US;
+        }
+    }
+    if (c->relay_tokens_x1000 < 1000u) {
+        c->relay_dropped++;
+        return 0;
+    }
+    c->relay_tokens_x1000 -= 1000u;
+    return 1;
+}
+
 static void cdr(oc_core_t *k, const oc_core_call_t *c, uint8_t cause)
 {
     oc_core_cdr_t r;
@@ -97,6 +124,10 @@ static void end_call(oc_core_t *k, oc_core_call_t *c, uint8_t cause)
     if (c->b.kind == OC_CORE_LEG_PLAY && c->answer != 0) {
         oc_core_logf(k, "call %08x: playback sent %u payloads, skipped %u", (unsigned)c->a.ref, (unsigned)c->play_sent,
                      (unsigned)c->play_skipped);
+    }
+    if (c->relay_dropped != 0) { /* review I2: a peer's MEDIA this core would not pass to the cell at once */
+        oc_core_logf(k, "call %08x: relay dropped %u MEDIA (peer -> cell budget)", (unsigned)c->a.ref,
+                     (unsigned)c->relay_dropped);
     }
     cdr(k, c, cause);
     oc_core_logf(k, "call %08x/%08x ended, cause %u", (unsigned)c->a.ref, (unsigned)c->b.ref, cause);
@@ -379,7 +410,7 @@ static void leg_rx(oc_core_t *k, oc_core_call_t *c, oc_core_leg_t *leg, oc_core_
         to_leg(k, other, OC_CORE_CALL_RELEASE, m->u.call.cause); /* the same cause on the other leg */
         end_call(k, c, m->u.call.cause);
         break;
-    case OC_CORE_MEDIA:
+    case OC_CORE_MEDIA: {
         if (c->state != OC_CORE_CALL_ACTIVE) break;
         if (other->kind == OC_CORE_LEG_PLAY) {
             /* the caller's terminal is connected: the clip may start now */
@@ -387,8 +418,13 @@ static void leg_rx(oc_core_t *k, oc_core_call_t *c, oc_core_leg_t *leg, oc_core_
             break;
         }
         /* the echo service sends it back */
-        media_to(k, other->kind == OC_CORE_LEG_ECHO ? leg : other, m->u.media.seq, m->u.media.data, m->u.media.len);
+        const oc_core_leg_t *dest = other->kind == OC_CORE_LEG_ECHO ? leg : other;
+        /* review I2: a peer's own pacing does not protect this core's cell
+         * from a burst (a stalled link delivering several at once) */
+        if (leg->kind == OC_CORE_LEG_PEER && dest->kind == OC_CORE_LEG_CELL && !relay_allowed(k, c)) break;
+        media_to(k, dest, m->u.media.seq, m->u.media.data, m->u.media.len);
         break;
+    }
     default:
         break;
     }

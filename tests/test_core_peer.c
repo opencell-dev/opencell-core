@@ -444,6 +444,34 @@ static void test_a_call_setup_with_the_wrong_direction_bit_or_no_core_bit_is_ref
     TEST_ASSERT_EQUAL_HEX8(OC_SIG_CAUSE_NET_FAILURE, setup_cause(81u, ECHO2, 0));
 }
 
+/* Review I2: a stalled OCSS link (a WireGuard RTO) can deliver several
+ * MEDIA at once; the relay from a peer leg into a cell leg must not pass
+ * more than OC_CORE_RELAY_DEPTH of them on in one turn, however many the
+ * peer sent, so the cell's shared, 8-deep DL queue never takes a burst. */
+static void test_a_peer_media_burst_into_the_cell_is_rate_limited(void)
+{
+    world();
+    dial(ECHO2);
+    advance(OC_CORE_ECHO_US); /* answered: the call is ACTIVE, b is the peer leg to core 2 */
+    uint32_t ref = 0;
+    for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+        if (C1.k.calls[i].used && C1.k.calls[i].b.kind == OC_CORE_LEG_PEER) ref = C1.k.calls[i].b.ref;
+    }
+    TEST_ASSERT_NOT_EQUAL(0, ref);
+    int before = NCELL;
+    for (int i = 0; i < 10; i++) { /* ten payloads from the peer, all in this one turn */
+        oc_core_msg_t m;
+        memset(&m, 0, sizeof(m));
+        m.type = OC_OCSS_MEDIA;
+        m.u.media.ref = ref;
+        m.u.media.seq = (uint16_t)i;
+        m.u.media.len = 3;
+        memcpy(m.u.media.data, "ABC", 3);
+        oc_core_peer_rx(&C1.k, L1, &m, NOW);
+    }
+    TEST_ASSERT_LESS_OR_EQUAL(OC_CORE_RELAY_DEPTH, (uint32_t)cell_count(before, OC_CORE_MEDIA));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -459,5 +487,6 @@ int main(void)
     RUN_TEST(test_core_2_never_sends_a_call_on_and_limits_a_peer);
     RUN_TEST(test_both_cores_first_calls_at_once_do_not_collide);
     RUN_TEST(test_a_call_setup_with_the_wrong_direction_bit_or_no_core_bit_is_refused);
+    RUN_TEST(test_a_peer_media_burst_into_the_cell_is_rate_limited);
     return UNITY_END();
 }

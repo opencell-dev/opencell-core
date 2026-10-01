@@ -36,6 +36,11 @@
 #define OC_CORE_PLAY_LATE_US 240000u         /* a payload this late is skipped, never sent in a burst */
 #define OC_CORE_PLAY_MAX_US  600000000ull    /* the service hangs up (cause 0) after 10 min connected */
 #define OC_CORE_CLIP_MAX     (OC_CORE_PLAY_BYTES * 5000u) /* 10 min of clip */
+/* The relay budget from a peer leg into a cell leg (review I2): at most
+ * this many MEDIA at once, refilled at OC_CORE_PLAY_US (the voice spec §3
+ * frame), so a burst after a stalled OCSS link can't fill the cell's
+ * shared, 8-deep DL queue. */
+#define OC_CORE_RELAY_DEPTH  2u
 
 typedef struct {
     uint16_t core_id;
@@ -110,6 +115,14 @@ typedef struct {
     uint32_t      play_at;       /* the clip offset of the next payload */
     uint16_t      play_seq;      /* its MEDIA seq */
     uint32_t      play_sent, play_skipped;
+    /* A leg is a peer, the other a cell: a token bucket (review I2) bounds
+     * MEDIA relayed from the peer into the cell's DL queue, so a burst from
+     * a stalled link (the peer's own pacing does not protect this core's
+     * cell) can't fill it. OC_CORE_RELAY_DEPTH tokens, refilled one every
+     * OC_CORE_PLAY_US (the spec §3 frame); x1000: fixed point, 1000 = 1 token. */
+    uint32_t      relay_tokens_x1000;
+    uint64_t      relay_refill_us;
+    uint32_t      relay_dropped;
 } oc_core_call_t;
 
 typedef struct {

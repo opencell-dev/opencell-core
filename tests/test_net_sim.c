@@ -524,6 +524,106 @@ static void in_a_cross_cell_call(void)
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_IN_CALL, state(1));
 }
 
+/* Cell 0's leg for terminal i (the core's MEDIA names it by ref). */
+static const oc_cell_leg_t *leg_on(int cell, int i)
+{
+    for (unsigned k = 0; k < OC_SIG_NET_TERMS; k++) {
+        const oc_cell_leg_t *l = &CELL[cell].c.legs[k];
+        if (l->used && l->tmid == TERM[i].tmid) return l;
+    }
+    return NULL;
+}
+
+static char cell_log[16][160];
+static int  ncell_log;
+static void cell_log_cap(void *ctx, const char *line)
+{
+    (void)ctx;
+    snprintf(cell_log[ncell_log % 16], sizeof(cell_log[0]), "%s", line);
+    ncell_log++;
+}
+static int cell_logged(const char *what)
+{
+    for (int i = 0; i < ncell_log && i < 16; i++) if (strstr(cell_log[i], what) != NULL) return 1;
+    return 0;
+}
+
+/* Media gate (core-test-services spec §14 F1): MEDIA from the core for a leg
+ * the far end has answered but the terminal hasn't confirmed (C_MO_CONNECTING)
+ * never reaches the air - it would have gone in the clear - and the cell
+ * counts and logs it. The call then connects and carries media as usual. */
+static void test_early_media_is_refused_and_counted(void)
+{
+    sim_world();
+    CELL[0].c.io.log = cell_log_cap;
+    ncell_log = 0;
+    registered_on(0, 0);
+    registered_on(1, 1);
+    forget_events();
+    dial(0, "606-555-01231");
+    run_ms(3000);
+    press(1, OC_SIG_CMD_ANSWER);
+    int seen = 0;
+    for (int f = 0; f < 50 && !seen; f++) {
+        frame();
+        const oc_sig_net_sess_t *s = sess_on(0, 0);
+        if (s == NULL || s->call != 3 /* C_MO_CONNECTING */) continue;
+        seen = 1;
+        const oc_cell_leg_t *l = leg_on(0, 0);
+        TEST_ASSERT_NOT_NULL(l);
+        oc_core_msg_t m;
+        memset(&m, 0, sizeof(m));
+        m.type = OC_CORE_MEDIA;
+        m.u.media.ref = l->ref;
+        m.u.media.len = 5;
+        memcpy(m.u.media.data, "EARLY", 5);
+        int dl = TERM[0].dl.count;
+        uint32_t before = CELL[0].c.media_refused;
+        oc_cell_core_rx(&CELL[0].c, &m, now);
+        oc_cell_core_rx(&CELL[0].c, &m, now);
+        TEST_ASSERT_EQUAL_INT(dl, TERM[0].dl.count); /* nothing for the air */
+        TEST_ASSERT_EQUAL_UINT32(before + 2u, CELL[0].c.media_refused);
+        TEST_ASSERT_TRUE(cell_logged("MEDIA refused"));
+    }
+    TEST_ASSERT_TRUE_MESSAGE(seen, "the caller's leg was never seen connecting");
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_IN_CALL, state(0));
+    talk(1, "HI");
+    run_ms(1000);
+    TEST_ASSERT_EQUAL_MEMORY("HI", TERM[0].app, 2);
+    press(0, OC_SIG_CMD_HANGUP);
+    run_ms(3000);
+    TEST_ASSERT_TRUE(cell_logged("2 MEDIA refused"));
+    CELL[0].c.io.log = NULL;
+}
+
+/* Media-gate review I2: the core's HELLO_ACK brings a new mode (oc-core admin
+ * cell mode): every call on a session registered in the old mode ends
+ * (NET_FAILURE), here a cross-cell call's leg and so the far leg too. An
+ * unknown mode changes nothing. */
+static void test_a_new_mode_from_the_core_ends_calls(void)
+{
+    sim_world();
+    in_a_cross_cell_call();
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_HELLO_ACK;
+    m.u.hello_ack.period_s = 1800;
+    oc_sig_number_to_bcd(SIM_ECHO, strlen(SIM_ECHO), m.u.hello_ack.echo_number);
+    m.u.hello_ack.mode = 3;
+    oc_cell_core_rx(&CELL[0].c, &m, now);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART15, CELL[0].c.net.cfg.mode);
+    run_ms(2000);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_IN_CALL, state(0));
+    m.u.hello_ack.mode = OC_SIG_MODE_PART97;
+    oc_cell_core_rx(&CELL[0].c, &m, now);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, CELL[0].c.net.cfg.mode);
+    run_ms(4000);
+    TEST_ASSERT_EQUAL_INT(OC_SIG_CAUSE_NET_FAILURE, ended(0));
+    TEST_ASSERT_NOT_EQUAL(-1, ended(1));
+    TEST_ASSERT_NOT_EQUAL(OC_SIG_ST_IN_CALL, state(1));
+}
+
 /* §7.8: T0 leaves cell 1 while idle and attaches to cell 2; it registers
  * there by itself, cell 1 is told to drop it, and a call to T0 rings on
  * cell 2. */
@@ -1023,6 +1123,8 @@ int main(void)
     RUN_TEST(test_reject_busy_unreachable_no_answer);
     RUN_TEST(test_both_dial_each_other_at_once);
     RUN_TEST(test_echo_service);
+    RUN_TEST(test_early_media_is_refused_and_counted);
+    RUN_TEST(test_a_new_mode_from_the_core_ends_calls);
     RUN_TEST(test_idle_move_between_cells);
     RUN_TEST(test_reactivation_on_a_new_terminal_elsewhere);
     RUN_TEST(test_cell_restart_mid_call);

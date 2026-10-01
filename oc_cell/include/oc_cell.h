@@ -77,6 +77,7 @@ typedef struct {
     oc_cell_reg_t regs[OC_SIG_NET_TERMS];
     uint32_t      av_count; /* vectors taken from AV_RES so far (wraps after 2^32: not in a cell's life) */
     oc_cell_av_seen_t av_seen[OC_SIG_NET_TERMS];
+    uint32_t      media_refused; /* MEDIA from the core oc_sig_net refused (a leg not active yet: media gate) */
 } oc_cell_t;
 
 void oc_cell_init(oc_cell_t *c, const oc_cell_io_t *io, const oc_cell_cfg_t *cfg);

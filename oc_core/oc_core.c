@@ -144,6 +144,7 @@ void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us)
             l->used = 1;
             l->link = link;
             l->last_rx = l->last_tx = now_us;
+            l->tel_next = 0xFF;
             return;
         }
     }
@@ -286,6 +287,42 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     send_list(k, l, c.list_id, now);
 }
 
+/* CELL_STATUS: parts 0, 1, ... gathered in tel_in, published in tel at the
+ * last. A part out of order drops what was gathered (the next report
+ * starts again at part 0); what does not fit the core's room is left out. */
+static void on_status(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m)
+{
+    uint8_t idx = (uint8_t)(m->u.cell_status.part & ~OC_CORE_STATUS_LAST);
+    if (idx == 0) {
+        memset(&l->tel_in, 0, sizeof(l->tel_in));
+        l->tel_next = 0;
+    }
+    if (idx != l->tel_next) {
+        l->tel_next = 0xFF;
+        return;
+    }
+    oc_core_tel_t *t = &l->tel_in;
+    for (uint8_t i = 0; i < m->u.cell_status.nradio && t->nradio < OC_CORE_TEL_RADIOS; i++) {
+        t->radio[t->nradio++] = m->u.cell_status.radio[i];
+    }
+    for (uint8_t i = 0; i < m->u.cell_status.nterm && t->nterm < OC_CORE_TEL_TERMS; i++) {
+        t->term[t->nterm++] = m->u.cell_status.term[i];
+    }
+    if (m->u.cell_status.part & OC_CORE_STATUS_LAST) {
+        t->at = k->io.unix_now(k->io.ctx);
+        l->tel = *t;
+        l->tel_next = 0xFF;
+    } else {
+        l->tel_next = (uint8_t)(idx + 1u);
+    }
+}
+
+const oc_core_tel_t *oc_core_cell_tel(const oc_core_t *k, uint32_t cell_id)
+{
+    const oc_core_link_t *l = link_of_cell((oc_core_t *)k, cell_id);
+    return l != NULL && l->tel.at != 0 ? &l->tel : NULL;
+}
+
 void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us)
 {
     k->now = now_us;
@@ -320,6 +357,9 @@ void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t no
     case OC_CORE_CALL_RELEASE:
     case OC_CORE_MEDIA:
         oc_core_sw_rx(k, l->cell_id, m);
+        break;
+    case OC_CORE_CELL_STATUS:
+        on_status(k, l, m);
         break;
     default:
         break;
@@ -378,6 +418,24 @@ int oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us)
     if (k->st.cell_put(k->st.ctx, &c) != 0) return -1;
     oc_core_link_t *l = link_of_cell(k, cell_id);
     if (l != NULL) drop(k, l, now_us);
+    return 0;
+}
+
+int oc_core_cell_mode(oc_core_t *k, uint32_t cell_id, uint8_t mode, uint64_t now_us)
+{
+    oc_core_cell_t c;
+    k->now = now_us;
+    if (mode != OC_SIG_MODE_PART15 && mode != OC_SIG_MODE_PART97) return -1;
+    int got = cell_id == 0 ? OC_CORE_STORE_NONE : k->st.cell_get(k->st.ctx, cell_id, &c);
+    if (got == OC_CORE_STORE_NONE) return -1;
+    if (got != 0) return -2;
+    if (!c.enabled) return -3;
+    c.mode = mode;
+    if (k->st.cell_put(k->st.ctx, &c) != 0) return -2;
+    oc_core_link_t *l = link_of_cell(k, cell_id);
+    if (l != NULL) drop(k, l, now_us);
+    oc_core_logf(k, "cell %u: mode %s; it takes it at its next HELLO", (unsigned)cell_id,
+                 mode == OC_SIG_MODE_PART97 ? "part97" : "part15");
     return 0;
 }
 

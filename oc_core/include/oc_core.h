@@ -67,6 +67,19 @@ typedef struct {
     void     (*log)(void *ctx, const char *line);
 } oc_core_io_t;
 
+/* A cell's latest CELL_STATUS (NOC design §7.3), whole: its parts are
+ * gathered in the link's tel_in and published here once the last one
+ * arrives. In memory only, gone with the link; read by the admin API. */
+#define OC_CORE_TEL_RADIOS 4u
+#define OC_CORE_TEL_TERMS  64u
+
+typedef struct {
+    uint32_t           at; /* unix s the last part arrived; 0: no report yet */
+    uint8_t            nradio, nterm;
+    oc_core_radio_t    radio[OC_CORE_TEL_RADIOS];
+    oc_core_term_sig_t term[OC_CORE_TEL_TERMS];
+} oc_core_tel_t;
+
 typedef struct {
     int      used;
     uint32_t link;
@@ -75,6 +88,8 @@ typedef struct {
     uint8_t  cfg_pending;  /* CELL_CFG is owed to this cell: retried from oc_core_tick */
     uint8_t  cfg_backoff_s; /* the next retry's wait: 1 s doubling to 60 s */
     uint64_t cfg_retry_at;
+    oc_core_tel_t tel, tel_in; /* the published report, and the one being gathered */
+    uint8_t  tel_next;         /* the part tel_in expects next; 0xFF: none (wait for part 0) */
 } oc_core_link_t;
 
 /* One leg of a call (core test services spec §4): a cell's leg, one of
@@ -200,6 +215,14 @@ uint64_t oc_core_due(const oc_core_t *k);
  * it and drops its link. */
 int  oc_core_cell_add(oc_core_t *k, uint32_t cell_id, const char *name, uint8_t mode, uint16_t list_id);
 int  oc_core_cell_revoke(oc_core_t *k, uint32_t cell_id, uint64_t now_us);
+/* A cell's mode (OC_SIG_MODE_PART15 or _PART97), as `oc-core admin cell
+ * mode` sets it: stored, and the cell's link dropped so it reconnects and
+ * takes it from HELLO_ACK (its calls end). 0; -1 no such cell or a bad
+ * mode; -2 the store failed; -3 the cell is revoked (nothing changed). */
+int  oc_core_cell_mode(oc_core_t *k, uint32_t cell_id, uint8_t mode, uint64_t now_us);
+/* The linked cell's latest whole CELL_STATUS, or NULL (not linked, or no
+ * report since it linked). */
+const oc_core_tel_t *oc_core_cell_tel(const oc_core_t *k, uint32_t cell_id);
 /* The channel list of list group list_id (channel-list spec §8): stored, and
  * sent in CELL_CFG to every linked cell of the group now and to each after
  * its HELLO_ACK. The core numbers the versions (list->ver is ignored): 1, 2,

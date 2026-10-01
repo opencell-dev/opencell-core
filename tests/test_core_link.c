@@ -418,6 +418,100 @@ static void test_an_unreadable_list_can_be_replaced(void)
     TEST_ASSERT_EQUAL_INT(4, oc_core_chan_list_replace(&K, 5, &l, NOW)); /* readable: like set */
 }
 
+/* A CELL_STATUS part with `nt` terminals numbered from tmid0. */
+static oc_core_msg_t status_part(uint8_t part, uint8_t nradio, uint8_t nt, uint32_t tmid0)
+{
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CELL_STATUS;
+    m.u.cell_status.ver = OC_CORE_STATUS_VER;
+    m.u.cell_status.part = part;
+    m.u.cell_status.nradio = nradio;
+    for (uint8_t i = 0; i < nradio; i++) {
+        m.u.cell_status.radio[i].radio = i;
+        m.u.cell_status.radio[i].pps = 1;
+        m.u.cell_status.radio[i].late_slots = (uint16_t)(10u + i);
+    }
+    m.u.cell_status.nterm = nt;
+    for (uint8_t i = 0; i < nt; i++) {
+        m.u.cell_status.term[i].tmid = tmid0 + i;
+        m.u.cell_status.term[i].rssi_dbm = -90;
+    }
+    return m;
+}
+
+/* NOC design §7.3: the latest whole report per linked cell, in memory. */
+static void test_cell_status_is_kept_whole_per_link(void)
+{
+    core_world();
+    oc_core_msg_t m = status_part(OC_CORE_STATUS_LAST, 1, 0, 0);
+    oc_core_link_up(&K, 10, NOW);
+    rx(10, &m); /* before HELLO: ignored */
+    hello(10, 2, 1);
+    TEST_ASSERT_NULL(oc_core_cell_tel(&K, 2));
+    TEST_ASSERT_NULL(oc_core_cell_tel(&K, 1)); /* not linked */
+
+    m = status_part(0, 1, 28, 0x100);
+    rx(10, &m);
+    TEST_ASSERT_NULL(oc_core_cell_tel(&K, 2)); /* not the last part yet */
+    m = status_part(OC_CORE_STATUS_LAST | 1, 0, 3, 0x200);
+    advance(5000000u);
+    rx(10, &m);
+    const oc_core_tel_t *t = oc_core_cell_tel(&K, 2);
+    TEST_ASSERT_NOT_NULL(t);
+    TEST_ASSERT_EQUAL_UINT8(1, t->nradio);
+    TEST_ASSERT_EQUAL_UINT16(10, t->radio[0].late_slots);
+    TEST_ASSERT_EQUAL_UINT8(31, t->nterm);
+    TEST_ASSERT_EQUAL_HEX32(0x202, t->term[30].tmid);
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 6u, t->at);
+
+    /* a part out of order: the report being gathered is dropped, the published one stays */
+    m = status_part(0, 1, 2, 0x300);
+    rx(10, &m);
+    m = status_part(OC_CORE_STATUS_LAST | 2, 0, 1, 0x400);
+    rx(10, &m);
+    TEST_ASSERT_EQUAL_UINT8(31, oc_core_cell_tel(&K, 2)->nterm);
+    m = status_part(OC_CORE_STATUS_LAST | 1, 0, 1, 0x500); /* still waiting for a part 0 */
+    rx(10, &m);
+    TEST_ASSERT_EQUAL_UINT8(31, oc_core_cell_tel(&K, 2)->nterm);
+
+    /* more than the core's room: the rest is left out */
+    for (uint8_t p = 0; p < 3; p++) {
+        m = status_part((uint8_t)(p | (p == 2 ? OC_CORE_STATUS_LAST : 0)), 2, 28, 0x1000u + p * 28u);
+        rx(10, &m);
+    }
+    t = oc_core_cell_tel(&K, 2);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_TEL_RADIOS, t->nradio);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_TEL_TERMS, t->nterm);
+
+    /* gone with the link */
+    oc_core_link_down(&K, 10, NOW);
+    TEST_ASSERT_NULL(oc_core_cell_tel(&K, 2));
+    hello(11, 2, 1);
+    TEST_ASSERT_NULL(oc_core_cell_tel(&K, 2));
+}
+
+/* The mode switch (NOC design §7.1 cell.mode): stored, the link dropped,
+ * the new mode in the next HELLO_ACK. */
+static void test_a_mode_change_drops_the_link_and_the_next_hello_takes_it(void)
+{
+    core_world();
+    hello(10, 1, 1);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART15, sent(10, OC_CORE_HELLO_ACK)->u.hello_ack.mode);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_mode(&K, 1, OC_SIG_MODE_PART97, NOW));
+    TEST_ASSERT_EQUAL_UINT32(10, CLOSED[0]);
+    hello(11, 1, 1);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, sent(11, OC_CORE_HELLO_ACK)->u.hello_ack.mode);
+
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_cell_mode(&K, 9, OC_SIG_MODE_PART97, NOW)); /* no such cell */
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_cell_mode(&K, 1, 7, NOW));                  /* no such mode */
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_revoke(&K, 2, NOW));
+    TEST_ASSERT_EQUAL_INT(-3, oc_core_cell_mode(&K, 2, OC_SIG_MODE_PART15, NOW)); /* revoked */
+    oc_core_cell_t c;
+    TEST_ASSERT_EQUAL_INT(0, ST.cell_get(ST.ctx, 2, &c));
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, c.mode);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -435,5 +529,7 @@ int main(void)
     RUN_TEST(test_a_list_that_cant_be_read_at_hello_is_retried_not_dropped);
     RUN_TEST(test_the_fan_out_retries_a_cell_it_cant_read);
     RUN_TEST(test_an_unreadable_list_can_be_replaced);
+    RUN_TEST(test_cell_status_is_kept_whole_per_link);
+    RUN_TEST(test_a_mode_change_drops_the_link_and_the_next_hello_takes_it);
     return UNITY_END();
 }

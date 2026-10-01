@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""oc-db-upgrade: runbook R9, automated (postgres-ha; user decision 2026-10-01).
+
+postgresql-17, patroni, etcd-server and pgbackrest are held (apt-mark hold, and
+unattended-upgrades' Package-Blacklist) on oc-db-1, oc-core-2 and oc-ldn-1; they
+are upgraded only by this script, from the laptop, one host at a time:
+
+  1. preflight: each cluster has a leader and a streaming Sync Standby, etcd is
+     3/3 healthy -- otherwise nothing is touched;
+  2. oc-ldn-1 (the witness: etcd, pgBackRest, the drills' Postgres binaries);
+  3. each member host in turn: its leaders are switched over to the other member
+     (and the script waits for Sync Standby), so the host carries only replicas;
+     then its packages are upgraded, and its etcd (3/3 again), pgBackRest server
+     and Patroni (both clusters streaming again) are restarted, and the host is
+     checked (no pending restart);
+  4. every cluster goes back to its home (runbook R2).
+
+Any failure stops the run at once: the packages of the host that failed are put
+back to their previous versions if apt still has them, the holds are always
+re-applied, and the script says where it stopped (the clusters are left with
+their leaders on healthy members; runbooks R1-R3).
+
+  oc-db-upgrade [--dry-run] [--restart-only] [--ssh-config FILE]
+
+--dry-run       show what is upgradable and the plan; change nothing
+--restart-only  the whole rolling cycle with no package change (for a reload
+                of every service without a failover, and to drill the script)
+"""
+import argparse
+import json
+import shlex
+import subprocess
+import sys
+import time
+
+PACKAGES = ("postgresql-17", "patroni", "etcd-server", "pgbackrest")
+WITNESS = "oc-ldn-1"
+MEMBERS = ("oc-db-1", "oc-core-2")  # the order the member hosts are upgraded in
+HOMES = {"oc-east": "oc-db-1", "oc-west": "oc-core-2"}
+ETCD = ("https://10.99.0.4:2379,https://10.99.0.2:2379,https://10.99.0.3:2379")
+TLS = "/etc/opencell/db-tls"
+SYNC_WAIT_S = 300
+ETCD_WAIT_S = 60
+POLL_S = 5
+
+
+class Stop(Exception):
+    """The run must stop here."""
+
+
+# ---------------------------------------------------------------- remote operations
+
+
+class Remote:
+    """The few things the orchestration does on the hosts, over ssh."""
+
+    def __init__(self, ssh_config):
+        self.ssh_config = ssh_config
+
+    def sh(self, host, script, timeout=600):
+        r = subprocess.run(["ssh", "-F", self.ssh_config, host, "bash -s"], input=script, text=True,
+                           capture_output=True, timeout=timeout)
+        if r.returncode != 0:
+            raise Stop(f"{host}: exit {r.returncode}: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
+        return r.stdout
+
+    def versions(self, host):
+        """{package: (installed, candidate)} for the held packages installed on host."""
+        out = self.sh(host, "sudo apt-get update -q >/dev/null 2>&1 || exit 3\n" + "".join(
+            f"v=$(dpkg-query -W -f '${{Version}}' {p} 2>/dev/null) && "
+            f"echo \"{p} $v $(apt-cache policy {p} | sed -n 's/^ *Candidate: //p')\"\n" for p in PACKAGES))
+        return {p: (i, c) for p, i, c in (line.split() for line in out.splitlines() if len(line.split()) == 3)}
+
+    def clusters(self):
+        """{cluster: [{name, role, state, lag}]}, asked of the first member that answers."""
+        for host in MEMBERS:
+            try:
+                out = self.sh(host, "".join(
+                    f"echo {c}; sudo -u postgres patronictl -c /etc/patroni/{c}.yml list -f json\n" for c in HOMES))
+            except Stop:
+                continue
+            lines = out.splitlines()
+            return {lines[i]: [{"name": m["Member"], "role": m["Role"], "state": m["State"], "lag": m.get("Lag in MB")}
+                               for m in json.loads(lines[i + 1])] for i in range(0, len(lines), 2)}
+        raise Stop("no member answers patronictl")
+
+    def etcd_healthy(self):
+        out = self.sh(WITNESS, f"etcdctl --endpoints={ETCD} --cacert={TLS}/ca.crt --cert={TLS}/db.crt "
+                               f"--key={TLS}/db.key --dial-timeout=3s endpoint health 2>&1 | grep -c 'is healthy' || true")
+        return int(out.strip() or 0)
+
+    def switchover(self, cluster, leader, candidate):
+        self.sh(leader, f"sudo -u postgres patronictl -c /etc/patroni/{cluster}.yml switchover "
+                        f"--leader {leader} --candidate {candidate} --force")
+
+    def install(self, host, packages):
+        """Lift the hold of exactly these packages for the install, then hold again (always)."""
+        p = " ".join(shlex.quote(x) for x in packages)
+        self.sh(host, f"trap 'sudo apt-mark hold {p} >/dev/null' EXIT\nsudo apt-mark unhold {p} >/dev/null\n"
+                      f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --only-upgrade "
+                      f"-o Dpkg::Options::=--force-confold {p}", timeout=1800)
+
+    def downgrade(self, host, versions):
+        """Back to {package: version}, if apt still has those versions (a cache or a repository)."""
+        spec = " ".join(f"{shlex.quote(p)}={shlex.quote(v)}" for p, v in versions.items())
+        p = " ".join(shlex.quote(x) for x in versions)
+        self.sh(host, f"trap 'sudo apt-mark hold {p} >/dev/null' EXIT\nsudo apt-mark unhold {p} >/dev/null\n"
+                      f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --allow-downgrades "
+                      f"-o Dpkg::Options::=--force-confold {spec}", timeout=1800)
+
+    def hold(self, host, packages):
+        self.sh(host, "sudo apt-mark hold " + " ".join(
+            f"$(dpkg-query -W -f '${{Package}}' {shlex.quote(p)} 2>/dev/null)" for p in packages) + " >/dev/null")
+
+    def restart(self, host, unit):
+        self.sh(host, f"sudo systemctl restart {shlex.quote(unit)}")
+
+    def pending_restart(self, host):
+        """Clusters whose Postgres on host still runs the old binary or settings."""
+        out = self.sh(host, "".join(
+            f"[ \"$(sudo -u postgres psql -p {port} -XAtc 'select count(*) from pg_settings where pending_restart')\" = 0 ] "
+            f"|| echo {c}\n" for c, port in (("oc-east", 5432), ("oc-west", 5433))))
+        return out.split()
+
+
+# ---------------------------------------------------------------- orchestration (pure)
+
+
+class Upgrade:
+    def __init__(self, remote, log=print, sleep=time.sleep, clock=time.monotonic):
+        self.r, self.log, self.sleep, self.clock = remote, log, sleep, clock
+
+    # -- checks
+    def leader_of(self, cl, cluster):
+        return next((m["name"] for m in cl[cluster] if m["role"] in ("Leader", "Standby Leader")), None)
+
+    def synced(self, cl):
+        return all(self.leader_of(cl, c) and any(m["role"] == "Sync Standby" and m["state"] == "streaming"
+                                                 for m in cl[c]) for c in HOMES)
+
+    def wait(self, what, ok, timeout):
+        end = self.clock() + timeout
+        while True:
+            if ok():
+                return
+            if self.clock() >= end:
+                raise Stop(f"{what}: not within {timeout} s")
+            self.sleep(POLL_S)
+
+    def wait_synced(self):
+        self.wait("both clusters with a streaming Sync Standby", lambda: self.synced(self.r.clusters()), SYNC_WAIT_S)
+
+    def wait_etcd(self):
+        self.wait("etcd 3/3 healthy", lambda: self.r.etcd_healthy() == 3, ETCD_WAIT_S)
+
+    def preflight(self):
+        cl = self.r.clusters()
+        if not self.synced(cl):
+            raise Stop("preflight: a cluster has no leader or no streaming Sync Standby (fix that first: R1-R3)")
+        try:  # one reading can blip (seen live): allow it 30 s, as the in-run checks do
+            self.wait("preflight: etcd 3/3 healthy", lambda: self.r.etcd_healthy() == 3, 30)
+        except Stop:
+            raise Stop("preflight: etcd is not 3/3 healthy")
+        return cl
+
+    # -- steps
+    def move_leaders_off(self, host):
+        cl = self.r.clusters()
+        for c in HOMES:
+            if self.leader_of(cl, c) == host:
+                other = next(m for m in MEMBERS if m != host)
+                self.log(f"  {c}: switchover {host} -> {other}")
+                self.r.switchover(c, host, other)
+                self.wait_synced()
+
+    def upgrade_host(self, host, todo, restart_only):
+        """todo: {package: (installed, candidate)} to upgrade on host."""
+        if todo:
+            self.log(f"  {host}: install " + ", ".join(f"{p} {i} -> {c}" for p, (i, c) in sorted(todo.items())))
+            try:
+                self.r.install(host, sorted(todo))
+            except Stop:
+                self.rollback(host, todo)
+                raise
+        try:
+            self.restart_services(host, set(todo) if not restart_only else set(PACKAGES))
+            if host != WITNESS:
+                pending = self.r.pending_restart(host)
+                if pending:
+                    raise Stop(f"{host}: still pending restart after the restarts: {', '.join(pending)}")
+        except Stop:
+            if todo:
+                self.rollback(host, todo)
+            raise
+
+    def restart_services(self, host, changed):
+        if "etcd-server" in changed:
+            self.log(f"  {host}: restart etcd")
+            self.r.restart(host, "etcd")
+            self.wait_etcd()
+        if "pgbackrest" in changed:
+            self.log(f"  {host}: restart pgbackrest")
+            self.r.restart(host, "pgbackrest")
+        if host != WITNESS and changed & {"postgresql-17", "patroni"}:
+            for c in HOMES:  # the host carries only replicas now (move_leaders_off)
+                self.log(f"  {host}: restart patroni@{c}")
+                self.r.restart(host, f"patroni@{c}")
+                self.wait_synced()
+
+    def rollback(self, host, todo):
+        old = {p: i for p, (i, c) in todo.items()}
+        self.log(f"  {host}: ROLLBACK to " + ", ".join(f"{p} {v}" for p, v in sorted(old.items())))
+        try:
+            self.r.downgrade(host, old)
+            self.restart_services(host, set(old))
+        except Stop as e:
+            self.log(f"  {host}: rollback failed ({e}): the host keeps the new versions -- see runbook R9")
+
+    def go_home(self):
+        cl = self.r.clusters()
+        for c, home in HOMES.items():
+            leader = self.leader_of(cl, c)
+            if leader and leader != home:
+                self.log(f"  {c}: back home {leader} -> {home} (R2)")
+                self.r.switchover(c, leader, home)
+                self.wait_synced()
+
+    def plan(self, todo, restart_only):
+        steps = [f"preflight: {', '.join(HOMES)} each with a streaming Sync Standby; etcd 3/3"]
+        for host in (WITNESS,) + MEMBERS:
+            pk = sorted(PACKAGES if restart_only else todo.get(host, {}))
+            if not pk:
+                continue
+            if host in MEMBERS:
+                steps.append(f"{host}: move its leaders to the other member, wait for Sync Standby")
+            restarts = "etcd, pgBackRest" + (", Patroni of both clusters" if host in MEMBERS else "")
+            steps.append(f"{host}: " + ("" if restart_only else "upgrade " + ", ".join(pk) + "; ")
+                         + f"restart {restarts} (each followed by its health check)")
+        steps.append("each cluster back to its home (R2)")
+        return steps
+
+    def run(self, dry_run=False, restart_only=False):
+        self.preflight()
+        todo = {}
+        if not restart_only:
+            for host in (WITNESS,) + MEMBERS:
+                v = self.r.versions(host)
+                todo[host] = {p: ic for p, ic in v.items() if ic[0] != ic[1] and ic[1] not in ("", "(none)")}
+            if not any(todo.values()):
+                self.log("nothing to upgrade: every held package is at its candidate version")
+                return 0
+        for line in self.plan(todo, restart_only):
+            self.log(("PLAN " if dry_run else "") + line)
+        if dry_run:
+            return 0
+        try:
+            for host in (WITNESS,) + MEMBERS:
+                t = todo.get(host, {})
+                if not t and not restart_only:
+                    continue
+                self.log(f"{host}:")
+                if host in MEMBERS:
+                    self.move_leaders_off(host)
+                self.upgrade_host(host, t, restart_only)
+                self.check()
+            self.go_home()
+            self.check()
+        except Stop as e:
+            self.log(f"STOPPED: {e}")
+            return 1
+        finally:
+            for host in (WITNESS,) + MEMBERS:
+                try:
+                    self.r.hold(host, PACKAGES)
+                except Stop as e:
+                    self.log(f"WARNING: could not re-hold the packages on {host}: {e}")
+        self.log(f"done: every host {'restarted' if restart_only else 'upgraded'}, both clusters synchronous, "
+                 "etcd 3/3, leaders at home")
+        return 0
+
+    def check(self):
+        if self.r.etcd_healthy() != 3:
+            raise Stop("etcd is not 3/3 healthy")
+        if not self.synced(self.r.clusters()):
+            raise Stop("a cluster has no streaming Sync Standby")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description="runbook R9, automated: rolling upgrade of the held database packages")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--restart-only", action="store_true")
+    ap.add_argument("--ssh-config", default=__import__("os").path.expanduser("~/.ssh/cm/oc-portal.conf"))
+    a = ap.parse_args(argv)
+    try:
+        return Upgrade(Remote(a.ssh_config)).run(dry_run=a.dry_run, restart_only=a.restart_only)
+    except Stop as e:  # preflight
+        print(f"STOPPED before any change: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -20,6 +20,13 @@
  * 0x70-0x7F for replication (plan 10). A cell link ignores OCSS types and
  * an OCSS link ignores cell types. OCSS call refs: every message about a
  * call carries the call_ref its CALL_SETUP gave it (the calling core's).
+ * The two cores in a pair each number their own outgoing calls from 1 at
+ * every restart, so the two could otherwise pick the same value; the
+ * calling core sets OC_CORE_REF_DIR (bit 30) when its own core_id is the
+ * higher of the pair, so the two directions' refs never collide. A
+ * CALL_SETUP whose ref lacks OC_CORE_REF_CORE, or carries the direction bit
+ * that would mean the *receiver's* own calls, is refused (cause 5): spec
+ * §6.4 (review finding I1).
  *
  * Types not listed here are free. */
 #ifndef OC_CORE_MSG_H
@@ -32,6 +39,7 @@
 #define OC_CORE_PROTO     2u /* 2: AV_RES carries HXRES, not XRES (§19.1); LOC_CANCEL names its RAND (§19 follow-ups) */
 #define OC_CORE_AV_MAX    4u
 #define OC_CORE_REF_CORE  0x80000000u
+#define OC_CORE_REF_DIR   0x40000000u /* an OCSS call_ref: set by the calling core when self > peer (review I1) */
 #define OC_OCSS_PROTO     1u /* OCSS HELLO's proto (the test-services slice: link and call control only) */
 #define OC_OCSS_OFFSET    0x40u /* an OCSS type is its §6 analogue + this */
 

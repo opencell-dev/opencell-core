@@ -387,6 +387,63 @@ static void test_core_2_never_sends_a_call_on_and_limits_a_peer(void)
     TEST_ASSERT_EQUAL_HEX8(0xFF, setup_cause(OC_CORE_REF_CORE | 60u, ECHO2, 0)); /* a repeat: ignored */
 }
 
+/* Review I1: the two cores in a pair each number their own calls from 1 at
+ * restart, so a call core 1 places and a call core 2 places at the same
+ * time can pick the same low bits. The calling core's direction bit (self
+ * > peer) must keep the two apart: placed at once, each ends on its own,
+ * never the other's. */
+static void test_both_cores_first_calls_at_once_do_not_collide(void)
+{
+    world();
+    int from = NCELL;
+    dial(ECHO2); /* core 1's own first call: self(1) < peer(2), so dir bit 0 */
+    const uint32_t out_ref = OC_CORE_REF_CORE | 1u;
+    TEST_ASSERT_EQUAL_UINT32(out_ref, Q[(QT - 1) % 256].m.u.setup.call_ref);
+
+    /* core 2's first call to core 1, arriving "at the same time" (NOW is
+     * unchanged): its ref has the SAME low bits (1) but the direction bit
+     * a correct core 2 sets, since peer(2) > self(1). */
+    const uint32_t in_ref = OC_CORE_REF_CORE | OC_CORE_REF_DIR | 1u;
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CALL_SETUP;
+    m.u.setup.call_ref = in_ref;
+    memcpy(m.u.setup.caller, SUB2, OC_SIG_NUMBER_LEN); /* a subscriber in core 2's own block */
+    memcpy(m.u.setup.called, NA, OC_SIG_NUMBER_LEN);   /* core 1's registered subscriber */
+    oc_core_peer_rx(&C1.k, L1, &m, NOW);
+    const oc_core_msg_t *offer = cell_got(from, OC_CORE_CALL_OFFER);
+    TEST_ASSERT_NOT_NULL(offer);
+    TEST_ASSERT_NOT_EQUAL(out_ref, offer->u.call_offer.call_ref); /* a distinct call, not core 1's own */
+
+    /* releasing the incoming call ends only it; core 1's own outgoing call
+     * (b.ref out_ref) is untouched (the bug: a peer RELEASE for the wrong
+     * ref ended the unrelated call). */
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CALL_RELEASE;
+    m.u.call.ref = in_ref;
+    m.u.call.cause = OC_SIG_CAUSE_NORMAL;
+    oc_core_peer_rx(&C1.k, L1, &m, NOW);
+    TEST_ASSERT_NOT_NULL(cell_got(from, OC_CORE_CALL_RELEASE));
+    int still_there = 0;
+    for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+        if (C1.k.calls[i].used && C1.k.calls[i].b.kind == OC_CORE_LEG_PEER && C1.k.calls[i].b.ref == out_ref) {
+            still_there = 1;
+        }
+    }
+    TEST_ASSERT_TRUE_MESSAGE(still_there, "core 1's own outgoing call was ended by the other call's RELEASE");
+}
+
+static void test_a_call_setup_with_the_wrong_direction_bit_or_no_core_bit_is_refused(void)
+{
+    world();
+    QH = QT;
+    /* core 1 (peer 1, as setup_cause simulates) using core 2's direction
+     * bit: not peer 1's to use (peer(1) is not > self(2)). */
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_CAUSE_NET_FAILURE, setup_cause(OC_CORE_REF_CORE | OC_CORE_REF_DIR | 80u, ECHO2, 0));
+    /* no OC_CORE_REF_CORE at all */
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_CAUSE_NET_FAILURE, setup_cause(81u, ECHO2, 0));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -400,5 +457,7 @@ int main(void)
     RUN_TEST(test_core_2_silent_after_setup_times_out_in_10_s);
     RUN_TEST(test_a_lost_link_ends_its_calls_on_both_cores);
     RUN_TEST(test_core_2_never_sends_a_call_on_and_limits_a_peer);
+    RUN_TEST(test_both_cores_first_calls_at_once_do_not_collide);
+    RUN_TEST(test_a_call_setup_with_the_wrong_direction_bit_or_no_core_bit_is_refused);
     return UNITY_END();
 }

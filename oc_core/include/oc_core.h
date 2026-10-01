@@ -122,7 +122,7 @@ typedef struct {
     uint64_t        prune_at; /* next pruning of issued vectors */
     oc_core_call_t  calls[OC_CORE_CALLS];
     oc_core_peer_t  peers[OC_CORE_PEERS];
-    uint32_t        next_ref; /* wraps at 2^31 (top bit is OC_CORE_REF_CORE); safe since calls[] does not survive a core restart (§7.10) */
+    uint32_t        next_ref; /* wraps at 2^30 (bit 31 is OC_CORE_REF_CORE, bit 30 OC_CORE_REF_DIR for a peer leg's ref: review I1); safe since calls[] does not survive a core restart (§7.10) */
 } oc_core_t;
 
 /* A new network key pair (X25519 from random32) with its registration

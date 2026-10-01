@@ -171,7 +171,7 @@ static oc_core_call_t *new_call(oc_core_t *k, oc_core_call_t *full, const uint8_
     if (c == NULL) c = full;
     memset(c, 0, sizeof(*c));
     c->used = c != full;
-    k->next_ref = (k->next_ref + 1u) & ~OC_CORE_REF_CORE;
+    k->next_ref = (k->next_ref + 1u) & (OC_CORE_REF_DIR - 1u); /* wraps at 2^30: bit 30 is OC_CORE_REF_DIR */
     c->b.ref = OC_CORE_REF_CORE | k->next_ref;
     memcpy(c->caller, caller, OC_SIG_NUMBER_LEN);
     memcpy(c->called, called, OC_SIG_NUMBER_LEN);
@@ -236,6 +236,12 @@ static void start_b(oc_core_t *k, oc_core_call_t *c)
     c->state = OC_CORE_CALL_ROUTING;
     c->due = k->now + OC_CORE_SETUP_US;
     if (c->b.kind == OC_CORE_LEG_PEER) {
+        /* review I1: the two cores number their own calls independently
+         * from 1 at restart, so the low bits can coincide; the calling
+         * core (always this one, here) sets the direction bit when its own
+         * core_id is the higher of the pair, so the two directions' refs
+         * never collide (spec §6.4). */
+        if (k->cfg.core_id > c->b.peer) c->b.ref |= OC_CORE_REF_DIR;
         o.type = OC_OCSS_CALL_SETUP;
         o.u.setup.call_ref = c->b.ref;
         memcpy(o.u.setup.caller, c->caller, OC_SIG_NUMBER_LEN);
@@ -284,6 +290,32 @@ static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     start_b(k, c);
 }
 
+/* 1 if ref is a call_ref the peer (the calling core here) could legitimately
+ * have assigned: OC_CORE_REF_CORE set, and its direction bit (review I1)
+ * matching peer being the higher core_id of the pair - never the bit that
+ * marks this core's own outgoing refs. */
+static int ref_from_peer_ok(uint16_t self_id, uint16_t peer_id, uint32_t ref)
+{
+    if ((ref & OC_CORE_REF_CORE) == 0) return 0;
+    int want_dir = peer_id > self_id;
+    int has_dir = (ref & OC_CORE_REF_DIR) != 0;
+    return (want_dir != 0) == (has_dir != 0);
+}
+
+/* A CALL_SETUP refused before any call is created: no CDR, no call slot
+ * spent (reviews I1, M1, M3 - a bad or malicious peer costs nothing but a
+ * RELEASE and, at most, one logged line). */
+static void reject_setup(oc_core_t *k, uint16_t peer, uint32_t ref, uint8_t cause, const char *why)
+{
+    oc_core_msg_t rel;
+    memset(&rel, 0, sizeof(rel));
+    rel.type = OC_OCSS_CALL_RELEASE;
+    rel.u.call.ref = ref;
+    rel.u.call.cause = cause;
+    oc_core_peer_send(k, peer, &rel);
+    if (why != NULL) oc_core_logf(k, "peer %u: CALL_SETUP refused: %s", (unsigned)peer, why);
+}
+
 /* A peer core's CALL_SETUP (core test services spec §6.3): served as a
  * cell's CALL_ROUTE is, but the caller is the peer's to vouch for (it
  * authenticated the caller's terminal; this core can't), and at most
@@ -292,6 +324,10 @@ static void on_setup(oc_core_t *k, uint16_t peer, const oc_core_msg_t *m)
 {
     oc_core_leg_t *leg, *other;
     if (find_peer(k, peer, m->u.setup.call_ref, &leg, &other) != NULL) return; /* a repeat */
+    if (!ref_from_peer_ok(k->cfg.core_id, peer, m->u.setup.call_ref)) {
+        reject_setup(k, peer, m->u.setup.call_ref, OC_SIG_CAUSE_NET_FAILURE, "bad call_ref (review I1)");
+        return;
+    }
     oc_core_call_t full, *c = new_call(k, &full, m->u.setup.caller, m->u.setup.called);
     c->a.kind = OC_CORE_LEG_PEER;
     c->a.peer = peer;

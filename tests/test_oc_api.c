@@ -1262,6 +1262,49 @@ static void test_cell_mode(void)
     done();
 }
 
+/* I1 (final review, 2026-10-01): a reg.list page that names a chosen
+ * cursor is a look at one subscriber's neighborhood (the first row is
+ * whoever sorts just after it) and must be audited as itself, with the
+ * cursor in the record - never folded into the quiet once-a-minute poll
+ * count (Review Focus 3). Only a from-the-start reg.list is the poll. */
+static void test_reg_list_with_a_cursor_is_audited(void)
+{
+    world();
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&core, 3, "Lancaster 1", OC_SIG_MODE_PART15, 0));
+    registered("+883171746412345", 3, 0x76ad0488u, UNIX0 + 3700u, UNIX0 + 90u);
+    char detail[64], number[32];
+    req_t r;
+    long before = count_rows("SELECT count(*) FROM audit");
+
+    begin(&r, OC_API_REG_LIST, 1, 1);
+    put32(&r, 0);
+    put_num(&r, "+883171746412344"); /* a chosen cursor, one below the target */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_INT(before + 1, count_rows("SELECT count(*) FROM audit")); /* its own record */
+    last_audit(detail, sizeof(detail), number, sizeof(number));
+    TEST_ASSERT_EQUAL_STRING("a1 reg.list ok after", detail);
+    TEST_ASSERT_EQUAL_STRING("+883171746412344", number);
+
+    /* a second cursored call in the same minute: still its own record, not coalesced */
+    begin(&r, OC_API_REG_LIST, 1, 1);
+    put32(&r, 0);
+    put_num(&r, "+883171746412345");
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_INT(before + 2, count_rows("SELECT count(*) FROM audit"));
+    last_audit(detail, sizeof(detail), number, sizeof(number));
+    TEST_ASSERT_EQUAL_STRING("a1 reg.list ok after", detail);
+    TEST_ASSERT_EQUAL_STRING("+883171746412345", number);
+
+    /* a from-the-start call is still the quiet poll */
+    begin(&r, OC_API_REG_LIST, 1, 1);
+    put32(&r, 0);
+    put(&r, (uint8_t[OC_SIG_NUMBER_LEN]){ 0 }, OC_SIG_NUMBER_LEN);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_INT(before + 3, count_rows("SELECT count(*) FROM audit"));
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit WHERE detail = 'a1 reg.list ok'"));
+    done();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1287,5 +1330,6 @@ int main(void)
     RUN_TEST(test_audit_list);
     RUN_TEST(test_ocss_status_and_core_blocks);
     RUN_TEST(test_cell_mode);
+    RUN_TEST(test_reg_list_with_a_cursor_is_audited);
     return UNITY_END();
 }

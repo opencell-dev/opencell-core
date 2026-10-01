@@ -747,6 +747,16 @@ static uint8_t op_reg_list(call_t *c)
     c->a->audit_cell = id;
     uint8_t known = cell_known(c, id);
     if (known != OC_API_OK) return known;
+    /* I1 (final review): a chosen cursor is a look at one subscriber's
+     * neighborhood (the first row sorts just after it); put it in the
+     * record's number column, like audit_list's named number, so the call
+     * is audited as itself and quiet() (which excludes a set audit_number)
+     * never folds it into the once-a-minute poll count. Only a
+     * from-the-start reg.list (the NOC's poll) stays quiet. */
+    if (!from_start) {
+        memcpy(c->a->audit_number, after, OC_SIG_NUMBER_LEN);
+        snprintf(c->a->audit_what, sizeof(c->a->audit_what), "after");
+    }
     char after_text[OC_SIG_NUMBER_TEXT] = "";
     if (!from_start) oc_sig_number_to_text(after, after_text);
     char sql[512];

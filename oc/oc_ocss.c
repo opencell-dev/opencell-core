@@ -142,6 +142,10 @@ static void conn_end(oc_ocss_t *s, oc_ocss_conn_t *c, int report, int prio, cons
     int was_open = c->state == C_OPEN;
     uint32_t link = c->link;
     if (why != NULL) oc_log(prio, "ocss: %s (core %u): closed: %s", c->addr, (unsigned)c->core_id, why);
+    if (c->bad != 0) { /* review M6 */
+        oc_log(OC_LOG_WARNING, "ocss: %s (core %u): %u frame(s) did not decode", c->addr, (unsigned)c->core_id,
+               (unsigned)c->bad);
+    }
     oc_tls_conn_close(&c->tls);
     oc_sig_wipe(c->rx, sizeof(c->rx));
     oc_sig_wipe(c->tx, sizeof(c->tx));
@@ -352,6 +356,10 @@ static void read_frames(oc_ocss_t *s, oc_ocss_conn_t *c)
             if (oc_core_decode(c->rx, len + 2u, &m) == 0) {
                 oc_core_peer_rx(s->cfg.core, link, &m, s->cfg.now_us());
             } else {
+                if (c->bad == 0) { /* review M6: the first one, logged; the rest counted for conn_end */
+                    oc_log(OC_LOG_WARNING, "ocss: %s (core %u): frame type %02x did not decode", c->addr,
+                           (unsigned)c->core_id, (unsigned)c->rx[2]);
+                }
                 c->bad++;
             }
             oc_sig_wipe(&m, sizeof(m));

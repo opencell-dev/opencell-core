@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -333,6 +334,44 @@ static void test_an_ipv6_listen_address_binds_too(void)
     oc_ocss_close(&C2.o);
 }
 
+/* Review M6: a frame that does not decode (a version-skewed peer, say) was
+ * only ever counted (c->bad), never logged - it would vanish silently.
+ * Writes the frame straight past oc_core's own framing, over the open
+ * link's TLS connection (state 3, the header's documented "open"), and
+ * checks stderr (oc_log's only destination) for a line naming it. */
+static void test_an_undecodable_frame_is_logged(void)
+{
+    world("core.fpr");
+    TEST_ASSERT_TRUE(linked_within(400));
+    oc_ocss_conn_t *c = NULL;
+    for (unsigned i = 0; i < OC_OCSS_CONNS && c == NULL; i++) {
+        if (C1.o.c[i].state == 3) c = &C1.o.c[i];
+    }
+    TEST_ASSERT_NOT_NULL(c);
+    char tmp[] = "/tmp/oc_ocss_log_XXXXXX";
+    int fd = mkstemp(tmp);
+    TEST_ASSERT_TRUE(fd >= 0);
+    fflush(stderr);
+    int saved = dup(2);
+    TEST_ASSERT_TRUE(saved >= 0);
+    dup2(fd, 2);
+    uint8_t bad[] = { 0x00, 0x01, 0xFF }; /* len 1, type 0xFF: not a frame oc_core_decode knows */
+    long wn = oc_tls_conn_write(&c->tls, bad, sizeof(bad));
+    for (int i = 0; i < 20; i++) turn(50000u);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    char buf[4096] = { 0 };
+    off_t end = lseek(fd, 0, SEEK_CUR);
+    lseek(fd, 0, SEEK_SET);
+    ssize_t n = end > 0 ? read(fd, buf, sizeof(buf) - 1) : 0;
+    close(fd);
+    unlink(tmp);
+    TEST_ASSERT_EQUAL_INT((long)sizeof(bad), wn);
+    TEST_ASSERT_TRUE_MESSAGE(n > 0 && strstr(buf, "frame type ff") != NULL, buf);
+    done();
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -345,5 +384,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_peer_configured_to_be_dialled_refuses_an_inbound_link);
     RUN_TEST(test_a_second_handshake_from_the_same_address_is_refused);
     RUN_TEST(test_an_ipv6_listen_address_binds_too);
+    RUN_TEST(test_an_undecodable_frame_is_logged);
     return UNITY_END();
 }

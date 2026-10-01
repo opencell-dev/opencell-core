@@ -62,6 +62,15 @@
  *                                                        audit record, 0 none), expires (4), RSSI (2,
  *                                                        int16 dBm), SNR (2, int16 quarter dB; both
  *                                                        -32768: not reported), heard at (4, unix s, 0)
+ *   0x12 cdr.recent       after (4, a CDR id; 0: from    rows, by id: id (4), setup, answer, end (4
+ *                         the first), limit (2, 1-1000)  each, unix s), cause (1), caller, called,
+ *                                                        cell a, cell b (4 each; 0: not a cell), leg
+ *                                                        kinds (1: a << 4 | b; 0 cell, 1 echo, 2
+ *                                                        playback, 3 peer)
+ *   0x13 audit.list       after (4, an audit id), event  rows, by id: id (4), ts (4), event (1),
+ *                         mask (4: bit e for event e;    number (zero: none), the TMID's top 16 bits
+ *                         0: every event), number (zero: (2), cell (4), detail (text)
+ *                         any), limit (2, 1-500)
  *
  * The core never answers with K, OPc, SQN or a token secret; the QR text
  * of a token it has just issued is the one secret it gives (spec §7).
@@ -99,12 +108,13 @@
 #define OC_API_CDR_MAX   1000u
 #define OC_API_FREE_MAX  32u
 #define OC_API_REG_MAX   1000u
+#define OC_API_AUDIT_MAX 500u
 
 enum {
     OC_API_NUM_FREE = 0x01, OC_API_NUM_CHECK, OC_API_SUB_CREATE, OC_API_SUB_REISSUE, OC_API_SUB_STATUS,
     OC_API_SUB_RELEASE, OC_API_SUB_DISABLE, OC_API_SUB_ENABLE, OC_API_CDR_LIST, OC_API_CELL_ADD,
     OC_API_CELL_SET_CERT, OC_API_CELL_REVOKE, OC_API_CELL_STATUS, OC_API_CORE_STATUS, OC_API_ROUTE_OFFER,
-    OC_API_CELL_RADIO, OC_API_REG_LIST,
+    OC_API_CELL_RADIO, OC_API_REG_LIST, OC_API_CDR_RECENT, OC_API_AUDIT_LIST,
     OC_API_OPS /* one past the last */
 };
 #define OC_API_ANSWER 0x80u /* | op */

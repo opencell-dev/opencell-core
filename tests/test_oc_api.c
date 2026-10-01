@@ -1027,6 +1027,126 @@ static void test_reg_list(void)
     done();
 }
 
+/* cdr.recent (NOC design §7.1): every CDR after an id, with both cells and
+ * what each leg was, for the portal's copy of the calls. */
+static void test_cdr_recent(void)
+{
+    world();
+    oc_core_store_t st = oc_sql_store(sql);
+    oc_core_cdr_t d;
+    memset(&d, 0, sizeof(d));
+    oc_sig_number_to_bcd("+883171746412345", 16, d.caller);
+    oc_sig_number_to_bcd("+883171746400777", 16, d.called);
+    d.cell_a = 3;
+    d.cell_b = 4;
+    d.setup = UNIX0 + 10u;
+    d.answer = UNIX0 + 13u;
+    d.end = UNIX0 + 70u;
+    d.cause = 0;
+    TEST_ASSERT_EQUAL_INT(0, st.cdr_add(st.ctx, &d));
+    memcpy(d.called, cfg.echo_number, OC_SIG_NUMBER_LEN); /* to the echo service */
+    d.cell_b = 0;
+    TEST_ASSERT_EQUAL_INT(0, st.cdr_add(st.ctx, &d));
+    oc_sig_number_to_bcd("+883150355501234", 16, d.called); /* to a peer core's subscriber */
+    d.answer = 0;
+    d.cause = 4;
+    TEST_ASSERT_EQUAL_INT(0, st.cdr_add(st.ctx, &d));
+    req_t r;
+    begin(&r, OC_API_CDR_RECENT, 1, 0);
+    put32(&r, 0);
+    put16(&r, 1000);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(3, ANS[0].body[0]);
+    const uint8_t *row = ANS[0].body + 1;
+    TEST_ASSERT_EQUAL_UINT32(1, get32(row));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 10u, get32(row + 4));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 13u, get32(row + 8));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 70u, get32(row + 12));
+    char t[OC_SIG_NUMBER_TEXT];
+    num_text(row + 17, t);
+    TEST_ASSERT_EQUAL_STRING("+883171746412345", t);
+    num_text(row + 25, t);
+    TEST_ASSERT_EQUAL_STRING("+883171746400777", t);
+    TEST_ASSERT_EQUAL_UINT32(3, get32(row + 33));
+    TEST_ASSERT_EQUAL_UINT32(4, get32(row + 37));
+    TEST_ASSERT_EQUAL_HEX8(0x00, row[41]);         /* cell to cell */
+    TEST_ASSERT_EQUAL_HEX8(0x01, row[42 + 41]);    /* cell to echo */
+    TEST_ASSERT_EQUAL_HEX8(0x03, row[84 + 41]);    /* cell to a peer */
+    TEST_ASSERT_EQUAL_UINT8(4, row[84 + 16]);      /* its cause */
+
+    begin(&r, OC_API_CDR_RECENT, 1, 0); /* after id 2, one at most */
+    put32(&r, 2);
+    put16(&r, 1);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(1, ANS[0].body[0]);
+    TEST_ASSERT_EQUAL_UINT32(3, get32(ANS[0].body + 1));
+    begin(&r, OC_API_CDR_RECENT, 1, 0);
+    put32(&r, 0);
+    put16(&r, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    begin(&r, OC_API_CDR_RECENT, 1, 0);
+    put32(&r, 0);
+    put16(&r, 1001);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    done();
+}
+
+/* audit.list (NOC design §7.1): the core's own audit after an id, by event
+ * and by number; a look at one number's records is itself audited with it. */
+static void test_audit_list(void)
+{
+    world();
+    char detail[64], number[32];
+    registered("+883171746412345", 3, 0x76ad0488u, UNIX0 + 3700u, UNIX0 + 90u);
+    registered("+883171746400777", 3, 0x11220001u, UNIX0 + 3700u, UNIX0 + 80u);
+    num_op(OC_API_SUB_STATUS, "+883171746412345", 9); /* an API record, about the number */
+    req_t r;
+    begin(&r, OC_API_AUDIT_LIST, 1, 0);
+    put32(&r, 0);
+    put32(&r, 1u << OC_CORE_AUDIT_REGISTER);
+    put(&r, (uint8_t[OC_SIG_NUMBER_LEN]){ 0 }, OC_SIG_NUMBER_LEN);
+    put16(&r, 500);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(2, ANS[0].body[0]);
+    const uint8_t *row = ANS[0].body + 1;
+    uint32_t first = get32(row);
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 90u, get32(row + 4));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AUDIT_REGISTER, row[8]);
+    char t[OC_SIG_NUMBER_TEXT];
+    num_text(row + 9, t);
+    TEST_ASSERT_EQUAL_STRING("+883171746412345", t);
+    TEST_ASSERT_EQUAL_HEX16(0x76ad, get16(row + 17));
+    TEST_ASSERT_EQUAL_UINT32(3, get32(row + 19));
+    TEST_ASSERT_EQUAL_UINT8(4, row[23]);
+    TEST_ASSERT_EQUAL_STRING_LEN("test", (const char *)row + 24, 4);
+
+    begin(&r, OC_API_AUDIT_LIST, 1, 5); /* every event about one number, after the first REGISTER */
+    put32(&r, first);
+    put32(&r, 0);
+    put_num(&r, "+883171746412345");
+    put16(&r, 10);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(1, ANS[0].body[0]); /* the sub.status call's record */
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_AUDIT_API, ANS[0].body[1 + 8]);
+    last_audit(detail, sizeof(detail), number, sizeof(number));
+    TEST_ASSERT_EQUAL_STRING("a5 audit.list ok after 1", detail);
+    TEST_ASSERT_EQUAL_STRING("+883171746412345", number);
+
+    begin(&r, OC_API_AUDIT_LIST, 1, 0);
+    put32(&r, 0);
+    put32(&r, 0);
+    put(&r, (uint8_t[OC_SIG_NUMBER_LEN]){ 0 }, OC_SIG_NUMBER_LEN);
+    put16(&r, 501);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    begin(&r, OC_API_AUDIT_LIST, 1, 0);
+    put32(&r, 0);
+    put32(&r, 0);
+    put(&r, (uint8_t[OC_SIG_NUMBER_LEN]){ 0x12, 0x34, 0, 0, 0, 0, 0, 0 }, OC_SIG_NUMBER_LEN);
+    put16(&r, 5);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    done();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1048,5 +1168,7 @@ int main(void)
     RUN_TEST(test_status_polls_are_audited_once_a_minute);
     RUN_TEST(test_cell_radio);
     RUN_TEST(test_reg_list);
+    RUN_TEST(test_cdr_recent);
+    RUN_TEST(test_audit_list);
     return UNITY_END();
 }

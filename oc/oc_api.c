@@ -28,6 +28,7 @@ static const struct {
     [OC_API_CELL_STATUS] = { "cell.status", 1200, 60 },  [OC_API_CORE_STATUS] = { "core.status", 1200, 60 },
     [OC_API_ROUTE_OFFER] = { "route.offer", 10, 2 },
     [OC_API_CELL_RADIO] = { "cell.radio", 1200, 60 },    [OC_API_REG_LIST] = { "reg.list", 600, 30 },
+    [OC_API_CDR_RECENT] = { "cdr.recent", 600, 30 },     [OC_API_AUDIT_LIST] = { "audit.list", 600, 30 },
 };
 
 const char *oc_api_op_name(unsigned op)
@@ -785,6 +786,100 @@ static uint8_t op_reg_list(call_t *c)
     return OC_API_OK;
 }
 
+/* A CDR leg's kind (NOC design §7.1): a cell's, or else, for the called
+ * side, the echo or the playback service, and otherwise a peer core's. */
+static uint8_t leg_kind(const oc_api_t *a, uint32_t cell, const uint8_t *number, int called)
+{
+    if (cell != 0) return 0;
+    if (called && memcmp(number, a->cfg->echo_number, OC_SIG_NUMBER_LEN) == 0) return 1;
+    if (called && memcmp(number, a->cfg->playback_number, OC_SIG_NUMBER_LEN) == 0) return 2;
+    return 3;
+}
+
+static uint8_t op_cdr_recent(call_t *c)
+{
+    uint32_t after = rd_u32(&c->r);
+    uint16_t limit = rd_u16(&c->r);
+    if (!rd_done(&c->r) || limit < 1 || limit > OC_API_CDR_MAX) return fail(c, OC_API_INVALID, "after (4), limit 1-1000");
+    snprintf(c->a->audit_what, sizeof(c->a->audit_what), "after %u", (unsigned)after);
+    sqlite3_stmt *st = q(c->a, "SELECT id, setup, answer, \"end\", cause, caller, called, cell_a, cell_b FROM cdr"
+                               " WHERE id > ?1 ORDER BY id LIMIT ?2");
+    int rc = st != NULL ? sqlite3_bind_int64(st, 1, after) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, limit);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return fail(c, OC_API_UNAVAILABLE, "store error");
+    }
+    list_start(&c->w);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN];
+        if (num_col(st, 5, caller) != 0 || num_col(st, 6, called) != 0) continue; /* a row oc_core never wrote */
+        uint32_t cell_a = (uint32_t)sqlite3_column_int64(st, 7), cell_b = (uint32_t)sqlite3_column_int64(st, 8);
+        wr_t row = { .n = 0 };
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 0));
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 1));
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 2));
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 3));
+        wr_u8(&row, (uint8_t)sqlite3_column_int(st, 4));
+        wr_bytes(&row, caller, OC_SIG_NUMBER_LEN);
+        wr_bytes(&row, called, OC_SIG_NUMBER_LEN);
+        wr_u32(&row, cell_a);
+        wr_u32(&row, cell_b);
+        wr_u8(&row, (uint8_t)(leg_kind(c->a, cell_a, caller, 0) << 4 | leg_kind(c->a, cell_b, called, 1)));
+        list_row(&c->w, row.b, row.n);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return fail(c, OC_API_UNAVAILABLE, "store error");
+    return OC_API_OK;
+}
+
+static uint8_t op_audit_list(call_t *c)
+{
+    static const uint8_t none[OC_SIG_NUMBER_LEN];
+    uint32_t after = rd_u32(&c->r), mask = rd_u32(&c->r);
+    const uint8_t *nb = rd_bytes(&c->r, OC_SIG_NUMBER_LEN);
+    uint16_t limit = rd_u16(&c->r);
+    if (!rd_done(&c->r) || limit < 1 || limit > OC_API_AUDIT_MAX) {
+        return fail(c, OC_API_INVALID, "after (4), mask (4), number, limit 1-500");
+    }
+    int any = memcmp(nb, none, sizeof(none)) == 0;
+    if (!any && !oc_sig_number_valid(nb)) return fail(c, OC_API_INVALID, "not a full number");
+    if (!any) memcpy(c->a->audit_number, nb, OC_SIG_NUMBER_LEN); /* who was looked at, in this call's own record */
+    snprintf(c->a->audit_what, sizeof(c->a->audit_what), "after %u", (unsigned)after);
+    sqlite3_stmt *st = q(c->a, "SELECT id, ts, event, number, tmid, cell_id, detail FROM audit"
+                               " WHERE id > ?1 AND (?2 = 0 OR (event < 32 AND (?2 >> event) & 1))"
+                               " AND (?3 = '' OR number = ?3) ORDER BY id LIMIT ?4");
+    char nt[OC_SIG_NUMBER_TEXT] = "";
+    if (!any) oc_sig_number_to_text(nb, nt);
+    int rc = st != NULL ? sqlite3_bind_int64(st, 1, after) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, mask);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, nt, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 4, limit);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return fail(c, OC_API_UNAVAILABLE, "store error");
+    }
+    list_start(&c->w);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        uint8_t n[OC_SIG_NUMBER_LEN];
+        if (sqlite3_column_type(st, 3) == SQLITE_NULL || num_col(st, 3, n) != 0) memset(n, 0, sizeof(n));
+        char detail[64];
+        snprintf(detail, sizeof(detail), "%s", sqlite3_column_text(st, 6) != NULL ? (const char *)sqlite3_column_text(st, 6) : "");
+        wr_t row = { .n = 0 };
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 0));
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 1));
+        wr_u8(&row, (uint8_t)sqlite3_column_int(st, 2));
+        wr_bytes(&row, n, OC_SIG_NUMBER_LEN);
+        wr_u16(&row, (uint16_t)((uint32_t)sqlite3_column_int64(st, 4) >> 16));
+        wr_u32(&row, (uint32_t)sqlite3_column_int64(st, 5));
+        wr_text(&row, detail);
+        list_row(&c->w, row.b, row.n);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return fail(c, OC_API_UNAVAILABLE, "store error");
+    return OC_API_OK;
+}
+
 static uint8_t op_core_status(call_t *c)
 {
     if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
@@ -904,7 +999,8 @@ static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
  * audited once a minute per actor (oc_api.h). */
 static int quiet_op(unsigned op)
 {
-    return op == OC_API_CELL_STATUS || op == OC_API_CORE_STATUS || op == OC_API_CELL_RADIO || op == OC_API_REG_LIST;
+    return op == OC_API_CELL_STATUS || op == OC_API_CORE_STATUS || op == OC_API_CELL_RADIO || op == OC_API_REG_LIST ||
+           op == OC_API_CDR_RECENT || op == OC_API_AUDIT_LIST;
 }
 
 /* The minute's count of op's quiet calls, as one record; the minute closed.
@@ -1028,6 +1124,8 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         case OC_API_CORE_STATUS: status = op_core_status(&c); break;
         case OC_API_CELL_RADIO: status = op_cell_radio(&c); break;
         case OC_API_REG_LIST: status = op_reg_list(&c); break;
+        case OC_API_CDR_RECENT: status = op_cdr_recent(&c); break;
+        case OC_API_AUDIT_LIST: status = op_audit_list(&c); break;
         default: status = op_sub_change(&c, op, actor); break;
         }
         if (status == OC_API_OK && c.w.err) status = fail(&c, OC_API_UNAVAILABLE, "answer too long");

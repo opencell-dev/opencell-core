@@ -29,6 +29,7 @@ static const struct {
     [OC_API_ROUTE_OFFER] = { "route.offer", 10, 2 },
     [OC_API_CELL_RADIO] = { "cell.radio", 1200, 60 },    [OC_API_REG_LIST] = { "reg.list", 600, 30 },
     [OC_API_CDR_RECENT] = { "cdr.recent", 600, 30 },     [OC_API_AUDIT_LIST] = { "audit.list", 600, 30 },
+    [OC_API_OCSS_STATUS] = { "ocss.status", 1200, 60 },  [OC_API_CORE_BLOCKS] = { "core.blocks", 120, 10 },
 };
 
 const char *oc_api_op_name(unsigned op)
@@ -880,6 +881,57 @@ static uint8_t op_audit_list(call_t *c)
     return OC_API_OK;
 }
 
+/* Calls with a leg on peer core_id. */
+static uint8_t calls_with(const oc_api_t *a, uint16_t core_id)
+{
+    uint8_t n = 0;
+    for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+        const oc_core_call_t *k = &a->core->calls[i];
+        n += k->used && ((k->a.kind == OC_CORE_LEG_PEER && k->a.peer == core_id) ||
+                         (k->b.kind == OC_CORE_LEG_PEER && k->b.peer == core_id));
+    }
+    return n;
+}
+
+static uint8_t op_ocss_status(call_t *c)
+{
+    if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
+    oc_api_peer_t p[OC_CORE_PEERS];
+    unsigned n = c->a->peers != NULL ? c->a->peers(c->a->peers_ctx, p, OC_CORE_PEERS) : 0;
+    list_start(&c->w);
+    for (unsigned i = 0; i < n && i < OC_CORE_PEERS; i++) {
+        wr_t row = { .n = 0 };
+        p[i].addr[sizeof(p[i].addr) - 1] = '\0';
+        wr_u16(&row, p[i].core_id);
+        wr_u8(&row, p[i].dials);
+        wr_u8(&row, p[i].state);
+        wr_u32(&row, p[i].since);
+        wr_u32(&row, p[i].last_rx);
+        wr_u32(&row, p[i].last_tx);
+        wr_u8(&row, calls_with(c->a, p[i].core_id));
+        wr_u32(&row, p[i].dropped);
+        wr_text(&row, p[i].addr);
+        list_row(&c->w, row.b, row.n);
+    }
+    return OC_API_OK;
+}
+
+static uint8_t op_core_blocks(call_t *c)
+{
+    if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
+    list_start(&c->w);
+    for (unsigned i = 0; i < c->a->route->n; i++) {
+        const oc_core_block_t *b = &c->a->route->b[i];
+        wr_t row = { .n = 0 };
+        wr_u16(&row, b->block_idx);
+        wr_u16(&row, b->home_core);
+        wr_u8(&row, oc_core_route_home(c->a->route, b) ? 1 : 0); /* secondaries come with plan 11 */
+        wr_text(&row, b->prefix);
+        list_row(&c->w, row.b, row.n);
+    }
+    return OC_API_OK;
+}
+
 static uint8_t op_core_status(call_t *c)
 {
     if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
@@ -1000,7 +1052,7 @@ static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
 static int quiet_op(unsigned op)
 {
     return op == OC_API_CELL_STATUS || op == OC_API_CORE_STATUS || op == OC_API_CELL_RADIO || op == OC_API_REG_LIST ||
-           op == OC_API_CDR_RECENT || op == OC_API_AUDIT_LIST;
+           op == OC_API_CDR_RECENT || op == OC_API_AUDIT_LIST || op == OC_API_OCSS_STATUS || op == OC_API_CORE_BLOCKS;
 }
 
 /* The minute's count of op's quiet calls, as one record; the minute closed.
@@ -1126,6 +1178,8 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         case OC_API_REG_LIST: status = op_reg_list(&c); break;
         case OC_API_CDR_RECENT: status = op_cdr_recent(&c); break;
         case OC_API_AUDIT_LIST: status = op_audit_list(&c); break;
+        case OC_API_OCSS_STATUS: status = op_ocss_status(&c); break;
+        case OC_API_CORE_BLOCKS: status = op_core_blocks(&c); break;
         default: status = op_sub_change(&c, op, actor); break;
         }
         if (status == OC_API_OK && c.w.err) status = fail(&c, OC_API_UNAVAILABLE, "answer too long");

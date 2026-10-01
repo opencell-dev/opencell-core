@@ -1147,6 +1147,81 @@ static void test_audit_list(void)
     done();
 }
 
+/* What the daemon would say about its OCSS peers (oc_core_main.c's api_peers). */
+static unsigned fake_peers(void *ctx, oc_api_peer_t *out, unsigned cap)
+{
+    (void)ctx;
+    TEST_ASSERT_TRUE(cap >= 2);
+    memset(out, 0, 2 * sizeof(*out));
+    out[0].core_id = 2;
+    out[0].dials = 1;
+    out[0].state = 4;
+    out[0].since = UNIX0 + 5u;
+    out[0].last_rx = UNIX0 + 60u;
+    out[0].last_tx = UNIX0 + 61u;
+    out[0].dropped = 3;
+    snprintf(out[0].addr, sizeof(out[0].addr), "10.99.0.2:7443");
+    out[1].core_id = 3;
+    out[1].state = 0;
+    snprintf(out[1].addr, sizeof(out[1].addr), "-");
+    return 2;
+}
+
+/* ocss.status and core.blocks (NOC design §7.1). */
+static void test_ocss_status_and_core_blocks(void)
+{
+    world();
+    req_t r;
+    begin(&r, OC_API_OCSS_STATUS, 1, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(0, ANS[0].body[0]); /* no OCSS configured */
+    api.peers = fake_peers;
+    core.calls[0].used = 1;
+    core.calls[0].a.kind = OC_CORE_LEG_CELL;
+    core.calls[0].a.cell = 3;
+    core.calls[0].b.kind = OC_CORE_LEG_PEER;
+    core.calls[0].b.peer = 2;
+    begin(&r, OC_API_OCSS_STATUS, 1, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(2, ANS[0].body[0]);
+    const uint8_t *row = ANS[0].body + 1;
+    TEST_ASSERT_EQUAL_UINT16(2, get16(row));
+    TEST_ASSERT_EQUAL_UINT8(1, row[2]);                     /* this core dials it */
+    TEST_ASSERT_EQUAL_UINT8(4, row[3]);                     /* up */
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 5u, get32(row + 4));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 60u, get32(row + 8));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 61u, get32(row + 12));
+    TEST_ASSERT_EQUAL_UINT8(1, row[16]);                    /* one call over it */
+    TEST_ASSERT_EQUAL_UINT32(3, get32(row + 17));           /* frames dropped */
+    TEST_ASSERT_EQUAL_UINT8(14, row[21]);
+    TEST_ASSERT_EQUAL_STRING_LEN("10.99.0.2:7443", (const char *)row + 22, 14);
+    row += 22 + 14;
+    TEST_ASSERT_EQUAL_UINT16(3, get16(row));
+    TEST_ASSERT_EQUAL_UINT8(0, row[3]);                     /* down */
+    TEST_ASSERT_EQUAL_UINT8(0, row[16]);
+    core.calls[0].used = 0;
+
+    begin(&r, OC_API_CORE_BLOCKS, 1, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(2, ANS[0].body[0]);
+    row = ANS[0].body + 1;
+    TEST_ASSERT_EQUAL_UINT16(1, get16(row));
+    TEST_ASSERT_EQUAL_UINT16(1, get16(row + 2));
+    TEST_ASSERT_EQUAL_UINT8(1, row[4]); /* home */
+    TEST_ASSERT_EQUAL_UINT8(7, row[5]);
+    TEST_ASSERT_EQUAL_STRING_LEN("8831717", (const char *)row + 6, 7);
+    row += 6 + 7;
+    TEST_ASSERT_EQUAL_UINT16(2, get16(row));
+    TEST_ASSERT_EQUAL_UINT16(2, get16(row + 2));
+    TEST_ASSERT_EQUAL_UINT8(0, row[4]); /* another core's */
+    TEST_ASSERT_EQUAL_STRING_LEN("8831717555", (const char *)row + 6, 10);
+
+    begin(&r, OC_API_CORE_BLOCKS, 1, 0);
+    put8(&r, 1); /* a field it does not take */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    done();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1170,5 +1245,6 @@ int main(void)
     RUN_TEST(test_reg_list);
     RUN_TEST(test_cdr_recent);
     RUN_TEST(test_audit_list);
+    RUN_TEST(test_ocss_status_and_core_blocks);
     return UNITY_END();
 }

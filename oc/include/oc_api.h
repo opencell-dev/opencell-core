@@ -71,6 +71,15 @@
  *                         mask (4: bit e for event e;    number (zero: none), the TMID's top 16 bits
  *                         0: every event), number (zero: (2), cell (4), detail (text)
  *                         any), limit (2, 1-500)
+ *   0x14 ocss.status      -                              rows, per configured OCSS peer: core id (2),
+ *                                                        this core dials it (1), state (1: 0 down, 1
+ *                                                        connecting, 2 handshake, 3 open, 4 up), since,
+ *                                                        last rx, last tx (4 each, unix s; 0 never),
+ *                                                        calls (1), frames dropped (4), address (text;
+ *                                                        "-": it dials here)
+ *   0x15 core.blocks      -                              rows: block index (2), home core (2), this
+ *                                                        core's role (1: 0 none, 1 home, 2 secondary),
+ *                                                        prefix (text, digits)
  *
  * The core never answers with K, OPc, SQN or a token secret; the QR text
  * of a token it has just issued is the one secret it gives (spec §7).
@@ -114,7 +123,8 @@ enum {
     OC_API_NUM_FREE = 0x01, OC_API_NUM_CHECK, OC_API_SUB_CREATE, OC_API_SUB_REISSUE, OC_API_SUB_STATUS,
     OC_API_SUB_RELEASE, OC_API_SUB_DISABLE, OC_API_SUB_ENABLE, OC_API_CDR_LIST, OC_API_CELL_ADD,
     OC_API_CELL_SET_CERT, OC_API_CELL_REVOKE, OC_API_CELL_STATUS, OC_API_CORE_STATUS, OC_API_ROUTE_OFFER,
-    OC_API_CELL_RADIO, OC_API_REG_LIST, OC_API_CDR_RECENT, OC_API_AUDIT_LIST,
+    OC_API_CELL_RADIO, OC_API_REG_LIST, OC_API_CDR_RECENT, OC_API_AUDIT_LIST, OC_API_OCSS_STATUS,
+    OC_API_CORE_BLOCKS,
     OC_API_OPS /* one past the last */
 };
 #define OC_API_ANSWER 0x80u /* | op */
@@ -134,6 +144,17 @@ typedef struct {
     uint64_t window_us;       /* the minute's end (0: none open) */
 } oc_api_rate_t;
 
+/* One OCSS peer as ocss.status shows it: the daemon fills these from its
+ * OCSS links (oc_ocss, in oc_net, which oc_api does not link against). */
+typedef struct {
+    uint16_t core_id;
+    uint8_t  dials; /* this core dials it */
+    uint8_t  state; /* 0 down, 1 connecting, 2 handshake, 3 open, 4 up */
+    uint32_t since, last_rx, last_tx; /* unix s; 0 never */
+    uint32_t dropped; /* frames that did not decode, on its connection */
+    char     addr[64]; /* "-": it dials this core */
+} oc_api_peer_t;
+
 /* The minute of a read-only operation's quiet audit (above). */
 typedef struct {
     uint32_t actor;     /* whose minute it is */
@@ -149,6 +170,9 @@ typedef struct {
     uint64_t (*now_us)(void);   /* monotonic: rate limits, uptime, oc_core's clock */
     uint32_t (*unix_now)(void); /* wall clock: token expiry, registration times */
     const char *name, *version; /* core.status */
+    /* ocss.status: up to cap configured peers into out, how many; NULL: no OCSS */
+    unsigned (*peers)(void *ctx, oc_api_peer_t *out, unsigned cap);
+    void     *peers_ctx;
     uint64_t    started_us;
     oc_api_rate_t rate[OC_API_OPS];
     oc_api_quiet_t quiet[OC_API_OPS];

@@ -423,6 +423,43 @@ static const char *cred_path(const char *v, char *buf, size_t cap)
 
 static uint32_t unix_now(void) { return (uint32_t)time(NULL); }
 
+/* ocss.status (oc_api.h): each configured peer, from the core's view of
+ * its link once it is up, else from the transport's (connecting,
+ * handshake, open). Monotonic times become unix seconds. */
+static unsigned api_peers(void *ctx, oc_api_peer_t *out, unsigned cap)
+{
+    (void)ctx;
+    uint64_t now = mono_us();
+    uint32_t wall = unix_now();
+    unsigned n = 0;
+#define OC_WALL(t) ((t) == 0 || (t) > now ? 0u : wall - (uint32_t)((now - (t)) / 1000000u))
+    for (unsigned i = 0; i < D.ocss_cfg.npeer && n < cap; i++) {
+        const oc_ocss_peer_t *p = &D.ocss_cfg.peer[i];
+        oc_api_peer_t *o = &out[n++];
+        memset(o, 0, sizeof(*o));
+        o->core_id = p->core_id;
+        o->dials = p->addr[0] != '\0';
+        snprintf(o->addr, sizeof(o->addr), "%s", p->addr[0] != '\0' ? p->addr : "-");
+        for (unsigned c = 0; c < OC_OCSS_CONNS; c++) {
+            const oc_ocss_conn_t *k = &D.ocss.c[c];
+            if (k->state == 0 || k->core_id != p->core_id) continue;
+            o->state = (uint8_t)k->state;
+            o->since = OC_WALL(k->since_us);
+            o->dropped = k->bad;
+        }
+        for (unsigned c = 0; c < OC_CORE_PEERS; c++) {
+            const oc_core_peer_t *k = &D.core.peers[c];
+            if (!k->used || !k->up || k->core_id != p->core_id) continue;
+            o->state = 4;
+            o->since = OC_WALL(k->since);
+            o->last_rx = OC_WALL(k->last_rx);
+            o->last_tx = OC_WALL(k->last_tx);
+        }
+    }
+#undef OC_WALL
+    return n;
+}
+
 /* The admin API's state (always: its expiry job runs without a listener
  * too) and, with api_listen, its TLS listener. 0 or -1 (logged). */
 static int api_start(void)
@@ -437,6 +474,7 @@ static int api_start(void)
     D.api.unix_now = unix_now;
     D.api.name = D.name;
     D.api.version = OC_VERSION;
+    D.api.peers = api_peers;
     oc_api_init(&D.api);
     for (unsigned i = 0; oc_kv_nth(&D.kv, "api_rate", i) != NULL; i++) {
         if (oc_api_rate_set(&D.api, oc_kv_nth(&D.kv, "api_rate", i), err, sizeof(err)) != 0) {

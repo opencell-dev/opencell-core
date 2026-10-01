@@ -71,3 +71,7 @@ add_test(NAME test_oc_api_proc
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_api_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_api>
                  $<TARGET_FILE:tool_oc_hello> ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_api_proc PROPERTIES FIXTURES_REQUIRED pki)
+
+# The playback clip's generator (laptop only: skipped without libflite1, numpy, scipy).
+add_test(NAME test_oc_clip_gen COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_clip_gen.sh ${PROJECT_SOURCE_DIR}/tools/clip/oc-clip-gen)
+set_tests_properties(test_oc_clip_gen PROPERTIES SKIP_RETURN_CODE 77)

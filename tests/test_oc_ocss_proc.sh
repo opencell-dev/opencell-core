@@ -62,9 +62,10 @@ ocss_ca = $PKI/ca.crt
 EOF2
 
 # Configs that can't work stop oc-core before anything starts.
-refused() { # WHAT SED-EXPR MESSAGE
-    sed "$2" "$T/core1.conf" >"$T/bad.conf"
-    out=$(timeout 5 "$OC" --config "$T/bad.conf" --key-file "$T/key1" 2>&1); rc=$?
+refused() { # WHAT SED-EXPR MESSAGE [BASE_CONF KEY_FILE]
+    local base=${4:-$T/core1.conf} key=${5:-$T/key1}
+    sed "$2" "$base" >"$T/bad.conf"
+    out=$(timeout 5 "$OC" --config "$T/bad.conf" --key-file "$key" 2>&1); rc=$?
     [ "$rc" = 1 ] || fail "$1: exit $rc"
     expect "$out" "$3"
 }
@@ -75,6 +76,12 @@ refused "a clip that is not whole payloads" "s|$T/clip.bit|$T/short.bit|" "a who
 refused "a service number of another core's block" 's/^playback = .*/playback = +883150355500102/' \
     "not in a block this core is home for"
 refused "a peer with a bad fingerprint" 's/^peer = 2 \(.*\) .*/peer = 2 \1 abc/' "CORE_ID ADDRESS|- SHA256"
+# Review M2 (spec §7.1): the lower core_id dials; and a duplicate pin.
+refused "'-' given for a higher core_id (this core must dial it)" "s|127.0.0.1:$PORT|-|" "the lower core_id dials"
+refused "an address given for a lower core_id (it dials here)" 's|^peer = 1 - |peer = 1 127.0.0.1:1 |' \
+    "the lower core_id dials" "$T/core2.conf" "$T/key2"
+refused "two peers with the same certificate fingerprint" "\$a peer = 3 127.0.0.1:19999 $FPR2" \
+    "same certificate fingerprint"
 
 "$CALL" hss "$T/hss.txt" || fail "tool_oc_call hss"
 A1=("$OC" admin --offline --config "$T/core1.conf" --key-file "$T/key1")

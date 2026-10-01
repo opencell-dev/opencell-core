@@ -255,6 +255,13 @@ static void opened(oc_ocss_t *s, oc_ocss_conn_t *c)
         conn_end(s, c, 0, OC_LOG_WARNING, "the certificate is not the peer's");
         return;
     }
+    /* review M2: "the lower core_id dials" (spec §7.1) - a peer this core
+     * has an address for is one THIS core should dial; an inbound link
+     * claiming to be it did not come from the dial it was owed. */
+    if (!c->dialled && s->cfg.peer[i].addr[0] != '\0') {
+        conn_end(s, c, 0, OC_LOG_WARNING, "this core dials that peer; an inbound link from it is refused");
+        return;
+    }
     c->core_id = s->cfg.peer[i].core_id;
     c->state = C_OPEN;
     c->since_us = s->cfg.now_us();

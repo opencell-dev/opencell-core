@@ -226,9 +226,23 @@ static int load_peers(void)
                 oc_log(OC_LOG_ERR, "config: peer %u is named twice", id);
                 return -1;
             }
+            if (memcmp(o->peer[j].fpr, o->peer[i].fpr, 32) == 0) { /* review M2 */
+                oc_log(OC_LOG_ERR, "config: peer %u and peer %u have the same certificate fingerprint",
+                       o->peer[j].core_id, id);
+                return -1;
+            }
+        }
+        /* review M2 (spec §7.1): the lower core_id dials, so an address
+         * names a peer with a higher id, "-" one with a lower id. */
+        int has_addr = strcmp(addr, "-") != 0;
+        if ((id < D.cfg.core_id) == has_addr) {
+            oc_log(OC_LOG_ERR, "config: peer %u: the lower core_id dials; %s", id,
+                   id < D.cfg.core_id ? "give '-' here, not an address (that core dials this one)"
+                                      : "give its address here (this core dials it)");
+            return -1;
         }
         o->peer[i].core_id = (uint16_t)id;
-        if (strcmp(addr, "-") != 0) snprintf(o->peer[i].addr, sizeof(o->peer[i].addr), "%s", addr);
+        if (has_addr) snprintf(o->peer[i].addr, sizeof(o->peer[i].addr), "%s", addr);
         o->npeer = i + 1u;
     }
     for (unsigned i = 0; i < D.route.n; i++) { /* every block homed elsewhere needs its home as a peer */

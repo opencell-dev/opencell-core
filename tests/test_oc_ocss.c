@@ -253,6 +253,36 @@ static void test_a_link_whose_peer_goes_is_reported_and_dialled_again(void)
     done();
 }
 
+/* Review M2: "the lower core_id dials" (spec §7.1) means core 2, told it
+ * dials core 1 (an address for a lower core_id), must not instead accept
+ * an inbound link claiming to be core 1 - that connection should have
+ * come from core 2 dialling out, not core 1 dialling in. */
+static void test_a_peer_configured_to_be_dialled_refuses_an_inbound_link(void)
+{
+    static const oc_core_io_t IO1 = { NULL, send1, close1, rnd, unix_now, NULL };
+    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL };
+    char err[300];
+    memset(&C1, 0, sizeof(C1));
+    memset(&C2, 0, sizeof(C2));
+    NOW = 1000000u;
+    NCELL = 0;
+    make_core(&C1, 1, &IO1);
+    make_core(&C2, 2, &IO2);
+    oc_ocss_cfg_t c2 = { "127.0.0.1:0", f("core2.crt"), f("core2.key"), f("ca.crt"), { { 0 } }, 1,
+                         &C2.k,         now_us,          new_link,        NULL };
+    c2.peer[0].core_id = 1;
+    snprintf(c2.peer[0].addr, sizeof(c2.peer[0].addr), "127.0.0.1:1"); /* core 2 thinks it dials core 1 */
+    fpr("core.fpr", c2.peer[0].fpr);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_ocss_open(&C2.o, &c2, err, sizeof(err)), err);
+    oc_ocss_cfg_t c1 = { NULL, f("core.crt"), f("core.key"), f("ca.crt"), { { 0 } }, 1, &C1.k, now_us, new_link, NULL };
+    c1.peer[0].core_id = 2;
+    snprintf(c1.peer[0].addr, sizeof(c1.peer[0].addr), "127.0.0.1:%u", C2.o.port);
+    fpr("core2.fpr", c1.peer[0].fpr);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_ocss_open(&C1.o, &c1, err, sizeof(err)), err);
+    TEST_ASSERT_FALSE(linked_within(400)); /* core 1 dials in, but core 2 refuses the accept */
+    done();
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -262,5 +292,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_call_from_core_1_reaches_core_2s_echo);
     RUN_TEST(test_a_core_that_has_not_pinned_the_other_refuses_it);
     RUN_TEST(test_a_link_whose_peer_goes_is_reported_and_dialled_again);
+    RUN_TEST(test_a_peer_configured_to_be_dialled_refuses_an_inbound_link);
     return UNITY_END();
 }

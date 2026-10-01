@@ -45,6 +45,7 @@ typedef struct {
     uint32_t tmid;
     uint16_t seq;     /* MEDIA sent on this leg */
     uint8_t  mt;      /* a call to here (CALL_OFFER) */
+    uint32_t refused; /* MEDIA from the core the media gate refused on this leg */
 } oc_cell_leg_t;
 
 /* A registration here, as oc_sig_net's registered() reported it: the

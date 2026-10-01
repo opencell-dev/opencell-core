@@ -30,6 +30,7 @@ static const struct {
     [OC_API_CELL_RADIO] = { "cell.radio", 1200, 60 },    [OC_API_REG_LIST] = { "reg.list", 600, 30 },
     [OC_API_CDR_RECENT] = { "cdr.recent", 600, 30 },     [OC_API_AUDIT_LIST] = { "audit.list", 600, 30 },
     [OC_API_OCSS_STATUS] = { "ocss.status", 1200, 60 },  [OC_API_CORE_BLOCKS] = { "core.blocks", 120, 10 },
+    [OC_API_CELL_MODE] = { "cell.mode", 20, 5 },
 };
 
 const char *oc_api_op_name(unsigned op)
@@ -932,6 +933,22 @@ static uint8_t op_core_blocks(call_t *c)
     return OC_API_OK;
 }
 
+static uint8_t op_cell_mode(call_t *c)
+{
+    uint32_t id = rd_u32(&c->r);
+    uint8_t mode = rd_u8(&c->r);
+    if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
+    c->a->audit_cell = id;
+    if (mode != 1 && mode != 2) return fail(c, OC_API_INVALID, "mode: 1 part15, 2 part97");
+    snprintf(c->a->audit_what, sizeof(c->a->audit_what), "%s", mode == 2 ? "part97" : "part15");
+    switch (oc_core_cell_mode(c->a->core, id, mode == 2 ? OC_SIG_MODE_PART97 : OC_SIG_MODE_PART15, c->a->now_us())) {
+    case 0: return OC_API_OK;
+    case -1: return fail(c, OC_API_NOT_FOUND, "no such cell");
+    case -3: return fail(c, OC_API_INVALID, "revoked");
+    default: return fail(c, OC_API_UNAVAILABLE, "store error");
+    }
+}
+
 static uint8_t op_core_status(call_t *c)
 {
     if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
@@ -1180,6 +1197,7 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         case OC_API_AUDIT_LIST: status = op_audit_list(&c); break;
         case OC_API_OCSS_STATUS: status = op_ocss_status(&c); break;
         case OC_API_CORE_BLOCKS: status = op_core_blocks(&c); break;
+        case OC_API_CELL_MODE: status = op_cell_mode(&c); break;
         default: status = op_sub_change(&c, op, actor); break;
         }
         if (status == OC_API_OK && c.w.err) status = fail(&c, OC_API_UNAVAILABLE, "answer too long");

@@ -1222,6 +1222,46 @@ static void test_ocss_status_and_core_blocks(void)
     done();
 }
 
+/* cell.mode (NOC design §7.1): the mode switch, audited with the account;
+ * the cell's link drops and its next HELLO takes the mode. */
+static void test_cell_mode(void)
+{
+    world();
+    char detail[64], number[32];
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&core, 3, "Lancaster 1", OC_SIG_MODE_PART15, 0));
+    cell_reports(1, 3, NULL, 0);
+    TEST_ASSERT_NOT_NULL(oc_core_cell_tel(&core, 3)); /* linked */
+    req_t r;
+    begin(&r, OC_API_CELL_MODE, 1, 42);
+    put32(&r, 3);
+    put8(&r, 2);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    last_audit(detail, sizeof(detail), number, sizeof(number));
+    TEST_ASSERT_EQUAL_STRING("a42 cell.mode ok part97", detail);
+    TEST_ASSERT_NULL(oc_core_cell_tel(&core, 3)); /* the link was dropped */
+    oc_core_store_t st = oc_sql_store(sql);
+    oc_core_cell_t cell;
+    TEST_ASSERT_EQUAL_INT(0, st.cell_get(st.ctx, 3, &cell));
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, cell.mode);
+
+    begin(&r, OC_API_CELL_MODE, 1, 42);
+    put32(&r, 3);
+    put8(&r, 3);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    begin(&r, OC_API_CELL_MODE, 1, 42);
+    put32(&r, 9);
+    put8(&r, 1);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, call1(&r));
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_revoke(&core, 3, mono));
+    begin(&r, OC_API_CELL_MODE, 1, 42);
+    put32(&r, 3);
+    put8(&r, 1);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    TEST_ASSERT_EQUAL_INT(0, st.cell_get(st.ctx, 3, &cell));
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, cell.mode); /* unchanged */
+    done();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1246,5 +1286,6 @@ int main(void)
     RUN_TEST(test_cdr_recent);
     RUN_TEST(test_audit_list);
     RUN_TEST(test_ocss_status_and_core_blocks);
+    RUN_TEST(test_cell_mode);
     return UNITY_END();
 }

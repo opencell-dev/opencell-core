@@ -80,6 +80,10 @@
  *   0x15 core.blocks      -                              rows: block index (2), home core (2), this
  *                                                        core's role (1: 0 none, 1 home, 2 secondary),
  *                                                        prefix (text, digits)
+ *   0x16 cell.mode        cell id (4), mode (1: 1        -  (as `oc-core admin cell mode`: stored, the
+ *                         part15, 2 part97)                 link dropped, the cell takes it at its next
+ *                                                           HELLO and its calls end; a revoked cell:
+ *                                                           invalid, nothing changed)
  *
  * The core never answers with K, OPc, SQN or a token secret; the QR text
  * of a token it has just issued is the one secret it gives (spec §7).
@@ -124,7 +128,7 @@ enum {
     OC_API_SUB_RELEASE, OC_API_SUB_DISABLE, OC_API_SUB_ENABLE, OC_API_CDR_LIST, OC_API_CELL_ADD,
     OC_API_CELL_SET_CERT, OC_API_CELL_REVOKE, OC_API_CELL_STATUS, OC_API_CORE_STATUS, OC_API_ROUTE_OFFER,
     OC_API_CELL_RADIO, OC_API_REG_LIST, OC_API_CDR_RECENT, OC_API_AUDIT_LIST, OC_API_OCSS_STATUS,
-    OC_API_CORE_BLOCKS,
+    OC_API_CORE_BLOCKS, OC_API_CELL_MODE,
     OC_API_OPS /* one past the last */
 };
 #define OC_API_ANSWER 0x80u /* | op */

@@ -95,9 +95,11 @@ int oc_ocss_open(oc_ocss_t *s, const oc_ocss_cfg_t *cfg, char *err, size_t cap)
         return -1;
     }
     int fd = socket(sa.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), one = 1;
-    /* IP_FREEBIND: the WireGuard address may come up after the core starts */
+    /* IP_FREEBIND/IPV6_FREEBIND (review M5): the WireGuard address may come
+     * up after the core starts, on either family. */
     if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
         (sa.ss_family == AF_INET && setsockopt(fd, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one)) != 0) ||
+        (sa.ss_family == AF_INET6 && setsockopt(fd, IPPROTO_IPV6, IPV6_FREEBIND, &one, sizeof(one)) != 0) ||
         bind(fd, (struct sockaddr *)&sa, len) != 0 || listen(fd, 8) != 0) {
         snprintf(err, cap, "ocss_listen = '%s': %s", cfg->listen, strerror(errno));
         if (fd >= 0) close(fd);

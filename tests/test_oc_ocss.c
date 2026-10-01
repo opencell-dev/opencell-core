@@ -313,6 +313,26 @@ static void test_a_second_handshake_from_the_same_address_is_refused(void)
     done();
 }
 
+/* Review M5: an IPv6 ocss_listen takes IPV6_FREEBIND too (not IPv4 only),
+ * so it can bind an address that is not up yet (the header already
+ * documents IPv6 listen addresses). [::1]:0 is always up, so this only
+ * exercises the AF_INET6 bind path without a not-yet-configured address
+ * to prove FREEBIND's benefit; that needs a netns this sandbox lacks. */
+static void test_an_ipv6_listen_address_binds_too(void)
+{
+    char err[300];
+    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL };
+    memset(&C2, 0, sizeof(C2));
+    make_core(&C2, 2, &IO2);
+    oc_ocss_cfg_t c2 = { "[::1]:0", f("core2.crt"), f("core2.key"), f("ca.crt"), { { 0 } }, 1, &C2.k, now_us, new_link,
+                         NULL };
+    c2.peer[0].core_id = 1;
+    fpr("core.fpr", c2.peer[0].fpr);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_ocss_open(&C2.o, &c2, err, sizeof(err)), err);
+    TEST_ASSERT_NOT_EQUAL(0, C2.o.port);
+    oc_ocss_close(&C2.o);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -324,5 +344,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_link_whose_peer_goes_is_reported_and_dialled_again);
     RUN_TEST(test_a_peer_configured_to_be_dialled_refuses_an_inbound_link);
     RUN_TEST(test_a_second_handshake_from_the_same_address_is_refused);
+    RUN_TEST(test_an_ipv6_listen_address_binds_too);
     return UNITY_END();
 }

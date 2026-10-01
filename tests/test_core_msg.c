@@ -413,6 +413,96 @@ static void test_ocss_what_does_not_decode(void)
     TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(free_type, sizeof(free_type), &m));
 }
 
+/* CELL_STATUS (NOC design §7.3): the bytes pinned, a full part fits a
+ * frame, and what must not decode. */
+static void test_cell_status(void)
+{
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CELL_STATUS;
+    m.u.cell_status.ver = OC_CORE_STATUS_VER;
+    m.u.cell_status.part = OC_CORE_STATUS_LAST | 0;
+    m.u.cell_status.nradio = 1;
+    oc_core_radio_t *x = &m.u.cell_status.radio[0];
+    x->radio = 0;
+    x->role = 1;
+    x->band = 0;
+    x->fw[0] = 0;
+    x->fw[1] = 3;
+    x->fw[2] = 1;
+    x->anchor = 30;
+    x->pps = 1;
+    x->timebase = 1;
+    x->temp_c = -5;
+    x->uptime_s = 0x01020304u;
+    x->schedules = 1000;
+    x->rach = 7;
+    x->attach = 3;
+    x->grants = 3;
+    x->ack_err = 2;
+    x->ack_late = 1;
+    x->late_slots = 4;
+    x->radio_errors = 5;
+    x->sched_misses = 6;
+    x->uart_crc = 0;
+    x->last_radio_err = -707;
+    m.u.cell_status.nterm = 1;
+    m.u.cell_status.term[0].tmid = 0x76ad0488u;
+    m.u.cell_status.term[0].rssi_dbm = -97;
+    m.u.cell_status.term[0].snr_qdb = 30;
+    m.u.cell_status.term[0].heard_age_s = 2;
+    m.u.cell_status.term[0].ul_rx = 120;
+    static const uint8_t want[] = {
+        0x00, 0x43, 0x07, 0x01, 0x80, 0x01,                         /* len 67, type, ver, last part 0, 1 radio */
+        0x00, 0x01, 0x00, 0x00, 0x03, 0x01, 0x1E, 0x01, 0x01, 0xFB, /* radio 0, bs, 915, fw 0.3.1, anchor 30, PPS, timebase, -5 C */
+        0x04, 0x03, 0x02, 0x01,                                     /* uptime */
+        0xE8, 0x03, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, /* the cell's six counters */
+        0x04, 0x00, 0x05, 0x00, 0x06, 0x00, 0x00, 0x00, 0x3D, 0xFD, /* late, radio errors, misses, UART CRC, -707 */
+        0x01,                                                       /* 1 terminal */
+        0x88, 0x04, 0xAD, 0x76, 0x9F, 0xFF, 0x1E, 0x00, 0x02, 0x00, 0x78, 0x00, 0x00, 0x00,
+    };
+    golden(&m, want, sizeof(want));
+
+    /* the most one part holds still fits a frame, and round-trips */
+    m.u.cell_status.part = 3;
+    m.u.cell_status.nradio = OC_CORE_STATUS_RADIOS;
+    m.u.cell_status.nterm = OC_CORE_STATUS_TERMS;
+    for (unsigned i = 0; i < OC_CORE_STATUS_TERMS; i++) {
+        m.u.cell_status.term[i].tmid = 0x1000u + i;
+        m.u.cell_status.term[i].rssi_dbm = OC_CORE_STATUS_NONE;
+        m.u.cell_status.term[i].snr_qdb = OC_CORE_STATUS_NONE;
+        m.u.cell_status.term[i].heard_age_s = 65535u;
+    }
+    m.u.cell_status.radio[1] = m.u.cell_status.radio[0];
+    m.u.cell_status.radio[1].radio = 1;
+    uint8_t buf[OC_CORE_FRAME_MAX];
+    oc_core_msg_t back;
+    size_t n = oc_core_encode(&m, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_size_t(3u + 3u + 2u * 48u + 1u + 28u * 14u, n);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_decode(buf, n, &back));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(&m, &back, sizeof(back));
+
+    /* too many radios or terminals, or another version: not encoded, not decoded */
+    m.u.cell_status.nterm = OC_CORE_STATUS_TERMS + 1u;
+    TEST_ASSERT_EQUAL_size_t(0, oc_core_encode(&m, buf, sizeof(buf)));
+    m.u.cell_status.nterm = 1;
+    m.u.cell_status.ver = 2;
+    TEST_ASSERT_EQUAL_size_t(0, oc_core_encode(&m, buf, sizeof(buf)));
+    m.u.cell_status.ver = OC_CORE_STATUS_VER;
+    n = oc_core_encode(&m, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(n > 0);
+    buf[3] = 2; /* ver */
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(buf, n, &back));
+    buf[3] = 1;
+    buf[5] = OC_CORE_STATUS_RADIOS + 1u; /* n radios */
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(buf, n, &back));
+    buf[5] = 2;
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(buf, n - 1u, &back)); /* cut short (and its length field disagrees) */
+    buf[1] = (uint8_t)(buf[1] - 1u);
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(buf, n - 1u, &back)); /* cut short, length consistent */
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -424,5 +514,6 @@ int main(void)
     RUN_TEST(test_cell_cfg);
     RUN_TEST(test_ocss_golden_bytes);
     RUN_TEST(test_ocss_what_does_not_decode);
+    RUN_TEST(test_cell_status);
     return UNITY_END();
 }

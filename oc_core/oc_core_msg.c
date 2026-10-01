@@ -53,6 +53,69 @@ static void rnum(rd_t *r, uint8_t num[OC_SIG_NUMBER_LEN])
     if (!oc_sig_number_valid(num)) r->bad = 1;
 }
 
+static void w_radio(wr_t *w, const oc_core_radio_t *x)
+{
+    w8(w, x->radio);
+    w8(w, x->role);
+    w8(w, x->band);
+    wb(w, x->fw, 3);
+    w8(w, x->anchor);
+    w8(w, x->pps);
+    w8(w, x->timebase);
+    w8(w, (uint8_t)x->temp_c);
+    w32(w, x->uptime_s);
+    w32(w, x->schedules);
+    w32(w, x->rach);
+    w32(w, x->attach);
+    w32(w, x->grants);
+    w32(w, x->ack_err);
+    w32(w, x->ack_late);
+    w16(w, x->late_slots);
+    w16(w, x->radio_errors);
+    w16(w, x->sched_misses);
+    w16(w, x->uart_crc);
+    w16(w, (uint16_t)x->last_radio_err);
+}
+static void r_radio(rd_t *r, oc_core_radio_t *x)
+{
+    x->radio = r8(r);
+    x->role = r8(r);
+    x->band = r8(r);
+    rb(r, x->fw, 3);
+    x->anchor = r8(r);
+    x->pps = r8(r);
+    x->timebase = r8(r);
+    x->temp_c = (int8_t)r8(r);
+    x->uptime_s = r32(r);
+    x->schedules = r32(r);
+    x->rach = r32(r);
+    x->attach = r32(r);
+    x->grants = r32(r);
+    x->ack_err = r32(r);
+    x->ack_late = r32(r);
+    x->late_slots = r16(r);
+    x->radio_errors = r16(r);
+    x->sched_misses = r16(r);
+    x->uart_crc = r16(r);
+    x->last_radio_err = (int16_t)r16(r);
+}
+static void w_term(wr_t *w, const oc_core_term_sig_t *t)
+{
+    w32(w, t->tmid);
+    w16(w, (uint16_t)t->rssi_dbm);
+    w16(w, (uint16_t)t->snr_qdb);
+    w16(w, t->heard_age_s);
+    w32(w, t->ul_rx);
+}
+static void r_term(rd_t *r, oc_core_term_sig_t *t)
+{
+    t->tmid = r32(r);
+    t->rssi_dbm = (int16_t)r16(r);
+    t->snr_qdb = (int16_t)r16(r);
+    t->heard_age_s = r16(r);
+    t->ul_rx = r32(r);
+}
+
 static void w_av(wr_t *w, const oc_core_av_t *av)
 {
     wb(w, av->rand, 16);
@@ -122,6 +185,17 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         sn = oc_sig_body_encode(&cl, sig, sizeof(sig));
         if (sn == 0) return 0;
         wb(&w, sig, sn);
+        break;
+    }
+    case OC_CORE_CELL_STATUS: {
+        const uint8_t nr = m->u.cell_status.nradio, nt = m->u.cell_status.nterm;
+        if (m->u.cell_status.ver != OC_CORE_STATUS_VER || nr > OC_CORE_STATUS_RADIOS || nt > OC_CORE_STATUS_TERMS) return 0;
+        w8(&w, m->u.cell_status.ver);
+        w8(&w, m->u.cell_status.part);
+        w8(&w, nr);
+        for (uint8_t i = 0; i < nr; i++) w_radio(&w, &m->u.cell_status.radio[i]);
+        w8(&w, nt);
+        for (uint8_t i = 0; i < nt; i++) w_term(&w, &m->u.cell_status.term[i]);
         break;
     }
     case OC_CORE_ACT_FWD:
@@ -262,6 +336,16 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         r.at = len;
         break;
     }
+    case OC_CORE_CELL_STATUS:
+        m->u.cell_status.ver = r8(&r);
+        m->u.cell_status.part = r8(&r);
+        m->u.cell_status.nradio = r8(&r);
+        if (m->u.cell_status.ver != OC_CORE_STATUS_VER || m->u.cell_status.nradio > OC_CORE_STATUS_RADIOS) return -1;
+        for (uint8_t i = 0; i < m->u.cell_status.nradio; i++) r_radio(&r, &m->u.cell_status.radio[i]);
+        m->u.cell_status.nterm = r8(&r);
+        if (m->u.cell_status.nterm > OC_CORE_STATUS_TERMS) return -1;
+        for (uint8_t i = 0; i < m->u.cell_status.nterm; i++) r_term(&r, &m->u.cell_status.term[i]);
+        break;
     case OC_CORE_ACT_FWD:
         m->u.act_fwd.req = r16(&r);
         m->u.act_fwd.tmid = r32(&r);

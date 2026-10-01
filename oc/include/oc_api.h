@@ -56,7 +56,14 @@
  * its cell column), except calls a rate limit refused: the first in each
  * minute is audited, the rest counted into one record at the minute's end.
  * Every operation has its rate limit, route.offer too; op 0 and unknown
- * ops share one of their own, named "unknown" (api_rate = unknown ...). 
+ * ops share one of their own, named "unknown" (api_rate = unknown ...).
+ *
+ * A read-only status call that names no number and no cell (core.status,
+ * cell.status 0: the NOC's polls, NOC design §7) is audited once a minute
+ * per (operation, actor): the first call as itself, the rest of that
+ * minute counted into one record, "a<actor> <op> ok x<N> in 60 s". Any
+ * other status, or a call that names a number or a cell, is audited as
+ * itself.
  *
  * An unactivated number whose token has expired is released before any
  * call about it (sub.release_expired, network-core spec §18.3), and every
@@ -99,6 +106,13 @@ typedef struct {
     uint64_t window_us;       /* the minute's end (0: none open) */
 } oc_api_rate_t;
 
+/* The minute of a read-only operation's quiet audit (above). */
+typedef struct {
+    uint32_t actor;     /* whose minute it is */
+    uint32_t n;         /* calls in it not audited one by one */
+    uint64_t window_us; /* its end; 0: none open */
+} oc_api_quiet_t;
+
 typedef struct {
     oc_sql_t              *sql;
     const oc_core_route_t *route;
@@ -109,6 +123,7 @@ typedef struct {
     const char *name, *version; /* core.status */
     uint64_t    started_us;
     oc_api_rate_t rate[OC_API_OPS];
+    oc_api_quiet_t quiet[OC_API_OPS];
     uint64_t    sweep_at_us; /* the next release of every expired number */
     /* private: the call being served, for its audit record */
     uint8_t  audit_number[OC_SIG_NUMBER_LEN];

@@ -776,10 +776,68 @@ static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
     r->window_us = 0;
 }
 
+/* The read-only operations whose calls naming no number and no cell are
+ * audited once a minute per actor (oc_api.h). */
+static int quiet_op(unsigned op)
+{
+    return op == OC_API_CELL_STATUS || op == OC_API_CORE_STATUS;
+}
+
+/* The minute's count of op's quiet calls, as one record; the minute closed.
+ * Keeps the call being served's own audit fields. */
+static void quiet_flush(oc_api_t *a, unsigned op)
+{
+    oc_api_quiet_t *q = &a->quiet[op];
+    if (q->n > 0) {
+        uint8_t number[OC_SIG_NUMBER_LEN];
+        uint32_t cell = a->audit_cell;
+        char what[sizeof(a->audit_what)], extra[32];
+        memcpy(number, a->audit_number, sizeof(number));
+        memcpy(what, a->audit_what, sizeof(what));
+        memset(a->audit_number, 0, sizeof(a->audit_number));
+        a->audit_cell = 0;
+        snprintf(extra, sizeof(extra), "x%u in 60 s", (unsigned)q->n);
+        audit(a, q->actor, OPS[op].name, OC_API_OK, extra);
+        memcpy(a->audit_number, number, sizeof(number));
+        a->audit_cell = cell;
+        memcpy(a->audit_what, what, sizeof(what));
+    }
+    q->n = 0;
+    q->window_us = 0;
+}
+
+/* 1: this call is counted in its minute, not audited as itself. */
+static int quiet(oc_api_t *a, unsigned op, uint32_t actor, uint8_t status)
+{
+    static const uint8_t none[OC_SIG_NUMBER_LEN];
+    if (status != OC_API_OK || !quiet_op(op) || a->audit_cell != 0 ||
+        memcmp(a->audit_number, none, sizeof(none)) != 0) {
+        return 0;
+    }
+    oc_api_quiet_t *q = &a->quiet[op];
+    uint64_t now = a->now_us();
+    if (q->window_us != 0 && now < q->window_us && q->actor == actor) {
+        q->n++;
+        return 1;
+    }
+    quiet_flush(a, op);
+    q->actor = actor;
+    q->window_us = now + 60000000u;
+    return 0;
+}
+
 void oc_api_tick(oc_api_t *a)
 {
     uint64_t now = a->now_us();
-    for (unsigned op = 0; op < OC_API_OPS; op++) audit_refusals(a, op, now);
+    for (unsigned op = 0; op < OC_API_OPS; op++) {
+        audit_refusals(a, op, now);
+        if (a->quiet[op].window_us != 0 && now >= a->quiet[op].window_us) {
+            memset(a->audit_number, 0, sizeof(a->audit_number));
+            a->audit_cell = 0;
+            a->audit_what[0] = '\0';
+            quiet_flush(a, op);
+        }
+    }
     if (now >= a->sweep_at_us) {
         a->sweep_at_us = now + 60000000u;
         int n = oc_api_release_expired(a, NULL);
@@ -855,6 +913,6 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         wr_text(&c.w, c.msg != NULL ? c.msg : oc_api_status_name(status));
         wr_end(&c.w);
     }
-    audit(a, actor, op_label(op, label), status, a->audit_what);
+    if (!quiet(a, op, actor, status)) audit(a, actor, op_label(op, label), status, a->audit_what);
     return 0;
 }

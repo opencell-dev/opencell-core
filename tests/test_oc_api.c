@@ -806,6 +806,52 @@ static void test_expired_unactivated_numbers_are_released(void)
     done();
 }
 
+/* The NOC's polls (NOC design §7): core.status and cell.status of every
+ * cell are audited once a minute per account, the rest of the minute
+ * counted into one record; a call naming a cell, another account, or a
+ * failure is audited as itself. */
+static void test_status_polls_are_audited_once_a_minute(void)
+{
+    world();
+    char detail[64], number[32];
+    req_t r;
+    long before = count_rows("SELECT count(*) FROM audit");
+    for (int i = 0; i < 5; i++) {
+        begin(&r, OC_API_CORE_STATUS, 1, 0);
+        TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+        begin(&r, OC_API_CELL_STATUS, 1, 0);
+        put32(&r, 0);
+        TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    }
+    TEST_ASSERT_EQUAL_INT(before + 2, count_rows("SELECT count(*) FROM audit"));
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit WHERE detail = 'a0 core.status ok'"));
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit WHERE detail = 'a0 cell.status ok'"));
+
+    /* another account opens its own minute; the first account's count is written then */
+    begin(&r, OC_API_CORE_STATUS, 1, 7);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit WHERE detail = 'a0 core.status ok x4 in 60 s'"));
+    last_audit(detail, sizeof(detail), number, sizeof(number));
+    TEST_ASSERT_EQUAL_STRING("a7 core.status ok", detail);
+
+    /* a call that names a cell, or fails, is its own record */
+    long n = count_rows("SELECT count(*) FROM audit");
+    begin(&r, OC_API_CELL_STATUS, 1, 0);
+    put32(&r, 9);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_NOT_FOUND, call1(&r));
+    TEST_ASSERT_EQUAL_INT(n + 1, count_rows("SELECT count(*) FROM audit"));
+
+    /* the minute ends: its count is one record, written at the tick */
+    mono += 60000000u;
+    oc_api_tick(&api);
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit WHERE detail = 'a0 cell.status ok x4 in 60 s'"));
+    begin(&r, OC_API_CELL_STATUS, 1, 0);
+    put32(&r, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_INT(2, (int)count_rows("SELECT count(*) FROM audit WHERE detail = 'a0 cell.status ok'"));
+    done();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -824,5 +870,6 @@ int main(void)
     RUN_TEST(test_expired_unactivated_numbers_are_released);
     RUN_TEST(test_unsupported_operations_are_rate_limited_too);
     RUN_TEST(test_releasing_a_free_number_is_ok);
+    RUN_TEST(test_status_polls_are_audited_once_a_minute);
     return UNITY_END();
 }

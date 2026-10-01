@@ -517,6 +517,26 @@ static void test_a_mode_change_drops_the_link_and_the_next_hello_takes_it(void)
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_MODE_PART97, c.mode);
 }
 
+/* M6 (final review): a link that re-HELLOs as a different cell id must not
+ * keep showing the first cell's report under the new one. */
+static void test_a_link_that_changes_cell_loses_the_old_cells_report(void)
+{
+    core_world();
+    hello(10, 1, 1);
+    oc_core_msg_t m = status_part(OC_CORE_STATUS_LAST, 1, 0, 0);
+    rx(10, &m);
+    TEST_ASSERT_NOT_NULL(oc_core_cell_tel(&K, 1));
+
+    hello(10, 2, 1); /* the same link, now cell 2 (a board swap, or a misconfigured cell) */
+    TEST_ASSERT_NULL(oc_core_cell_tel(&K, 1)); /* cell_gone's own path */
+    TEST_ASSERT_NULL(oc_core_cell_tel(&K, 2)); /* and not cell 1's report under cell 2's id */
+
+    m = status_part(OC_CORE_STATUS_LAST, 1, 1, 0x900);
+    rx(10, &m);
+    TEST_ASSERT_NOT_NULL(oc_core_cell_tel(&K, 2));
+    TEST_ASSERT_EQUAL_HEX32(0x900, oc_core_cell_tel(&K, 2)->term[0].tmid);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -536,5 +556,6 @@ int main(void)
     RUN_TEST(test_an_unreadable_list_can_be_replaced);
     RUN_TEST(test_cell_status_is_kept_whole_per_link);
     RUN_TEST(test_a_mode_change_drops_the_link_and_the_next_hello_takes_it);
+    RUN_TEST(test_a_link_that_changes_cell_loses_the_old_cells_report);
     return UNITY_END();
 }

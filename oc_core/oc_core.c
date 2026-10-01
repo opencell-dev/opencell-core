@@ -265,7 +265,14 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     }
     oc_core_link_t *old = link_of_cell(k, id);
     if (old != NULL && old != l) drop(k, old, now); /* one link per cell: the newest wins */
-    if (l->cell_id != 0 && l->cell_id != id) cell_gone(k, l->cell_id, now);
+    if (l->cell_id != 0 && l->cell_id != id) {
+        cell_gone(k, l->cell_id, now);
+        /* final review M6: a report of record from l->cell_id must not be
+         * shown as id's once the link re-HELLOs as a different cell */
+        memset(&l->tel, 0, sizeof(l->tel));
+        memset(&l->tel_in, 0, sizeof(l->tel_in));
+        l->tel_next = 0xFF;
+    }
     if (c.boot_id != m->u.hello.boot_id) {
         /* the cell process restarted: its registrations and the vectors it
          * never used went with it (network-core spec §7.9) */

@@ -29,7 +29,8 @@ if(PROJECT_IS_TOP_LEVEL)
 endif()
 
 # The admin API's TLS (portal plan P4): oc_tls (OpenSSL 3, TLS 1.3, pinned
-# client certificates) and oc_apisrv (its listener and connections).
-add_library(oc_net STATIC oc_tls.c oc_apisrv.c)
+# peer certificates) and oc_apisrv (its listener and connections); oc_ocss,
+# the OCSS links to other cores (core test services spec §6).
+add_library(oc_net STATIC oc_tls.c oc_apisrv.c oc_ocss.c)
 target_include_directories(oc_net PUBLIC include)
 target_link_libraries(oc_net PUBLIC oc_store OpenSSL::SSL)

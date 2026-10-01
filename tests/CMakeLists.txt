@@ -53,6 +53,10 @@ add_executable(test_oc_tls test_oc_tls.c)
 target_link_libraries(test_oc_tls PRIVATE oc_net unity)
 add_test(NAME test_oc_tls COMMAND test_oc_tls ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_tls PROPERTIES FIXTURES_REQUIRED pki)
+add_executable(test_oc_ocss test_oc_ocss.c)
+target_link_libraries(test_oc_ocss PRIVATE oc_net unity)
+add_test(NAME test_oc_ocss COMMAND test_oc_ocss ${CMAKE_BINARY_DIR}/pki)
+set_tests_properties(test_oc_ocss PROPERTIES FIXTURES_REQUIRED pki)
 
 # oc-core's admin API as a process, with a TLS client (tool_oc_api) and a
 # bare cell beside it.

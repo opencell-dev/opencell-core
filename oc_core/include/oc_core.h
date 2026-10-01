@@ -26,6 +26,8 @@
 #define OC_CORE_PEERS      4u
 #define OC_CORE_PEER_CALLS 8u /* calls at once with a leg on one peer (spec §15.6's per-peer limit, as a count) */
 #define OC_CORE_HOP_MAX    2u /* a CALL_SETUP with a larger hop is refused (network-core spec §15.5) */
+#define OC_CORE_SETUP_RATE_HZ 5u  /* a peer's CALL_SETUPs, refilled this many tokens a second (review M3) */
+#define OC_CORE_SETUP_BURST   10u /* ... up to this many at once */
 #define OC_CORE_SETUP_US 10000000u /* CALL_ROUTE to the callee's alert or release (§7.4) */
 #define OC_CORE_ECHO_US  3000000u  /* the echo and playback services ring this long, then answer */
 /* The playback service (core test services spec §5): one payload of the
@@ -99,6 +101,12 @@ typedef struct {
     uint8_t  up;
     uint64_t since; /* link_up: a link not up 10 s later is dropped */
     uint64_t last_rx, last_tx;
+    /* review M3: a per-peer CALL_SETUP budget (OC_CORE_SETUP_RATE_HZ,
+     * burst OC_CORE_SETUP_BURST), so a bad or compromised pinned peer
+     * looping setups can't flood this core's CDRs and logs without limit. */
+    uint32_t setup_tokens_x1000;
+    uint64_t setup_refill_us;
+    uint64_t setup_log_at; /* a "rate limited" line is logged at most once this often */
 } oc_core_peer_t;
 
 enum { OC_CORE_CALL_ROUTING = 1, OC_CORE_CALL_ALERTING = 2, OC_CORE_CALL_ACTIVE = 3 };

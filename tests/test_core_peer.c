@@ -472,6 +472,45 @@ static void test_a_peer_media_burst_into_the_cell_is_rate_limited(void)
     TEST_ASSERT_LESS_OR_EQUAL(OC_CORE_RELAY_DEPTH, (uint32_t)cell_count(before, OC_CORE_MEDIA));
 }
 
+/* Review M1: a peer vouches only for callers in its own block - this
+ * slice has no mobility, so a caller anywhere else can only be the
+ * peer lying about who is calling. */
+static void test_a_call_setup_whose_caller_is_not_the_peers_is_refused(void)
+{
+    world();
+    QH = QT;
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CALL_SETUP;
+    m.u.setup.call_ref = OC_CORE_REF_CORE | 90u;
+    memcpy(m.u.setup.caller, SUB2, OC_SIG_NUMBER_LEN); /* core 2's own subscriber */
+    memcpy(m.u.setup.called, ECHO2, OC_SIG_NUMBER_LEN);
+    int at = QT;
+    oc_core_peer_rx(&C2.k, L2, &m, NOW); /* but "sent" as if from peer 1 */
+    uint8_t cause = 0xFF;
+    for (int i = at; i < QT; i++) {
+        if (Q[i % 256].m.u.call.ref == (OC_CORE_REF_CORE | 90u) && Q[i % 256].m.type == OC_OCSS_CALL_RELEASE) {
+            cause = Q[i % 256].m.u.call.cause;
+        }
+    }
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_CAUSE_NET_FAILURE, cause);
+}
+
+/* Review M3: a per-peer CALL_SETUP token bucket, so a bad or compromised
+ * peer looping setups can't write unlimited CDRs and log lines. The first
+ * OC_CORE_SETUP_BURST attempts reach the normal (UNREACHABLE: NA's block
+ * is core 1's own, never relayed on) refusal; the next is refused by the
+ * rate limit alone, before a call or CDR is even created. */
+static void test_a_peer_flooding_call_setups_is_rate_limited(void)
+{
+    world();
+    QH = QT;
+    for (uint32_t i = 0; i < OC_CORE_SETUP_BURST; i++) {
+        TEST_ASSERT_EQUAL_HEX8(OC_SIG_CAUSE_UNREACHABLE, setup_cause(OC_CORE_REF_CORE | (100u + i), NA, 0));
+    }
+    TEST_ASSERT_EQUAL_HEX8(OC_SIG_CAUSE_NET_FAILURE, setup_cause(OC_CORE_REF_CORE | (100u + OC_CORE_SETUP_BURST), NA, 0));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -488,5 +527,7 @@ int main(void)
     RUN_TEST(test_both_cores_first_calls_at_once_do_not_collide);
     RUN_TEST(test_a_call_setup_with_the_wrong_direction_bit_or_no_core_bit_is_refused);
     RUN_TEST(test_a_peer_media_burst_into_the_cell_is_rate_limited);
+    RUN_TEST(test_a_call_setup_whose_caller_is_not_the_peers_is_refused);
+    RUN_TEST(test_a_peer_flooding_call_setups_is_rate_limited);
     return UNITY_END();
 }

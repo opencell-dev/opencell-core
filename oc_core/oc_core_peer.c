@@ -39,6 +39,42 @@ int oc_core_peer_linked(const oc_core_t *k, uint16_t core_id)
     return 0;
 }
 
+static oc_core_peer_t *peer_by_id(oc_core_t *k, uint16_t core_id)
+{
+    for (unsigned i = 0; i < OC_CORE_PEERS; i++) {
+        if (k->peers[i].used && k->peers[i].up && k->peers[i].core_id == core_id) return &k->peers[i];
+    }
+    return NULL;
+}
+
+int oc_core_peer_setup_allowed(oc_core_t *k, uint16_t core_id)
+{
+    oc_core_peer_t *p = peer_by_id(k, core_id);
+    if (p == NULL) return 0; /* can't happen: on_setup only runs for an up peer */
+    const uint32_t max_x1000 = OC_CORE_SETUP_BURST * 1000u;
+    if (p->setup_refill_us == 0) { /* first use since this link came up: start full */
+        p->setup_refill_us = k->now;
+        p->setup_tokens_x1000 = max_x1000;
+    } else if (k->now > p->setup_refill_us) {
+        uint64_t add = (k->now - p->setup_refill_us) * OC_CORE_SETUP_RATE_HZ / 1000u; /* x1000 units */
+        if (add > 0) {
+            p->setup_tokens_x1000 =
+                add >= max_x1000 - p->setup_tokens_x1000 ? max_x1000 : p->setup_tokens_x1000 + (uint32_t)add;
+            p->setup_refill_us = k->now;
+        }
+    }
+    if (p->setup_tokens_x1000 < 1000u) {
+        if (k->now >= p->setup_log_at) {
+            oc_core_logf(k, "peer %u: CALL_SETUP rate limit (%u/s, burst %u): refusing until it slows down",
+                         (unsigned)core_id, OC_CORE_SETUP_RATE_HZ, OC_CORE_SETUP_BURST);
+            p->setup_log_at = k->now + 1000000ull; /* at most once a second */
+        }
+        return 0;
+    }
+    p->setup_tokens_x1000 -= 1000u;
+    return 1;
+}
+
 /* Forgotten here (and its calls ended if it carried any); close: the core
  * dropped it, so the transport is told to close it. */
 static void gone(oc_core_t *k, oc_core_peer_t *p, int close)

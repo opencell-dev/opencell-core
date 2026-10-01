@@ -349,14 +349,25 @@ static void reject_setup(oc_core_t *k, uint16_t peer, uint32_t ref, uint8_t caus
 
 /* A peer core's CALL_SETUP (core test services spec §6.3): served as a
  * cell's CALL_ROUTE is, but the caller is the peer's to vouch for (it
- * authenticated the caller's terminal; this core can't), and at most
- * OC_CORE_PEER_CALLS calls at once come from one peer. */
+ * authenticated the caller's terminal; this core can't, so it only trusts
+ * the peer for a caller in its own block: review M1), and at most
+ * OC_CORE_PEER_CALLS calls at once come from one peer. A per-peer token
+ * bucket (review M3) refuses a flood before any call or CDR exists. */
 static void on_setup(oc_core_t *k, uint16_t peer, const oc_core_msg_t *m)
 {
     oc_core_leg_t *leg, *other;
     if (find_peer(k, peer, m->u.setup.call_ref, &leg, &other) != NULL) return; /* a repeat */
     if (!ref_from_peer_ok(k->cfg.core_id, peer, m->u.setup.call_ref)) {
         reject_setup(k, peer, m->u.setup.call_ref, OC_SIG_CAUSE_NET_FAILURE, "bad call_ref (review I1)");
+        return;
+    }
+    const oc_core_block_t *cb = oc_core_route_find(&k->route, m->u.setup.caller);
+    if (cb == NULL || cb->home_core != peer) {
+        reject_setup(k, peer, m->u.setup.call_ref, OC_SIG_CAUSE_NET_FAILURE, "caller not in the peer's block (review M1)");
+        return;
+    }
+    if (!oc_core_peer_setup_allowed(k, peer)) { /* already logged, at most once a second (review M3) */
+        reject_setup(k, peer, m->u.setup.call_ref, OC_SIG_CAUSE_NET_FAILURE, NULL);
         return;
     }
     oc_core_call_t full, *c = new_call(k, &full, m->u.setup.caller, m->u.setup.called);

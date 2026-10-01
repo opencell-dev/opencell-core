@@ -22,12 +22,26 @@
 #define OC_CORE_DEAD_US  15000000u /* a link that sent nothing for this long is down */
 #define OC_CORE_CALLS    32u
 #define OC_CORE_SETUP_US 10000000u /* CALL_ROUTE to the callee's alert or release (§7.4) */
-#define OC_CORE_ECHO_US  3000000u  /* the echo service rings this long, then answers */
+#define OC_CORE_ECHO_US  3000000u  /* the echo and playback services ring this long, then answer */
+/* The playback service (core test services spec §5): one payload of the
+ * clip per radio frame, the core's own clock pacing it. */
+#define OC_CORE_PLAY_US      120000u         /* one payload per 120 ms frame */
+#define OC_CORE_PLAY_BYTES   18u             /* 3 x 6 B Codec2 1200 frames: one app data frame (voice spec §4) */
+#define OC_CORE_PLAY_LEAD_US 1500000u        /* answer to first payload, unless the caller's first media comes sooner */
+#define OC_CORE_PLAY_LATE_US 240000u         /* a payload this late is skipped, never sent in a burst */
+#define OC_CORE_PLAY_MAX_US  600000000ull    /* the service hangs up (cause 0) after 10 min connected */
+#define OC_CORE_CLIP_MAX     (OC_CORE_PLAY_BYTES * 5000u) /* 10 min of clip */
 
 typedef struct {
     uint16_t core_id;
     uint16_t key_id;                          /* the network key pair in use: must be in the store */
     uint8_t  echo_number[OC_SIG_NUMBER_LEN];  /* the echo service, +883160655500100 */
+    /* The playback service (core test services spec §5): all zero, none.
+     * Set, it needs a clip oc_core_clip_ok accepts, which the caller keeps
+     * alive as long as the core. */
+    uint8_t        playback_number[OC_SIG_NUMBER_LEN];
+    const uint8_t *clip;
+    uint32_t       clip_len;
 } oc_core_cfg_t;
 
 typedef struct {
@@ -51,10 +65,17 @@ typedef struct {
     uint64_t cfg_retry_at;
 } oc_core_link_t;
 
-/* One leg of a call: a cell and the ref the leg started with. */
+/* One leg of a call (core test services spec §4): a cell's leg, one of
+ * this core's services (no cell, no ref of its own that anyone sees), or a
+ * peer core's leg over OCSS. cell is 0 for every kind but CELL (a cell id is
+ * never 0), so a lookup by cell never finds another kind's leg. */
+enum { OC_CORE_LEG_CELL = 0, OC_CORE_LEG_ECHO = 1, OC_CORE_LEG_PLAY = 2, OC_CORE_LEG_PEER = 3 };
+
 typedef struct {
-    uint32_t cell; /* 0: the echo service */
-    uint32_t ref;
+    uint8_t  kind; /* OC_CORE_LEG_* */
+    uint16_t peer; /* PEER: the peer's core_id */
+    uint32_t cell; /* CELL: the cell; 0 for the other kinds */
+    uint32_t ref;  /* CELL: the ref the leg started with; PEER: its CALL_SETUP's call_ref */
 } oc_core_leg_t;
 
 enum { OC_CORE_CALL_ROUTING = 1, OC_CORE_CALL_ALERTING = 2, OC_CORE_CALL_ACTIVE = 3 };
@@ -64,8 +85,13 @@ typedef struct {
     uint8_t       state;
     oc_core_leg_t a, b; /* a: the caller's leg (the cell's ref); b: the callee's (a core ref) */
     uint8_t       caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN];
-    uint64_t      due;           /* ROUTING: give up then; the echo service: answer then */
+    uint64_t      due;           /* ROUTING: give up then; a service ALERTING: answer then; PLAY ACTIVE: hang up then */
     uint32_t      setup, answer; /* unix s; answer 0 = not answered */
+    /* b is the playback service: */
+    uint64_t      play_next;     /* ACTIVE: when the next payload is due */
+    uint32_t      play_at;       /* the clip offset of the next payload */
+    uint16_t      play_seq;      /* its MEDIA seq */
+    uint32_t      play_sent, play_skipped;
 } oc_core_call_t;
 
 typedef struct {
@@ -86,8 +112,14 @@ typedef struct {
 int  oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t period_s, const uint8_t random32[32],
                         uint32_t unix_now);
 
-/* 0, or -1 when cfg->key_id is not in the store (or can't be read). Keeps
- * nothing of a previous run but what the store holds (a restart). */
+/* 1 if clip can be the playback service's: 1 to OC_CORE_CLIP_MAX bytes, a
+ * whole number of OC_CORE_PLAY_BYTES payloads (headerless `c2enc 1200`
+ * output, cut to 120 ms blocks: tools/clip/oc-clip-gen). */
+int  oc_core_clip_ok(const uint8_t *clip, uint32_t len);
+
+/* 0, or -1 when cfg->key_id is not in the store (or can't be read), or the
+ * playback service is configured without a clip oc_core_clip_ok accepts.
+ * Keeps nothing of a previous run but what the store holds (a restart). */
 int  oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                   const oc_core_cfg_t *cfg);
 void oc_core_link_up(oc_core_t *k, uint32_t link, uint64_t now_us);
@@ -104,6 +136,11 @@ void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t no
  * a quiet period connected (30 s), not at HELLO_ACK alone, so a core that
  * accepts and then drops a link can't drive a 1 s reconnect loop. */
 void oc_core_tick(oc_core_t *k, uint64_t now_us);
+/* When oc_core_tick next has a timer to serve (a service's answer, a
+ * playback payload, a setup timeout), in now_us's clock; UINT64_MAX: none.
+ * The daemon's poll waits no longer than this, so a payload leaves on time
+ * (core test services spec §5.3). */
+uint64_t oc_core_due(const oc_core_t *k);
 
 /* Admin (plan 8's CLI drives these). A new cell is enabled, in channel-list
  * group list_id (0: none); 0, -1 if it exists (or cell_id is 0), or -2 if the

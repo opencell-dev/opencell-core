@@ -110,11 +110,20 @@ int oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t peri
     return r;
 }
 
+int oc_core_clip_ok(const uint8_t *clip, uint32_t len)
+{
+    return clip != NULL && len > 0 && len <= OC_CORE_CLIP_MAX && len % OC_CORE_PLAY_BYTES == 0;
+}
+
 int oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                  const oc_core_cfg_t *cfg)
 {
+    static const uint8_t none[OC_SIG_NUMBER_LEN];
     oc_core_netkey_t key;
     memset(k, 0, sizeof(*k));
+    if (memcmp(cfg->playback_number, none, OC_SIG_NUMBER_LEN) != 0 && !oc_core_clip_ok(cfg->clip, cfg->clip_len)) {
+        return -1;
+    }
     k->io = *io;
     k->st = *st;
     k->route = *route;

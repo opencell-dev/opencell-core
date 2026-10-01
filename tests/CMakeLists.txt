@@ -57,6 +57,11 @@ add_executable(test_oc_ocss test_oc_ocss.c)
 target_link_libraries(test_oc_ocss PRIVATE oc_net unity)
 add_test(NAME test_oc_ocss COMMAND test_oc_ocss ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_ocss PROPERTIES FIXTURES_REQUIRED pki)
+# Two oc-core daemons over OCSS, a cell (tool_oc_call) on the first.
+add_test(NAME test_oc_ocss_proc
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_ocss_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_call>
+                 ${CMAKE_BINARY_DIR}/pki)
+set_tests_properties(test_oc_ocss_proc PROPERTIES FIXTURES_REQUIRED pki)
 
 # oc-core's admin API as a process, with a TLS client (tool_oc_api) and a
 # bare cell beside it.

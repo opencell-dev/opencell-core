@@ -309,6 +309,20 @@ static int cmd_status(oc_admin_t *a, oc_buf_t *o)
     }
     sqlite3_finalize(s);
     if (rc != SQLITE_DONE) bad |= store_error(o, "the cells can't be listed");
+    if (a->cfg->clip_len != 0) { /* core test services spec §5 */
+        char t[OC_SIG_NUMBER_TEXT];
+        unsigned n = a->cfg->clip_len / OC_CORE_PLAY_BYTES;
+        oc_sig_number_to_text(a->cfg->playback_number, t);
+        oc_buf_printf(o, "playback %s: clip of %u payloads (%u.%02u s)\n", t, n, n * 12u / 100u, n * 12u % 100u);
+    }
+    for (unsigned i = 0; i < a->route->n; i++) { /* blocks reached over OCSS (spec §6) */
+        const oc_core_block_t *b = &a->route->b[i];
+        if (b->home_core == a->cfg->core_id) continue;
+        oc_buf_printf(o, "block %s: home core %u, %s\n", b->prefix, (unsigned)b->home_core,
+                      a->core == NULL                              ? "offline"
+                      : oc_core_peer_linked(a->core, b->home_core) ? "peer linked"
+                                                                   : "peer NOT linked (calls get cause 5)");
+    }
     if (oc_sql_unseal_failures(a->sql) != 0) {
         oc_buf_printf(o, "WARNING: %u sealed values did not open (damaged rows): their reads fail\n",
                       oc_sql_unseal_failures(a->sql));

@@ -30,7 +30,14 @@
  * loop; api_cert, api_key and api_ca are files, or - a value with no '/' -
  * systemd credentials by name ($CREDENTIALS_DIRECTORY). Every minute,
  * whether or not the API listens, unactivated numbers whose code has
- * expired are released (network-core spec §18.3, oc_api_tick). */
+ * expired are released (network-core spec §18.3, oc_api_tick).
+ *
+ * The test services and OCSS (core test services spec §5-§7): playback is
+ * a second service number with a clip file (playback_clip, read once at
+ * start); peer lines name the other cores (their pinned certificates, and
+ * the address of each this core dials), ocss_listen where they reach this
+ * one; a block line's third field is its home core. The loop's poll waits
+ * no longer than oc_core_due, so a playback payload leaves on time. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -55,6 +62,7 @@
 #include "oc_core.h"
 #include "oc_kv.h"
 #include "oc_log.h"
+#include "oc_ocss.h"
 #include "oc_seal.h"
 #include "oc_sig_keys.h"
 #include "oc_sql.h"
@@ -100,7 +108,10 @@ static struct {
     oc_api_t        api;
     oc_apisrv_t     apisrv;
     oc_tls_t       *tls;
-} D = { .cell_l = -1, .admin_l = -1, .apisrv = { .lfd = -1 } };
+    uint8_t         clip[OC_CORE_CLIP_MAX]; /* the playback service's, from playback_clip */
+    oc_ocss_cfg_t   ocss_cfg;               /* npeer 0: no OCSS */
+    oc_ocss_t       ocss;
+} D = { .cell_l = -1, .admin_l = -1, .apisrv = { .lfd = -1 }, .ocss = { .lfd = -1 } };
 
 static volatile sig_atomic_t g_stop;
 
@@ -155,9 +166,101 @@ static void no_core_dumps(void)
 
 /* ---- configuration ---- */
 
-static const char *const KEYS[] = { "core_id", "key_id", "echo", "block", "db", "cell_socket", "cell_group",
-                                    "admin_socket", "admin_group", "name", "api_listen", "api_cert", "api_key",
-                                    "api_ca", "api_portal_fpr", "api_rate", NULL };
+static const char *const KEYS[] = { "core_id",      "key_id",       "echo",          "block",          "db",
+                                    "cell_socket",  "cell_group",   "admin_socket",  "admin_group",    "name",
+                                    "api_listen",   "api_cert",     "api_key",       "api_ca",         "api_portal_fpr",
+                                    "api_rate",     "playback",     "playback_clip", "peer",           "ocss_listen",
+                                    "ocss_cert",    "ocss_key",     "ocss_ca",       NULL };
+
+/* playback_clip: read whole, checked as oc_core_clip_ok wants it. 0 or -1 (logged). */
+static int load_clip(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        oc_log(OC_LOG_ERR, "config: playback_clip = '%s': %s", path, strerror(errno));
+        return -1;
+    }
+    size_t n = fread(D.clip, 1, sizeof(D.clip), f);
+    int more = fgetc(f) != EOF;
+    fclose(f);
+    if (more || !oc_core_clip_ok(D.clip, (uint32_t)n)) {
+        oc_log(OC_LOG_ERR,
+               "config: playback_clip = '%s': %zu%s bytes; it must be 1 to %u, a whole number of %u-byte payloads "
+               "(headerless c2enc 1200 output: tools/clip/oc-clip-gen)",
+               path, n, more ? "+" : "", OC_CORE_CLIP_MAX, OC_CORE_PLAY_BYTES);
+        return -1;
+    }
+    D.cfg.clip = D.clip;
+    D.cfg.clip_len = (uint32_t)n;
+    return 0;
+}
+
+/* A service number (echo, playback) must be in a block this core is home
+ * for: a number of another core's block would hide that core's subscriber. */
+static int service_ok(const char *key, const uint8_t n[OC_SIG_NUMBER_LEN])
+{
+    if (oc_core_route_home(&D.route, oc_core_route_find(&D.route, n))) return 0;
+    oc_log(OC_LOG_ERR, "config: %s = %s: not in a block this core is home for", key, oc_kv_get(&D.kv, key));
+    return -1;
+}
+
+/* peer = CORE_ID ADDRESS|- SHA256: another core (core test services spec
+ * §7.1); "-" when that core dials this one (it has the lower core_id). */
+static int load_peers(void)
+{
+    oc_ocss_cfg_t *o = &D.ocss_cfg;
+    memset(o, 0, sizeof(*o));
+    for (unsigned i = 0; oc_kv_nth(&D.kv, "peer", i) != NULL; i++) {
+        const char *v = oc_kv_nth(&D.kv, "peer", i);
+        char addr[64], hex[80], extra;
+        unsigned id;
+        if (i >= OC_OCSS_PEERS || sscanf(v, "%u %63s %79s %c", &id, addr, hex, &extra) != 3 || id == 0 || id > 65535 ||
+            id == D.cfg.core_id || oc_tls_fpr_parse(hex, o->peer[i].fpr) != 0) {
+            oc_log(OC_LOG_ERR,
+                   "config: peer = '%s': CORE_ID ADDRESS|- SHA256, e.g. peer = 2 10.99.0.2:7443 <64 hex digits> "
+                   "(another core; at most %u)", v, OC_OCSS_PEERS);
+            return -1;
+        }
+        for (unsigned j = 0; j < i; j++) {
+            if (o->peer[j].core_id == id) {
+                oc_log(OC_LOG_ERR, "config: peer %u is named twice", id);
+                return -1;
+            }
+        }
+        o->peer[i].core_id = (uint16_t)id;
+        if (strcmp(addr, "-") != 0) snprintf(o->peer[i].addr, sizeof(o->peer[i].addr), "%s", addr);
+        o->npeer = i + 1u;
+    }
+    for (unsigned i = 0; i < D.route.n; i++) { /* every block homed elsewhere needs its home as a peer */
+        const oc_core_block_t *b = &D.route.b[i];
+        int known = b->home_core == D.cfg.core_id;
+        for (unsigned j = 0; j < o->npeer; j++) known |= o->peer[j].core_id == b->home_core;
+        if (!known) {
+            oc_log(OC_LOG_ERR, "config: block %s is homed on core %u: add a peer = %u ... line", b->prefix,
+                   b->home_core, b->home_core);
+            return -1;
+        }
+    }
+    const char *keys[] = { "ocss_cert", "ocss_key", "ocss_ca" };
+    for (unsigned i = 0; i < 3; i++) {
+        if ((o->npeer > 0) != (oc_kv_get(&D.kv, keys[i]) != NULL)) {
+            oc_log(OC_LOG_ERR, o->npeer > 0 ? "config: a peer is set: %s is needed too"
+                                            : "config: %s is set but no peer is (OCSS would not run)", keys[i]);
+            return -1;
+        }
+    }
+    int dials_us = 0;
+    for (unsigned j = 0; j < o->npeer; j++) dials_us |= o->peer[j].addr[0] == '\0';
+    if (dials_us && oc_kv_get(&D.kv, "ocss_listen") == NULL) {
+        oc_log(OC_LOG_ERR, "config: a peer dials this core (address -): ocss_listen is needed");
+        return -1;
+    }
+    if (o->npeer == 0 && oc_kv_get(&D.kv, "ocss_listen") != NULL) {
+        oc_log(OC_LOG_ERR, "config: ocss_listen is set but no peer is");
+        return -1;
+    }
+    return 0;
+}
 
 static int load_config(const char *path, const char *db)
 {
@@ -180,18 +283,38 @@ static int load_config(const char *path, const char *db)
     oc_core_route_init(&D.route, D.cfg.core_id);
     for (unsigned i = 0; oc_kv_nth(&D.kv, "block", i) != NULL; i++) {
         char prefix[32], extra;
-        unsigned idx;
+        unsigned idx, home = D.cfg.core_id;
         const char *b = oc_kv_nth(&D.kv, "block", i);
-        if (sscanf(b, "%31s %u %c", prefix, &idx, &extra) != 2 || idx > 65535 ||
-            oc_core_route_add(&D.route, prefix, (uint16_t)idx, D.cfg.core_id) != 0) {
-            oc_log(OC_LOG_ERR, "config: block = '%s': PREFIX INDEX, e.g. 8831606 1 (a new prefix and index)", b);
+        int got = sscanf(b, "%31s %u %u %c", prefix, &idx, &home, &extra);
+        if ((got != 2 && got != 3) || idx > 65535 || home == 0 || home > 65535 ||
+            oc_core_route_add(&D.route, prefix, (uint16_t)idx, (uint16_t)home) != 0) {
+            oc_log(OC_LOG_ERR,
+                   "config: block = '%s': PREFIX INDEX [HOME_CORE], e.g. 8831606 1 (a new prefix and index; "
+                   "HOME_CORE: another core's block, reached over OCSS)", b);
             return -1;
         }
     }
-    if (D.route.n == 0) {
-        oc_log(OC_LOG_ERR, "config: no block: add e.g. block = 8831606 1");
+    int home_blocks = 0;
+    for (unsigned i = 0; i < D.route.n; i++) home_blocks += D.route.b[i].home_core == D.cfg.core_id;
+    if (home_blocks == 0) {
+        oc_log(OC_LOG_ERR, "config: no block this core is home for: add e.g. block = 8831606 1");
         return -1;
     }
+    if (service_ok("echo", D.cfg.echo_number) != 0) return -1;
+    const char *play = oc_kv_get(&D.kv, "playback"), *clip = oc_kv_get(&D.kv, "playback_clip");
+    if ((play == NULL) != (clip == NULL)) {
+        oc_log(OC_LOG_ERR, "config: playback and playback_clip go together (the number and its clip)");
+        return -1;
+    }
+    if (play != NULL) {
+        if (oc_sig_number_normalize(play, strlen(play), NULL, D.cfg.playback_number) != 0 ||
+            memcmp(D.cfg.playback_number, D.cfg.echo_number, OC_SIG_NUMBER_LEN) == 0) {
+            oc_log(OC_LOG_ERR, "config: playback = '%s': a full OpenCell number, not the echo service's", play);
+            return -1;
+        }
+        if (service_ok("playback", D.cfg.playback_number) != 0 || load_clip(clip) != 0) return -1;
+    }
+    if (load_peers() != 0) return -1;
     D.db = db != NULL ? db : oc_kv_get(&D.kv, "db") ? oc_kv_get(&D.kv, "db") : "/var/lib/opencell/core/core.db";
     D.cell_sock = oc_kv_get(&D.kv, "cell_socket") ? oc_kv_get(&D.kv, "cell_socket") : "/run/opencell/core.sock";
     D.admin_sock = oc_kv_get(&D.kv, "admin_socket") ? oc_kv_get(&D.kv, "admin_socket") : DEFAULT_ADMIN;
@@ -325,6 +448,33 @@ static int api_start(void)
     return 0;
 }
 
+/* OCSS (core test services spec §6): the links to the other cores, with
+ * the ocss_* files as the admin API's are given (a value with no '/' is a
+ * systemd credential). 0, or -1 (logged). */
+static uint32_t ocss_new_link(void *ctx)
+{
+    (void)ctx;
+    return ++D.next_id;
+}
+
+static int ocss_start(void)
+{
+    char err[400], cert[512], key[512], ca[512];
+    if (D.ocss_cfg.npeer == 0) return 0;
+    D.ocss_cfg.listen = oc_kv_get(&D.kv, "ocss_listen");
+    D.ocss_cfg.cert = cred_path(oc_kv_get(&D.kv, "ocss_cert"), cert, sizeof(cert));
+    D.ocss_cfg.key = cred_path(oc_kv_get(&D.kv, "ocss_key"), key, sizeof(key));
+    D.ocss_cfg.ca = cred_path(oc_kv_get(&D.kv, "ocss_ca"), ca, sizeof(ca));
+    D.ocss_cfg.core = &D.core;
+    D.ocss_cfg.now_us = mono_us;
+    D.ocss_cfg.new_link = ocss_new_link;
+    if (oc_ocss_open(&D.ocss, &D.ocss_cfg, err, sizeof(err)) != 0) {
+        oc_log(OC_LOG_ERR, "OCSS: %s", err);
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- oc_core's transport ---- */
 
 static dlink_t *dlink(uint32_t id)
@@ -338,6 +488,7 @@ static dlink_t *dlink(uint32_t id)
 static int k_send(void *c, uint32_t link, const oc_core_msg_t *m)
 {
     (void)c;
+    if (oc_ocss_owns(&D.ocss, link)) return oc_ocss_send(&D.ocss, link, m);
     dlink_t *l = dlink(link);
     if (l == NULL || l->dead) return -1;
     if (oc_conn_send(&l->c, m) != 0) {
@@ -352,6 +503,10 @@ static int k_send(void *c, uint32_t link, const oc_core_msg_t *m)
 static void k_close(void *c, uint32_t link) /* oc_core dropped it: no oc_core_link_down */
 {
     (void)c;
+    if (oc_ocss_owns(&D.ocss, link)) {
+        oc_ocss_drop(&D.ocss, link);
+        return;
+    }
     dlink_t *l = dlink(link);
     if (l == NULL) return;
     oc_conn_flush(&l->c); /* a HELLO_NAK goes out before the close */
@@ -636,12 +791,16 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     if (D.cell_l < 0) goto out;
     D.admin_l = listen_on(D.admin_sock, oc_kv_get(&D.kv, "admin_group"));
     if (D.admin_l < 0) goto out;
-    if (api_start() != 0) goto out;
-    oc_log(OC_LOG_NOTICE, "oc-core %s: core %u (%s), key %u, %u blocks, db %s (v%d), cells on %s, admin on %s, API %s",
+    if (api_start() != 0 || ocss_start() != 0) goto out;
+    oc_log(OC_LOG_NOTICE,
+           "oc-core %s: core %u (%s), key %u, %u blocks, db %s (v%d), cells on %s, admin on %s, API %s, "
+           "playback %s, OCSS %u peers%s%s",
            OC_VERSION, D.cfg.core_id, D.name, D.cfg.key_id, D.route.n, D.db, oc_sql_version(D.sql), D.cell_sock,
-           D.admin_sock, D.api_listen != NULL ? D.api_listen : "off");
+           D.admin_sock, D.api_listen != NULL ? D.api_listen : "off", D.cfg.clip_len != 0 ? "on" : "off",
+           D.ocss_cfg.npeer, D.ocss_cfg.listen != NULL ? ", listening on " : "",
+           D.ocss_cfg.listen != NULL ? D.ocss_cfg.listen : "");
     while (!g_stop) {
-        struct pollfd p[2 + OC_CORE_LINKS + 1 + OC_APISRV_CONNS];
+        struct pollfd p[2 + OC_CORE_LINKS + 1 + OC_APISRV_CONNS + 1 + OC_OCSS_CONNS];
         dlink_t *who[2 + OC_CORE_LINKS];
         nfds_t np = 0;
         p[np] = (struct pollfd){ D.cell_l, POLLIN, 0 };
@@ -655,9 +814,18 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
             who[np++] = l;
         }
         int timeout = 100; /* oc_core_tick at least every 100 ms (CELL_CFG retries, PING, timers) */
+        uint64_t due = oc_core_due(&D.core), now = mono_us();
+        if (due <= now) {
+            timeout = 0;
+        } else if (due - now < 100000u) {
+            timeout = (int)((due - now + 999u) / 1000u); /* a playback payload: on time, to the ms */
+        }
         nfds_t api_at = np;
         unsigned api_n = oc_apisrv_fds(&D.apisrv, p + np, &timeout);
         np += api_n;
+        nfds_t ocss_at = np;
+        unsigned ocss_n = oc_ocss_fds(&D.ocss, p + np, &timeout);
+        np += ocss_n;
         int r = poll(p, np, timeout);
         if (r < 0 && errno != EINTR) {
             oc_log(OC_LOG_ERR, "poll: %s", strerror(errno));
@@ -685,6 +853,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
             for (nfds_t i = api_at; i < np; i++) p[i].revents = 0;
         }
         oc_apisrv_serve(&D.apisrv, p + api_at, api_n); /* deadlines too, so every turn */
+        oc_ocss_serve(&D.ocss, p + ocss_at, ocss_n);   /* dials and deadlines too */
         oc_core_tick(&D.core, mono_us());
         oc_api_tick(&D.api);
         for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
@@ -693,6 +862,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     }
     oc_log(OC_LOG_NOTICE, "oc-core: stopping");
     oc_apisrv_close(&D.apisrv);
+    oc_ocss_close(&D.ocss); /* its calls end with their CDRs, the cells' legs released */
     links_down();
     rc = 0;
 out:
@@ -708,6 +878,7 @@ out:
         unlink(D.admin_sock);
     }
     oc_apisrv_close(&D.apisrv);
+    oc_ocss_close(&D.ocss);
     oc_tls_free(D.tls);
     if (D.sql != NULL) oc_sql_close(D.sql);
     oc_sig_wipe(D.key, sizeof(D.key));

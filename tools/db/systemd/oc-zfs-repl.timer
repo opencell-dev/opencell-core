@@ -1,0 +1,9 @@
+[Unit]
+Description=Replicate esas/opencell-pgbackrest to internal18tb every 15 minutes
+
+[Timer]
+OnCalendar=*:07/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

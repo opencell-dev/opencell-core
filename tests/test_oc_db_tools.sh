@@ -1,5 +1,5 @@
 #!/bin/bash
-# tools/db/oc-zfs-snap, oc-db-drill and oc-db-writer against fake zfs,
+# tools/db/oc-zfs-snap, oc-zfs-repl, oc-db-drill and oc-db-writer against fake zfs,
 # pgbackrest, pg_ctl, psql and pg_amcheck: what they create, destroy, report
 # and clean up.
 # usage: test_oc_db_tools.sh TOOLS_DB_DIR OUT
@@ -67,6 +67,73 @@ expect "...but only once for the month" bash -c "! grep -q oc-monthly- '$FAKE_ZF
 snap 20261002 --dry-run
 expect "--dry-run changes nothing" bash -c "! grep -qE '^(snapshot|destroy)' '$FAKE_ZFS.calls' && grep -q 'would run: zfs snapshot' '$OUT/snap.out'"
 OC_TODAY=20261002 "$TOOLS/oc-zfs-snap" esas >/dev/null 2>&1
+expect "a pool's root dataset is refused" test $? = 2
+
+# ---- oc-zfs-repl -------------------------------------------------------------
+cat >"$OUT/bin/zfs-repl" <<'EOF'
+#!/bin/bash
+# fake zfs: each dataset's snapshots in $FAKE_R/<dataset, / as _> (oldest
+# first); send -R prints SRC's snapshots up to the one sent, recv -F makes the
+# target's set exactly that (what -R -F does to snapshots)
+echo "$*" >>"$FAKE_R.calls"
+f() { echo "$FAKE_R/${1//\//_}"; }
+case "$1" in
+    list)
+        ds=${*: -1}
+        [ -e "$(f "$ds")" ] || { echo "cannot open '$ds': dataset does not exist" >&2; exit 1; }
+        [ "$3" = -t ] && sed "s|^|$ds@|" "$(f "$ds")" || echo "$ds" ;;
+    snapshot) echo "${2#*@}" >>"$(f "${2%@*}")" ;;
+    destroy) grep -vx "${2#*@}" "$(f "${2%@*}")" >"$FAKE_R.tmp"; mv "$FAKE_R.tmp" "$(f "${2%@*}")" ;;
+    send) t=${*: -1}; sed "/^${t#*@}\$/q" "$(f "${t%@*}")" ;;
+    recv) [ -z "${FAKE_RECV_FAIL:-}" ] || { cat >/dev/null; echo "cannot receive: I/O error" >&2; exit 1; }
+        cat >"$(f "${*: -1}")" ;;
+esac
+EOF
+chmod +x "$OUT/bin/zfs-repl"
+FAKE_R=$OUT/repl
+mkdir -p "$FAKE_R"
+repl() { OC_ZFS=$OUT/bin/zfs-repl FAKE_R=$FAKE_R OC_NOW=$1 "$TOOLS/oc-zfs-repl" esas/opencell-pgbackrest internal18tb/opencell-pgbackrest "${@:2}" >"$OUT/repl.out" 2>&1; }
+S=$FAKE_R/esas_opencell-pgbackrest D=$FAKE_R/internal18tb_opencell-pgbackrest
+
+printf 'oc-daily-20261003\noc-daily-20261004\n' >"$S"; : >"$FAKE_R.calls"
+repl 20261004234500
+expect "first run: a full send -R of a new snapshot" \
+    grep -qx "send -R esas/opencell-pgbackrest@oc-repl-20261004234500" "$FAKE_R.calls"
+expect "...received read-only, its mountpoint not SRC's" \
+    grep -qx "recv -F -x mountpoint -o readonly=on internal18tb/opencell-pgbackrest" "$FAKE_R.calls"
+expect "...the copy has every snapshot" diff -q "$S" "$D"
+
+echo oc-daily-20261005 >>"$S"; : >"$FAKE_R.calls"
+repl 20261005000000
+expect "next run: incremental from the newest shared oc-repl snapshot" \
+    grep -qx "send -R -I @oc-repl-20261004234500 esas/opencell-pgbackrest@oc-repl-20261005000000" "$FAKE_R.calls"
+expect "...the snapshots in between come along" grep -qx oc-daily-20261005 "$D"
+repl 20261005001500
+expect "keeps the newest 2 oc-repl snapshots on SRC" bash -c "[ \$(grep -c '^oc-repl-' '$S') = 2 ] && ! grep -q oc-repl-20261004234500 '$S'"
+sed -i /oc-daily-20261003/d "$S"
+repl 20261005003000
+expect "snapshots pruned on SRC go from the copy too (-R -F)" bash -c "! grep -q oc-daily-20261003 '$D' && ! grep -q oc-repl-20261004234500 '$D'"
+expect "other snapshots are never destroyed, nor -r" bash -c "! grep -E '^destroy' '$FAKE_R.calls' | grep -vqE '^destroy esas/opencell-pgbackrest@oc-repl-[0-9]+\$'"
+
+cp "$S" "$OUT/before"; : >"$FAKE_R.calls"
+FAKE_RECV_FAIL=1 repl 20261005004500
+expect "a failed receive fails the run" test $? != 0
+expect "...and prunes nothing" bash -c "! grep -q '^destroy' '$FAKE_R.calls' && grep -q oc-repl-20261005001500 '$S'"
+repl 20261005010000
+expect "the run after a failure still finds a shared base" \
+    grep -qx "send -R -I @oc-repl-20261005003000 esas/opencell-pgbackrest@oc-repl-20261005010000" "$FAKE_R.calls"
+
+: >"$FAKE_R.calls"; cp "$S" "$OUT/before"
+repl 20261005011500 --dry-run
+expect "--dry-run changes nothing" bash -c "! grep -qE '^(snapshot|destroy|send|recv)' '$FAKE_R.calls' && diff -q '$OUT/before' '$S' && grep -q 'would run: zfs send -R -I' '$OUT/repl.out'"
+
+grep -v oc-repl- "$D" >"$D.tmp"; mv "$D.tmp" "$D"; : >"$FAKE_R.calls"
+repl 20261005013000
+expect "a copy with no shared oc-repl snapshot is refused" test $? = 1
+expect "...without sending or destroying" bash -c "! grep -qE '^(snapshot|send|destroy)' '$FAKE_R.calls'"
+OC_ZFS=$OUT/bin/zfs-repl "$TOOLS/oc-zfs-repl" esas/a esas/b >/dev/null 2>&1
+expect "a copy on the same pool is refused" test $? = 2
+OC_ZFS=$OUT/bin/zfs-repl "$TOOLS/oc-zfs-repl" esas internal18tb/a >/dev/null 2>&1
 expect "a pool's root dataset is refused" test $? = 2
 
 # ---- oc-db-drill -------------------------------------------------------------

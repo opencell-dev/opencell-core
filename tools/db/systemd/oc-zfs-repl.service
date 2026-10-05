@@ -1,0 +1,15 @@
+# A second copy of the pgBackRest repository on pvelondon's other pool
+# (esas -> internal18tb), on the host itself like oc-zfs-snap: the container
+# cannot touch it.
+[Unit]
+Description=Replicate esas/opencell-pgbackrest to internal18tb
+After=zfs-mount.service
+# Nothing else watches this unit: mail on a failed (or timed-out) run.
+OnFailure=oc-db-alert-failure@%n.service
+
+[Service]
+Type=oneshot
+# A suspended pool hangs zfs send in D state: fail (and mail) instead of
+# blocking silently; the timer cannot start a second run meanwhile.
+TimeoutStartSec=30min
+ExecStart=/usr/local/sbin/oc-zfs-repl esas/opencell-pgbackrest internal18tb/opencell-pgbackrest

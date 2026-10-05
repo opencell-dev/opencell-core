@@ -1,0 +1,68 @@
+#!/bin/bash
+# oc-zfs-repl: a second copy of the pgBackRest repository's dataset on another
+# pool of the same host (pvelondon: esas -> internal18tb), every 15 minutes, so
+# one pool's failure (2026-10-04: the external array's HBA reset, esas
+# suspended for two hours) cannot take the only copy of the backups with it.
+#
+#   oc-zfs-repl SRC DST [--keep N] [--dry-run]
+#
+# Takes SRC@oc-repl-YYYYMMDDHHMMSS (UTC) and sends it with `zfs send -R`: the
+# first run in full (DST must not exist yet), later runs incrementally (-I)
+# from the newest oc-repl snapshot both sides have, so the snapshots in between
+# (oc-zfs-snap's dailies and monthlies) come along, and `recv -F` drops the
+# ones SRC has pruned: DST's snapshots follow SRC's (a run's own pruning
+# reaches DST on the next run). DST is received read-only,
+# with its mountpoint inherited from its own pool (never SRC's). After a
+# successful send only, destroys the oldest oc-repl-<digits> snapshots of SRC
+# beyond the newest N (default 2; the newest is the next base). It only ever
+# creates or destroys snapshots named oc-repl-<digits> of SRC itself (never -r,
+# never a dataset). OC_ZFS and OC_NOW (YYYYMMDDHHMMSS) are for the tests.
+set -euo pipefail
+usage() { echo "usage: oc-zfs-repl SRC DST [--keep N] [--dry-run]" >&2; exit 2; }
+[ $# -ge 2 ] || usage
+SRC=$1 DST=$2
+shift 2
+KEEP=2 DRY=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        --keep) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; KEEP=$2; shift 2 ;;
+        --dry-run) DRY=1; shift ;;
+        *) usage ;;
+    esac
+done
+for ds in "$SRC" "$DST"; do
+    [[ $ds =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$ ]] || { echo "oc-zfs-repl: '$ds' is not a child dataset" >&2; exit 2; }
+done
+[ "${SRC%%/*}" != "${DST%%/*}" ] || { echo "oc-zfs-repl: $SRC and $DST are on the same pool" >&2; exit 2; }
+ZFS=${OC_ZFS:-zfs}
+NOW=${OC_NOW:-$(date -u +%Y%m%d%H%M%S)}
+NEW=oc-repl-$NOW
+run() { if [ "$DRY" = 1 ]; then echo "would run: zfs $*"; else "$ZFS" "$@"; fi; }
+snaps() { "$ZFS" list -H -t snapshot -o name -s creation -d 1 "$1" | sed -n "s|^$1@||p"; }
+
+"$ZFS" list -H -o name "$SRC" >/dev/null
+recv=(recv -F -x mountpoint -o readonly=on "$DST")
+if "$ZFS" list -H -o name "$DST" >/dev/null 2>&1; then
+    # the newest oc-repl snapshot of SRC that DST has too
+    base=$(grep -xFf <(snaps "$DST") <(snaps "$SRC") | grep -E '^oc-repl-[0-9]+$' | tail -n 1 || true)
+    [ -n "$base" ] || { echo "oc-zfs-repl: $DST exists but shares no oc-repl snapshot with $SRC (destroy it for a full send)" >&2; exit 1; }
+    send=(send -R -I "@$base" "$SRC@$NEW")
+else
+    base=
+    send=(send -R "$SRC@$NEW")
+fi
+
+run snapshot "$SRC@$NEW"
+if [ "$DRY" = 1 ]; then
+    echo "would run: zfs ${send[*]} | zfs ${recv[*]}"
+else
+    "$ZFS" "${send[@]}" | "$ZFS" "${recv[@]}"
+fi
+
+list=$(snaps "$SRC" | grep -E '^oc-repl-[0-9]+$' | sort || true)
+[ "$DRY" = 0 ] || list=$(printf '%s\n%s' "$list" "$NEW" | grep . | sort)
+n=$(grep -c . <<<"$list" || true)
+if [ "$n" -gt "$KEEP" ]; then
+    head -n $((n - KEEP)) <<<"$list" | while read -r s; do run destroy "$SRC@$s"; done
+fi
+echo "oc-zfs-repl $SRC -> $DST: sent @$NEW $([ -n "$base" ] && echo "incrementally from @$base" || echo "in full")"

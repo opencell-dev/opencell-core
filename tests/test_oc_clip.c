@@ -72,6 +72,140 @@ static void test_ten_minutes_fills_the_clip_exactly(void)
     free(out);
 }
 
+/* A WAV in b: RIFF, fmt (format, channels, rate, bits), an optional LIST
+ * chunk of 3 bytes plus its pad before data, then data of nsamp samples
+ * (a ramp). Returns its length. */
+static size_t wav(uint8_t *b, uint16_t format, uint16_t ch, uint32_t rate, uint16_t bits, uint32_t nsamp, int list)
+{
+    size_t o = 0;
+    uint32_t data_len = nsamp * ch * (bits / 8u);
+#define P4(s) (memcpy(b + o, s, 4), o += 4)
+#define U16(v) (b[o] = (uint8_t)(v), b[o + 1] = (uint8_t)((v) >> 8), o += 2)
+#define U32(v) (U16((v) & 0xffffu), U16((uint32_t)(v) >> 16))
+    P4("RIFF");
+    U32(4u + 24u + (list ? 12u : 0u) + 8u + data_len);
+    P4("WAVE");
+    P4("fmt ");
+    U32(16u);
+    U16(format);
+    U16(ch);
+    U32(rate);
+    U32(rate * ch * (bits / 8u));
+    U16(ch * (bits / 8u));
+    U16(bits);
+    if (list) {
+        P4("LIST");
+        U32(3u);
+        b[o++] = 'a';
+        b[o++] = 'b';
+        b[o++] = 'c';
+        b[o++] = 0; /* the pad byte */
+    }
+    P4("data");
+    U32(data_len);
+    for (uint32_t i = 0; i < data_len / 2u; i++) U16((uint16_t)(int16_t)(i * 7));
+#undef P4
+#undef U16
+#undef U32
+    return o;
+}
+
+static uint8_t *g_buf; /* big enough for 10 min and a bit */
+
+static void expect_refused(size_t len, const char *reason)
+{
+    int16_t *pcm = (int16_t *)1;
+    size_t n = 99;
+    char why[160] = "";
+    TEST_ASSERT_EQUAL(-1, oc_wav_read(g_buf, len, &pcm, &n, why, sizeof(why)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, reason), why);
+}
+
+static void test_a_good_wav_is_read_with_its_samples(void)
+{
+    size_t len = wav(g_buf, 1, 1, 8000, 16, 8000, 1);
+    int16_t *pcm = NULL;
+    size_t n = 0;
+    char why[160] = "";
+    TEST_ASSERT_EQUAL_MESSAGE(0, oc_wav_read(g_buf, len, &pcm, &n, why, sizeof(why)), why);
+    TEST_ASSERT_EQUAL(8000, n);
+    TEST_ASSERT_EQUAL_INT16(0, pcm[0]);
+    TEST_ASSERT_EQUAL_INT16(7, pcm[1]);
+    TEST_ASSERT_EQUAL_INT16((int16_t)(7999 * 7), pcm[7999]);
+    free(pcm);
+}
+
+static void test_the_wrong_format_is_refused_with_what_it_is(void)
+{
+    expect_refused(wav(g_buf, 1, 1, 22050, 16, 22050, 0), "22050 Hz, 1 channels, 16-bit, format 1; it must be 8000 Hz mono");
+    expect_refused(wav(g_buf, 1, 2, 8000, 16, 8000, 0), "8000 Hz, 2 channels");
+    expect_refused(wav(g_buf, 1, 1, 8000, 8, 8000, 0), "8-bit");
+    expect_refused(wav(g_buf, 3, 1, 8000, 32, 8000, 0), "format 3");
+}
+
+/* Review Focus 2 */
+static void test_extensible_format_is_refused(void)
+{
+    expect_refused(wav(g_buf, 0xFFFEu, 1, 8000, 16, 8000, 0), "format 65534");
+}
+
+static void test_missing_or_broken_chunks_are_refused(void)
+{
+    expect_refused(0, "not a RIFF/WAVE file");
+    memcpy(g_buf, "RIFX", 4);
+    expect_refused(44, "not a RIFF/WAVE file");
+    size_t len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
+    expect_refused(36, "no data chunk"); /* RIFF + fmt only */
+    memcpy(g_buf + 12, "fmX ", 4);
+    expect_refused(len, "no fmt chunk");
+    len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
+    expect_refused(len - 2, "the data chunk runs past the end of the file");
+    len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
+    g_buf[40] = (uint8_t)(g_buf[40] - 1u); /* 16000 -> 15999: odd, still inside the file */
+    expect_refused(len, "a data chunk of an odd length");
+}
+
+/* Review Focus 1: a streaming writer's 0xFFFFFFFF data size */
+static void test_streamed_wav_is_refused(void)
+{
+    size_t len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
+    memset(g_buf + 40, 0xFF, 4);
+    expect_refused(len, "the data chunk runs past the end of the file");
+}
+
+/* Review Focus 3 */
+static void test_one_second_and_ten_minutes_are_accepted(void)
+{
+    int16_t *pcm = NULL;
+    size_t n = 0;
+    char why[160] = "";
+    size_t len = wav(g_buf, 1, 1, 8000, 16, OC_CLIP_MIN_SAMPLES, 0);
+    TEST_ASSERT_EQUAL_MESSAGE(0, oc_wav_read(g_buf, len, &pcm, &n, why, sizeof(why)), why);
+    free(pcm);
+    len = wav(g_buf, 1, 1, 8000, 16, OC_CLIP_MAX_SAMPLES, 0);
+    TEST_ASSERT_EQUAL_MESSAGE(0, oc_wav_read(g_buf, len, &pcm, &n, why, sizeof(why)), why);
+    TEST_ASSERT_EQUAL(OC_CLIP_MAX_SAMPLES, n);
+    free(pcm);
+    expect_refused(wav(g_buf, 1, 1, 8000, 16, OC_CLIP_MIN_SAMPLES - 1u, 0), "0.99 s of audio; it must be 1 s to 10 min");
+    expect_refused(wav(g_buf, 1, 1, 8000, 16, OC_CLIP_MAX_SAMPLES + 1u, 0), "600.00 s of audio");
+}
+
+/* Review Focus 4: an odd last chunk whose pad byte is missing */
+static void test_last_odd_chunk_without_pad_is_accepted(void)
+{
+    size_t len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
+    memcpy(g_buf + len, "LIST", 4);
+    g_buf[len + 4] = 3;
+    g_buf[len + 5] = g_buf[len + 6] = g_buf[len + 7] = 0;
+    memcpy(g_buf + len + 8, "abc", 3); /* no pad byte after it */
+    int16_t *pcm = NULL;
+    size_t n = 0;
+    char why[160] = "";
+    TEST_ASSERT_EQUAL_MESSAGE(0, oc_wav_read(g_buf, len + 11, &pcm, &n, why, sizeof(why)), why);
+    TEST_ASSERT_EQUAL(8000, n);
+    free(pcm);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -79,10 +213,20 @@ int main(int argc, char **argv)
         return 2;
     }
     g_data = argv[1];
+    g_buf = malloc(2u * OC_CLIP_MAX_SAMPLES + 4096u);
     UNITY_BEGIN();
     RUN_TEST(test_encoding_gives_c2encs_bytes);
     RUN_TEST(test_a_part_block_is_padded_to_a_whole_payload);
     RUN_TEST(test_a_short_output_buffer_gives_0);
     RUN_TEST(test_ten_minutes_fills_the_clip_exactly);
-    return UNITY_END();
+    RUN_TEST(test_a_good_wav_is_read_with_its_samples);
+    RUN_TEST(test_the_wrong_format_is_refused_with_what_it_is);
+    RUN_TEST(test_extensible_format_is_refused);
+    RUN_TEST(test_missing_or_broken_chunks_are_refused);
+    RUN_TEST(test_streamed_wav_is_refused);
+    RUN_TEST(test_one_second_and_ten_minutes_are_accepted);
+    RUN_TEST(test_last_odd_chunk_without_pad_is_accepted);
+    int rc = UNITY_END();
+    free(g_buf);
+    return rc;
 }

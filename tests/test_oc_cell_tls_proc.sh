@@ -128,4 +128,15 @@ for _ in $(seq 100); do grep -q answered "$T/call" && break; sleep 0.1; done
 expect "$(cat "$T/call")" "answered"
 check "registration and an echo call over TLS (AV_RES and MEDIA through TLS)"
 
+"$HELLO" "$TLS" 1 12 8 >"$T/held" &
+BG+=($!)
+sleep 1
+out=$(adm cell cert 1 none)
+expect "$out" "its link was dropped"
+for _ in $(seq 30); do grep -q closed "$T/held" && break; sleep 0.1; done
+expect "$(cat "$T/held")" "closed"
+out=$("$HELLO" "$TLS" 1 13 1)
+expect "$out" "HELLO_NAK reason 1"
+check "cell cert none drops the TLS link"
+
 echo "PASS"

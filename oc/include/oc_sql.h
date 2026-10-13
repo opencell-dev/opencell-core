@@ -72,6 +72,10 @@ const char     *oc_sql_migration(unsigned i);
  * lowercase hex digits, or NULL to unpin. 0, OC_CORE_STORE_NONE (no such
  * cell) or OC_CORE_STORE_FAILED. */
 int oc_sql_cell_cert_set(oc_sql_t *s, uint32_t cell_id, const char *fpr);
+/* cell.cert_fpr for cell_id into out (64 lowercase hex digits and a NUL):
+ * 0 (pinned), 1 (the cell exists, nothing pinned), OC_CORE_STORE_NONE (no
+ * such cell) or OC_CORE_STORE_FAILED. */
+int oc_sql_cell_cert_get(oc_sql_t *s, uint32_t cell_id, char out[65]);
 /* For the release job (network-core spec §18.3): up to max unactivated
  * subscribers whose unused token expired at or before now, oldest expiry
  * first. How many, or -1 (the store failed). */

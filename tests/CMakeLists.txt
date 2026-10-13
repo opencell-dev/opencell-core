@@ -67,7 +67,7 @@ add_test(NAME test_oc_db_alert_mail COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/
 add_test(NAME test_oc_db_upgrade COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_db_upgrade.py
                                    ${PROJECT_SOURCE_DIR}/tools/db/oc-db-upgrade)
 add_executable(test_oc_tls test_oc_tls.c)
-target_link_libraries(test_oc_tls PRIVATE oc_net unity)
+target_link_libraries(test_oc_tls PRIVATE oc_net oc_util unity)
 add_test(NAME test_oc_tls COMMAND test_oc_tls ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_tls PROPERTIES FIXTURES_REQUIRED pki)
 add_executable(test_oc_ocss test_oc_ocss.c)

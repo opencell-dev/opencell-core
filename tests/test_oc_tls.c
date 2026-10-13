@@ -16,6 +16,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include "oc_conn.h"
 #include "oc_tls.h"
 
 void setUp(void) {}
@@ -44,6 +45,22 @@ static void read_fpr(const char *name, uint8_t out[32])
     fclose(fp);
     hex[strcspn(hex, "\n")] = '\0';
     TEST_ASSERT_EQUAL_INT(0, oc_tls_fpr_parse(hex, out));
+}
+
+static char last_peer[65];
+static oc_core_msg_t got_msg;
+static int ngot;
+static void on_rx(void *ctx, const oc_core_msg_t *m) { (void)ctx; got_msg = *m; ngot++; }
+
+static const char *file_text(const char *name) /* its first line, no newline */
+{
+    static char line[128];
+    FILE *fp = fopen(f(name), "r");
+    TEST_ASSERT_NOT_NULL_MESSAGE(fp, f(name));
+    TEST_ASSERT_NOT_NULL(fgets(line, sizeof(line), fp));
+    fclose(fp);
+    line[strcspn(line, "\n")] = '\0';
+    return line;
 }
 
 static oc_tls_cfg_t server_cfg(void)
@@ -110,6 +127,7 @@ static int handshake(const oc_tls_cfg_t *cfg, const client_t *cl, char *why, siz
         srv = oc_tls_conn_handshake(&c);
     }
     snprintf(why, cap, "%s", c.why);
+    snprintf(last_peer, sizeof(last_peer), "%s", c.peer);
     if (srv == 1) {
         /* TLS 1.3: the client's side ends before the server's; one frame each way */
         uint8_t ping[3] = { 0, 1, 0x0e }, got[8];
@@ -361,6 +379,133 @@ static void test_ocss_the_admin_api_does_not_speak_ocss(void)
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(sw, "does not speak oc-admin/1"), sw);
 }
 
+static oc_tls_cfg_t cell_server_cfg(void)
+{
+    oc_tls_cfg_t c;
+    memset(&c, 0, sizeof(c));
+    c.cert = f("core.crt");
+    c.key = f("core.key");
+    c.ca = f("ca.crt");
+    c.alpn = "oc-cell/1";
+    c.role = OC_TLS_ROLE_CELL;
+    c.pin_by_caller = 1;
+    return c;
+}
+
+static const client_t CELL = { "cell.crt", "cell.key", "oc-cell/1", TLS1_3_VERSION };
+
+static void test_a_cell_gets_in_unpinned_and_its_fingerprint_is_kept(void)
+{
+    oc_tls_cfg_t cfg = cell_server_cfg();
+    char why[160];
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, handshake(&cfg, &CELL, why, sizeof(why)), why);
+    TEST_ASSERT_EQUAL_STRING(last_peer, file_text("cell.fpr"));
+}
+
+static void test_the_cell_server_still_wants_the_cell_role(void)
+{
+    oc_tls_cfg_t cfg = cell_server_cfg();
+    char why[160];
+    TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &PORTAL, why, sizeof(why))); /* portal ALPN and role */
+    client_t cl = PORTAL;
+    cl.alpn = "oc-cell/1";
+    TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &cl, why, sizeof(why)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "lacks the role"), why);
+}
+
+static void test_pin_by_caller_with_pins_is_refused(void)
+{
+    char err[256];
+    oc_tls_cfg_t cfg = cell_server_cfg();
+    read_fpr("cell.fpr", cfg.pin[0]);
+    cfg.npin = 1;
+    TEST_ASSERT_NULL(oc_tls_new(&cfg, err, sizeof(err)));
+}
+
+/* oc_tls's own client against its own server, both stepped here. 1, or -1
+ * with the client's reason in why. */
+static int oc_pair(const oc_tls_cfg_t *scfg, const oc_tls_client_cfg_t *ccfg, char *why, size_t cap)
+{
+    char err[256];
+    int sv[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sv));
+    oc_tls_t *s = oc_tls_new(scfg, err, sizeof(err));
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_tls_t *k = oc_tls_client_new(ccfg, err, sizeof(err));
+    TEST_ASSERT_NOT_NULL_MESSAGE(k, err);
+    oc_tls_conn_t a, b;
+    TEST_ASSERT_EQUAL_INT(0, oc_tls_conn_start(s, &a, sv[0]));
+    TEST_ASSERT_EQUAL_INT(0, oc_tls_conn_start(k, &b, sv[1]));
+    int ra = 0, rb = 0;
+    for (int i = 0; i < 200 && (ra == 0 || rb == 0); i++) {
+        if (rb == 0) rb = oc_tls_conn_handshake(&b);
+        if (ra == 0) ra = oc_tls_conn_handshake(&a);
+        if (ra < 0 || rb < 0) break;
+    }
+    snprintf(why, cap, "%s", b.why);
+    int ok = ra == 1 && rb == 1;
+    if (ok) { /* a frame each way through oc_conn */
+        oc_conn_t ca, cb;
+        oc_tls_conn_t ma, mb;
+        oc_tls_conn_move(&ma, &a);
+        oc_tls_conn_move(&mb, &b);
+        oc_conn_io_t ia = oc_tls_conn_io(&ma), ib = oc_tls_conn_io(&mb);
+        oc_conn_init_io(&ca, ma.fd, &ia);
+        oc_conn_init_io(&cb, mb.fd, &ib);
+        oc_core_msg_t m;
+        memset(&m, 0, sizeof(m));
+        m.type = OC_CORE_PING;
+        TEST_ASSERT_EQUAL_INT(0, oc_conn_send(&cb, &m));
+        ngot = 0;
+        for (int i = 0; i < 200 && ngot == 0; i++) oc_conn_read(&ca, on_rx, NULL);
+        TEST_ASSERT_EQUAL_INT(1, ngot);
+        TEST_ASSERT_EQUAL_UINT(64, strlen(mb.peer)); /* the server's fingerprint, on the client */
+        oc_conn_close(&ca);
+        oc_conn_close(&cb);
+    } else {
+        oc_tls_conn_close(&a);
+        oc_tls_conn_close(&b);
+    }
+    oc_tls_free(s);
+    oc_tls_free(k);
+    ERR_clear_error();
+    return ok ? 1 : -1;
+}
+
+static oc_tls_client_cfg_t cell_client_cfg(void)
+{
+    oc_tls_client_cfg_t c = { f("cell.crt"), f("cell.key"), f("ca.crt"), "oc-cell/1", OC_TLS_ROLE_CORE, "localhost" };
+    return c;
+}
+
+static void test_the_oc_tls_client_talks_to_the_cell_server(void)
+{
+    oc_tls_cfg_t s = cell_server_cfg();
+    oc_tls_client_cfg_t c = cell_client_cfg();
+    char why[160];
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, oc_pair(&s, &c, why, sizeof(why)), why);
+}
+
+static void test_the_client_refuses_the_wrong_host(void)
+{
+    oc_tls_cfg_t s = cell_server_cfg();
+    oc_tls_client_cfg_t c = cell_client_cfg();
+    char why[160];
+    c.host = "oc-core-1.example";
+    TEST_ASSERT_EQUAL_INT(-1, oc_pair(&s, &c, why, sizeof(why)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "server certificate refused"), why);
+}
+
+static void test_the_client_refuses_a_server_without_the_core_role(void)
+{
+    oc_tls_cfg_t s = cell_server_cfg();
+    oc_tls_client_cfg_t c = cell_client_cfg();
+    char why[160];
+    c.role = OC_TLS_ROLE_PORTAL; /* core.crt does not carry it */
+    TEST_ASSERT_EQUAL_INT(-1, oc_pair(&s, &c, why, sizeof(why)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "lacks the role"), why);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -379,5 +524,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_ocss_the_dialler_refuses_a_server_it_has_not_pinned);
     RUN_TEST(test_ocss_a_portal_or_cell_certificate_is_not_a_core);
     RUN_TEST(test_ocss_the_admin_api_does_not_speak_ocss);
+    RUN_TEST(test_a_cell_gets_in_unpinned_and_its_fingerprint_is_kept);
+    RUN_TEST(test_the_cell_server_still_wants_the_cell_role);
+    RUN_TEST(test_pin_by_caller_with_pins_is_refused);
+    RUN_TEST(test_the_oc_tls_client_talks_to_the_cell_server);
+    RUN_TEST(test_the_client_refuses_the_wrong_host);
+    RUN_TEST(test_the_client_refuses_a_server_without_the_core_role);
     return UNITY_END();
 }

@@ -18,6 +18,9 @@ struct oc_tls {
     oc_tls_cfg_t cfg;
     uint8_t      alpn_wire[64]; /* the protocol as ALPN sends it: len | name */
     size_t       alpn_n;
+    int          own;       /* made by oc_tls_client_new: role and host below, no pins */
+    char         host[256];
+    char         role[64]; /* the OID, 50 characters for ours */
 };
 
 static int conn_idx = -1; /* SSL ex_data: the oc_tls_conn_t, for the verify callback's reason */
@@ -66,7 +69,7 @@ static int verify_cb(int ok, X509_STORE_CTX *st)
     SSL *ssl = X509_STORE_CTX_get_ex_data(st, SSL_get_ex_data_X509_STORE_CTX_idx());
     oc_tls_conn_t *c = SSL_get_ex_data(ssl, conn_idx);
     oc_tls_t *t = SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl));
-    const char *who = t->cfg.client ? "server" : "client";
+    const char *who = t->own || t->cfg.client ? "server" : "client";
     if (!ok) {
         int e = X509_STORE_CTX_get_error(st);
         snprintf(c->why, sizeof(c->why), "%s certificate refused: %s (depth %d)", who,
@@ -83,14 +86,17 @@ static int verify_cb(int ok, X509_STORE_CTX *st)
     }
     char hex[65];
     for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
-    int pinned = 0;
-    for (unsigned i = 0; i < t->cfg.npin; i++) pinned |= memcmp(md, t->cfg.pin[i], 32) == 0;
-    if (!pinned) {
-        snprintf(c->why, sizeof(c->why), "%s certificate %.16s... is not pinned", who, hex);
-        return 0;
+    if (!t->own && !t->cfg.pin_by_caller) {
+        int pinned = 0;
+        for (unsigned i = 0; i < t->cfg.npin; i++) pinned |= memcmp(md, t->cfg.pin[i], 32) == 0;
+        if (!pinned) {
+            snprintf(c->why, sizeof(c->why), "%s certificate %.16s... is not pinned", who, hex);
+            return 0;
+        }
     }
-    if (!has_policy(x, t->cfg.role)) {
-        snprintf(c->why, sizeof(c->why), "%s certificate %.16s... lacks the role %s", who, hex, t->cfg.role);
+    const char *role = t->own ? t->role : t->cfg.role;
+    if (!has_policy(x, role)) {
+        snprintf(c->why, sizeof(c->why), "%s certificate %.16s... lacks the role %s", who, hex, role);
         return 0;
     }
     memcpy(c->peer, hex, sizeof(hex));
@@ -113,9 +119,10 @@ static int alpn_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen, c
 
 oc_tls_t *oc_tls_new(const oc_tls_cfg_t *cfg, char *err, size_t cap)
 {
-    if (cfg->npin == 0 || cfg->npin > OC_TLS_PINS || cfg->alpn == NULL || strlen(cfg->alpn) == 0 ||
-        strlen(cfg->alpn) > 60 || cfg->role == NULL) {
-        snprintf(err, cap, "TLS: a pinned peer certificate, an ALPN protocol and a role are needed");
+    int pins_ok = cfg->pin_by_caller ? cfg->npin == 0 : cfg->npin > 0 && cfg->npin <= OC_TLS_PINS;
+    if (!pins_ok || cfg->alpn == NULL || strlen(cfg->alpn) == 0 || strlen(cfg->alpn) > 60 || cfg->role == NULL) {
+        snprintf(err, cap, cfg->pin_by_caller ? "TLS: pin_by_caller takes no pins (the caller checks the peer)"
+                                              : "TLS: a pinned peer certificate, an ALPN protocol and a role are needed");
         return NULL;
     }
     if (conn_idx < 0) conn_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
@@ -180,6 +187,65 @@ fail:
     return NULL;
 }
 
+oc_tls_t *oc_tls_client_new(const oc_tls_client_cfg_t *cfg, char *err, size_t cap)
+{
+    if (cfg->alpn == NULL || strlen(cfg->alpn) == 0 || strlen(cfg->alpn) > 60 || cfg->role == NULL ||
+        strlen(cfg->role) >= sizeof(((oc_tls_t *)0)->role) || cfg->host == NULL ||
+        strlen(cfg->host) >= sizeof(((oc_tls_t *)0)->host)) {
+        snprintf(err, cap, "TLS client: an ALPN protocol, a server role and a host are needed");
+        return NULL;
+    }
+    if (conn_idx < 0) conn_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    oc_tls_t *t = calloc(1, sizeof(*t));
+    if (t == NULL) {
+        snprintf(err, cap, "out of memory");
+        return NULL;
+    }
+    t->own = 1;
+    snprintf(t->role, sizeof(t->role), "%s", cfg->role);
+    snprintf(t->host, sizeof(t->host), "%s", cfg->host);
+    t->alpn_wire[0] = (uint8_t)strlen(cfg->alpn);
+    memcpy(t->alpn_wire + 1, cfg->alpn, t->alpn_wire[0]);
+    t->alpn_n = 1u + t->alpn_wire[0];
+    t->ctx = SSL_CTX_new(TLS_client_method());
+    if (t->ctx == NULL) {
+        ssl_err(err, cap, "TLS client: no context");
+        goto fail;
+    }
+    SSL_CTX_set_app_data(t->ctx, t);
+    if (SSL_CTX_set_min_proto_version(t->ctx, TLS1_3_VERSION) != 1) {
+        ssl_err(err, cap, "TLS client: no TLS 1.3");
+        goto fail;
+    }
+    if (SSL_CTX_use_certificate_chain_file(t->ctx, cfg->cert) != 1) {
+        ssl_err(err, cap, cfg->cert);
+        goto fail;
+    }
+    if (SSL_CTX_use_PrivateKey_file(t->ctx, cfg->key, SSL_FILETYPE_PEM) != 1 || SSL_CTX_check_private_key(t->ctx) != 1) {
+        char what[300];
+        snprintf(what, sizeof(what), "%s: not the key of %s", cfg->key, cfg->cert);
+        ssl_err(err, cap, what);
+        goto fail;
+    }
+    if (SSL_CTX_load_verify_locations(t->ctx, cfg->ca, NULL) != 1) {
+        ssl_err(err, cap, cfg->ca);
+        goto fail;
+    }
+    X509_VERIFY_PARAM_set_purpose(SSL_CTX_get0_param(t->ctx), X509_PURPOSE_SSL_SERVER);
+    SSL_CTX_set_verify(t->ctx, SSL_VERIFY_PEER, verify_cb);
+    SSL_CTX_set_verify_depth(t->ctx, 2);
+    if (SSL_CTX_set_alpn_protos(t->ctx, t->alpn_wire, (unsigned)t->alpn_n) != 0) {
+        ssl_err(err, cap, "TLS client: ALPN");
+        goto fail;
+    }
+    SSL_CTX_set_session_cache_mode(t->ctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_options(t->ctx, SSL_OP_NO_TICKET);
+    return t;
+fail:
+    oc_tls_free(t);
+    return NULL;
+}
+
 void oc_tls_free(oc_tls_t *t)
 {
     if (t == NULL) return;
@@ -198,7 +264,11 @@ int oc_tls_conn_start(oc_tls_t *t, oc_tls_conn_t *c, int fd)
         oc_tls_conn_close(c);
         return -1;
     }
-    if (t->cfg.client) {
+    if (t->own || t->cfg.client) {
+        if (t->own && SSL_set1_host(c->ssl, t->host) != 1) {
+            oc_tls_conn_close(c);
+            return -1;
+        }
         SSL_set_connect_state(c->ssl);
         c->want = POLLOUT; /* the ClientHello goes first */
     } else {
@@ -281,3 +351,17 @@ void oc_tls_conn_close(oc_tls_conn_t *c)
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
 }
+
+void oc_tls_conn_move(oc_tls_conn_t *dst, oc_tls_conn_t *src)
+{
+    *dst = *src;
+    if (dst->ssl != NULL) SSL_set_ex_data(dst->ssl, conn_idx, dst); /* the callbacks' oc_tls_conn_t */
+    src->ssl = NULL;
+    src->fd = -1;
+}
+
+static long tls_recv(void *ctx, void *buf, size_t n) { return oc_tls_conn_read(ctx, buf, n); }
+static long tls_send(void *ctx, const void *buf, size_t n) { return oc_tls_conn_write(ctx, buf, n); }
+static void tls_close(void *ctx) { oc_tls_conn_close(ctx); }
+
+oc_conn_io_t oc_tls_conn_io(oc_tls_conn_t *c) { return (oc_conn_io_t){ c, tls_recv, tls_send, tls_close }; }

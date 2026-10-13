@@ -16,6 +16,8 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include "oc_addr.h"
+#include "oc_apisrv.h"
 #include "oc_conn.h"
 #include "oc_tls.h"
 
@@ -506,6 +508,26 @@ static void test_the_client_refuses_a_server_without_the_core_role(void)
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "lacks the role"), why);
 }
 
+static void test_cell_addr_allows_public(void)
+{
+    struct sockaddr_storage sa;
+    socklen_t len;
+    int priv = -1;
+    TEST_ASSERT_EQUAL_INT(0, oc_addr_parse("0.0.0.0:7443", &sa, &len, &priv));
+    TEST_ASSERT_EQUAL_INT(0, priv);
+    TEST_ASSERT_EQUAL_INT(AF_INET, sa.ss_family);
+    TEST_ASSERT_EQUAL_INT(0, oc_addr_parse("[::]:7443", &sa, &len, &priv));
+    TEST_ASSERT_EQUAL_INT(0, priv);
+    TEST_ASSERT_EQUAL_INT(0, oc_addr_parse("10.0.0.60:7443", &sa, &len, &priv));
+    TEST_ASSERT_EQUAL_INT(1, priv);
+    TEST_ASSERT_EQUAL_INT(-1, oc_addr_parse("oc-core-1:7443", &sa, &len, &priv)); /* numeric only */
+    TEST_ASSERT_EQUAL_INT(-1, oc_addr_parse("10.0.0.60:0", &sa, &len, &priv));
+    TEST_ASSERT_EQUAL_INT(-1, oc_addr_parse("10.0.0.60", &sa, &len, &priv));
+    char err[200];
+    TEST_ASSERT_EQUAL_INT(-1, oc_apisrv_addr("0.0.0.0:7444", &sa, &len, err, sizeof(err)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(err, "not a private address"), err);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -530,5 +552,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_the_oc_tls_client_talks_to_the_cell_server);
     RUN_TEST(test_the_client_refuses_the_wrong_host);
     RUN_TEST(test_the_client_refuses_a_server_without_the_core_role);
+    RUN_TEST(test_cell_addr_allows_public);
     return UNITY_END();
 }

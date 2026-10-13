@@ -27,6 +27,11 @@ oc_test(test_oc_seal oc_store)
 oc_test(test_oc_sql oc_store)
 oc_test(test_oc_admin oc_store)
 oc_test(test_oc_api oc_store)
+# The playback clip's WAV reader and Codec2 1200 encoder (playback clip spec
+# 2026-10-12); tests/data holds c2enc's output for a fixture.
+add_executable(test_oc_clip test_oc_clip.c)
+target_link_libraries(test_oc_clip PRIVATE oc_clip unity)
+add_test(NAME test_oc_clip COMMAND test_oc_clip ${CMAKE_CURRENT_SOURCE_DIR}/data)
 
 # oc-core as a process, with a bare cell (tool_oc_hello) to speak HELLO, a
 # cell with a terminal in a call (tool_oc_call) and a slow admin peer

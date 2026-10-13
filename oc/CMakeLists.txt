@@ -5,6 +5,12 @@ add_library(oc_util STATIC oc_log.c oc_kv.c oc_conn.c)
 target_include_directories(oc_util PUBLIC include)
 target_link_libraries(oc_util PUBLIC oc_core)
 
+# The playback clip (playback clip spec 2026-10-12): a WAV read and encoded
+# with the vendored Codec2 at start.
+add_library(oc_clip STATIC oc_clip.c)
+target_include_directories(oc_clip PUBLIC include)
+target_link_libraries(oc_clip PUBLIC oc_core PRIVATE codec2)
+
 find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
 add_library(oc_store STATIC oc_seal.c oc_sql.c oc_admin.c oc_import.c oc_api.c)

@@ -152,4 +152,25 @@ expect "$out" "HELLO_ACK mode"
 grep -q "HELLO_NAK reason 1\|closed" <<<"$out" || fail "hello-other: no HELLO_NAK: $out"
 expect "$(cat "$T/log")" "let in as cell 1, HELLO names cell 2"
 check "a second HELLO for another cell is refused, and that cell is not linked"
+
+# Behind the HELLO gate, 4 links at most: silent cell certificates can't
+# take every link slot (shared with the Unix cells).
+SILENT=()
+for i in 1 2 3 4; do
+    "$HELLO" "$TLS" 1 ping-none 20 >"$T/gated$i" &
+    BG+=($!)
+    SILENT+=($!)
+done
+sleep 1
+t0=$(date +%s%N)
+out=$("$HELLO" "$TLS" 1 ping-none 3)
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+expect "$out" "closed"
+[ "$ms" -lt 2000 ] || fail "the fifth silent TLS link was held $ms ms"
+expect "$(cat "$T/log")" "4 links behind the HELLO gate already, connection refused"
+out=$("$HELLO" "$T/core.sock" 2 7 1) || fail "Unix cell beside 4 gated links: $out"
+expect "$out" "HELLO_ACK mode"
+kill "${SILENT[@]}" 2>/dev/null
+wait "${SILENT[@]}" 2>/dev/null
+check "at most 4 TLS links behind the HELLO gate; a Unix cell still gets in"
 echo "PASS"

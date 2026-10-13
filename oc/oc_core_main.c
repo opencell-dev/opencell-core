@@ -786,6 +786,16 @@ static void accept_cell(void)
 static void on_cell_tls(void *ctx, oc_tls_conn_t *tls, const char *addr)
 {
     (void)ctx;
+    /* Any cell certificate gets this far, pinned or not: behind the gate
+     * it may hold a link slot (shared with the Unix cells) GATE_S, so at
+     * most OC_CELLSRV_PENDING at once. */
+    unsigned gated = 0;
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) gated += D.link[i].used && D.link[i].gated ? 1u : 0u;
+    if (gated >= OC_CELLSRV_PENDING) {
+        oc_log(OC_LOG_WARNING, "cell TLS: %s: %u links behind the HELLO gate already, connection refused", addr,
+               OC_CELLSRV_PENDING);
+        return;
+    }
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
         if (D.link[i].used) continue;
         dlink_t *l = &D.link[i];

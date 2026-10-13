@@ -51,6 +51,14 @@ static void test_a_part_block_is_padded_to_a_whole_payload(void)
     int16_t pcm[OC_CLIP_BLOCK + 1] = { 0 };
     uint8_t out[3 * OC_CORE_PLAY_BYTES];
     TEST_ASSERT_EQUAL(2 * OC_CORE_PLAY_BYTES, oc_clip_encode_c2_1200(pcm, OC_CLIP_BLOCK + 1, out, sizeof(out)));
+    /* Review M5: the padding is silence, not whatever follows pcm[n] */
+    int16_t a[2 * OC_CLIP_BLOCK], b[2 * OC_CLIP_BLOCK] = { 0 };
+    uint8_t oa[2 * OC_CORE_PLAY_BYTES], ob[2 * OC_CORE_PLAY_BYTES];
+    for (size_t i = 0; i < 2 * OC_CLIP_BLOCK; i++) a[i] = (int16_t)(i < OC_CLIP_BLOCK + 1 ? (int)(i % 200) * 60 - 6000 : 12345);
+    memcpy(b, a, (OC_CLIP_BLOCK + 1) * sizeof(int16_t)); /* zeros after index OC_CLIP_BLOCK */
+    TEST_ASSERT_EQUAL(sizeof(oa), oc_clip_encode_c2_1200(a, OC_CLIP_BLOCK + 1, oa, sizeof(oa)));
+    TEST_ASSERT_EQUAL(sizeof(ob), oc_clip_encode_c2_1200(b, 2 * OC_CLIP_BLOCK, ob, sizeof(ob)));
+    TEST_ASSERT_EQUAL_MEMORY(ob, oa, sizeof(oa));
     TEST_ASSERT_EQUAL(OC_CORE_PLAY_BYTES, oc_clip_encode_c2_1200(pcm, OC_CLIP_BLOCK, out, sizeof(out)));
 }
 
@@ -137,10 +145,14 @@ static void test_a_good_wav_is_read_with_its_samples(void)
 
 static void test_the_wrong_format_is_refused_with_what_it_is(void)
 {
-    expect_refused(wav(g_buf, 1, 1, 22050, 16, 22050, 0), "22050 Hz, 1 channels, 16-bit, format 1; it must be 8000 Hz mono");
+    expect_refused(wav(g_buf, 1, 1, 22050, 16, 22050, 0), "22050 Hz, 1 channel, 16-bit, format 1; it must be 8000 Hz mono");
     expect_refused(wav(g_buf, 1, 2, 8000, 16, 8000, 0), "8000 Hz, 2 channels");
     expect_refused(wav(g_buf, 1, 1, 8000, 8, 8000, 0), "8-bit");
     expect_refused(wav(g_buf, 3, 1, 8000, 32, 8000, 0), "format 3");
+    /* Review M4a: a bad block align alone names itself, not a contradiction */
+    size_t len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
+    g_buf[32] = 4;
+    expect_refused(len, "block align 4");
 }
 
 /* Review Focus 2 */
@@ -158,6 +170,9 @@ static void test_missing_or_broken_chunks_are_refused(void)
     expect_refused(36, "no data chunk"); /* RIFF + fmt only */
     memcpy(g_buf + 12, "fmX ", 4);
     expect_refused(len, "no fmt chunk");
+    len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
+    g_buf[16] = 14; /* Review M4b: a fmt chunk too short to hold a format */
+    expect_refused(34, "a fmt chunk of 14 bytes");
     len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
     expect_refused(len - 2, "the data chunk runs past the end of the file");
     len = wav(g_buf, 1, 1, 8000, 16, 8000, 0);
@@ -187,7 +202,7 @@ static void test_one_second_and_ten_minutes_are_accepted(void)
     TEST_ASSERT_EQUAL(OC_CLIP_MAX_SAMPLES, n);
     free(pcm);
     expect_refused(wav(g_buf, 1, 1, 8000, 16, OC_CLIP_MIN_SAMPLES - 1u, 0), "0.99 s of audio; it must be 1 s to 10 min");
-    expect_refused(wav(g_buf, 1, 1, 8000, 16, OC_CLIP_MAX_SAMPLES + 1u, 0), "600.00 s of audio");
+    expect_refused(wav(g_buf, 1, 1, 8000, 16, OC_CLIP_MAX_SAMPLES + 1u, 0), "600.01 s of audio; it must be 1 s to 10 min"); /* M4c: rounded up, never the limit itself */
 }
 
 /* Review Focus 4: an odd last chunk whose pad byte is missing */

@@ -168,8 +168,8 @@ int  oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t per
                         uint32_t unix_now);
 
 /* 1 if clip can be the playback service's: 1 to OC_CORE_CLIP_MAX bytes, a
- * whole number of OC_CORE_PLAY_BYTES payloads (headerless `c2enc 1200`
- * output, cut to 120 ms blocks: tools/clip/oc-clip-gen). */
+ * whole number of OC_CORE_PLAY_BYTES payloads (the clip encoded from
+ * playback_clip's WAV, cut to 120 ms blocks: oc_clip.h). */
 int  oc_core_clip_ok(const uint8_t *clip, uint32_t len);
 
 /* 0, or -1 when cfg->key_id is not in the store (or can't be read), or the

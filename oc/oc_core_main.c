@@ -177,27 +177,44 @@ static const char *const KEYS[] = { "core_id",      "key_id",       "echo",     
  * §4), read whole, encoded with Codec2 1200 into D.clip, then freed. 0 or
  * -1 (logged). */
 #define CLIP_FILE_MAX (16u << 20) /* 10 min of samples is 9.6 MB; room for other chunks */
+static ssize_t read_all(int fd, uint8_t *b, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t k = read(fd, b + got, n - got);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        got += (size_t)k;
+    }
+    return (ssize_t)got;
+}
 static int load_clip(const char *path)
 {
     char why[160] = "";
     uint8_t *buf = NULL;
     int16_t *pcm = NULL;
-    size_t len = 0, n = 0, bytes = 0;
+    size_t n = 0, bytes = 0;
+    ssize_t r;
     struct stat st;
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
+    /* O_NONBLOCK: a FIFO must not hang the open; only a regular file is read */
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
         snprintf(why, sizeof(why), "%s", strerror(errno));
-    } else if (fstat(fileno(f), &st) != 0 || st.st_size > (off_t)CLIP_FILE_MAX) {
+    } else if (fstat(fd, &st) != 0) {
+        snprintf(why, sizeof(why), "%s", strerror(errno));
+    } else if (!S_ISREG(st.st_mode)) {
+        snprintf(why, sizeof(why), "not a regular file");
+    } else if (st.st_size > (off_t)CLIP_FILE_MAX) {
         snprintf(why, sizeof(why), "larger than %u MB", CLIP_FILE_MAX >> 20);
     } else if ((buf = malloc((size_t)st.st_size + 1u)) == NULL) {
         snprintf(why, sizeof(why), "out of memory");
-    } else if ((len = fread(buf, 1, (size_t)st.st_size, f)) != (size_t)st.st_size) {
+    } else if ((r = read_all(fd, buf, (size_t)st.st_size)) != (ssize_t)st.st_size) {
         snprintf(why, sizeof(why), "short read");
-    } else if (oc_wav_read(buf, len, &pcm, &n, why, sizeof(why)) == 0) {
+    } else if (oc_wav_read(buf, (size_t)r, &pcm, &n, why, sizeof(why)) == 0) {
         bytes = oc_clip_encode_c2_1200(pcm, n, D.clip, sizeof(D.clip));
         if (bytes == 0 || !oc_core_clip_ok(D.clip, (uint32_t)bytes)) snprintf(why, sizeof(why), "Codec2 1200 encoding failed");
     }
-    if (f != NULL) fclose(f);
+    if (fd >= 0) close(fd);
     free(buf);
     free(pcm);
     if (bytes == 0 || why[0] != '\0') {

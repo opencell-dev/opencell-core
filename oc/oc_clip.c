@@ -37,8 +37,12 @@ int oc_wav_read(const uint8_t *buf, size_t len, int16_t **pcm, size_t *n, char *
         }
         off += 8u + (size_t)sz + (sz & 1u); /* a missing last pad byte ends the loop */
     }
-    if (fmt == NULL || fmt_len < 16) {
+    if (fmt == NULL) {
         snprintf(why, why_len, "no fmt chunk");
+        return -1;
+    }
+    if (fmt_len < 16) {
+        snprintf(why, why_len, "a fmt chunk of %u bytes (at least 16)", (unsigned)fmt_len);
         return -1;
     }
     if (data == NULL) {
@@ -47,9 +51,13 @@ int oc_wav_read(const uint8_t *buf, size_t len, int16_t **pcm, size_t *n, char *
     }
     unsigned format = le16(fmt), ch = le16(fmt + 2), bits = le16(fmt + 14);
     uint32_t rate = le32(fmt + 4);
-    if (format != 1 || ch != 1 || rate != OC_CLIP_RATE || bits != 16 || le16(fmt + 12) != 2) {
-        snprintf(why, why_len, "%u Hz, %u channels, %u-bit, format %u; it must be 8000 Hz mono 16-bit PCM (format 1)",
-                 (unsigned)rate, ch, bits, format);
+    if (format != 1 || ch != 1 || rate != OC_CLIP_RATE || bits != 16) {
+        snprintf(why, why_len, "%u Hz, %u channel%s, %u-bit, format %u; it must be 8000 Hz mono 16-bit PCM (format 1)",
+                 (unsigned)rate, ch, ch == 1 ? "" : "s", bits, format);
+        return -1;
+    }
+    if (le16(fmt + 12) != 2) {
+        snprintf(why, why_len, "block align %u; it must be 2 for mono 16-bit PCM", le16(fmt + 12));
         return -1;
     }
     if (data_len & 1u) {
@@ -58,7 +66,9 @@ int oc_wav_read(const uint8_t *buf, size_t len, int16_t **pcm, size_t *n, char *
     }
     size_t samples = data_len / 2u;
     if (samples < OC_CLIP_MIN_SAMPLES || samples > OC_CLIP_MAX_SAMPLES) {
-        size_t cs = samples / 80u; /* hundredths of a second, rounded down */
+        /* hundredths of a second: rounded down when short, up when long, so a
+         * refusal never prints exactly the limit */
+        size_t cs = samples > OC_CLIP_MAX_SAMPLES ? (samples + 79u) / 80u : samples / 80u;
         snprintf(why, why_len, "%u.%02u s of audio; it must be 1 s to 10 min", (unsigned)(cs / 100u),
                  (unsigned)(cs % 100u));
         return -1;

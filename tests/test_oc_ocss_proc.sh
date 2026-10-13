@@ -72,9 +72,13 @@ refused() { # WHAT SED-EXPR MESSAGE [BASE_CONF KEY_FILE]
 refused "a block homed on a core with no peer line" '/^peer/d' "add a peer = 2"
 refused "a playback number with no clip" '/^playback_clip/d' "playback and playback_clip go together"
 python3 -I -c 'import sys, wave; w = wave.open(sys.argv[1], "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050); w.writeframes(bytes(44100)); w.close()' "$T/22k.wav"
-refused "a clip at 22050 Hz" "s|$T/clip.wav|$T/22k.wav|" "22050 Hz, 1 channels, 16-bit, format 1; it must be 8000 Hz mono 16-bit PCM"
+refused "a clip at 22050 Hz" "s|$T/clip.wav|$T/22k.wav|" "22050 Hz, 1 channel, 16-bit, format 1; it must be 8000 Hz mono 16-bit PCM"
 head -c 180 /dev/urandom >"$T/old.bit"
 refused "an old .bit clip" "s|$T/clip.wav|$T/old.bit|" "not a RIFF/WAVE file (tools/clip/oc-clip-gen)" # Review Focus 5
+mkdir "$T/adir"
+refused "a clip that is a directory" "s|$T/clip.wav|$T/adir|" "not a regular file"
+mkfifo "$T/fifo.wav"
+refused "a clip that is a FIFO (must not hang)" "s|$T/clip.wav|$T/fifo.wav|" "not a regular file"
 refused "a missing clip" "s|$T/clip.wav|$T/none.wav|" "No such file or directory"
 refused "a service number of another core's block" 's/^playback = .*/playback = +883150355500102/' \
     "not in a block this core is home for"

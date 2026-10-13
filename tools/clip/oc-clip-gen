@@ -12,9 +12,10 @@ resamples to 8 kHz (scipy); adds 1 s of silence at the end; pads to whole
 120 ms blocks (960 samples). Nothing else: no band filter and no level
 change, except a scale down to a -1 dBFS peak where the resampled speech
 would clip (filtering and a hot level cost Codec2 1200 words: 23% word
-errors against 8% unprocessed, 2026-10-12). OUT.wav is an 8 kHz mono 16-bit WAV, what oc-core's playback_clip takes
-(playback clip spec 2026-10-12): oc-core encodes it at start. Piper's voice
-samples noise, so each run differs a little: the committed clip is the reference, not
+errors against 8% unprocessed, 2026-10-12). OUT.wav is an 8 kHz mono 16-bit
+WAV, what oc-core's playback_clip takes (playback clip spec 2026-10-12):
+oc-core encodes it at start. Piper's voice samples noise, so each run
+differs a little: the committed clip is the reference, not
 this program's output. Run on the laptop, never on a core.
 """
 import os

@@ -29,7 +29,7 @@ endif()
 
 add_executable(oc-core oc_core_main.c)
 target_compile_definitions(oc-core PRIVATE OC_VERSION="${OC_VERSION}")
-target_link_libraries(oc-core PRIVATE oc_store oc_net)
+target_link_libraries(oc-core PRIVATE oc_store oc_net oc_clip)
 if(PROJECT_IS_TOP_LEVEL)
   install(TARGETS oc-core RUNTIME DESTINATION bin)
 endif()

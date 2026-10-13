@@ -125,6 +125,10 @@ oc_tls_t *oc_tls_new(const oc_tls_cfg_t *cfg, char *err, size_t cap)
                                               : "TLS: a pinned peer certificate, an ALPN protocol and a role are needed");
         return NULL;
     }
+    if (cfg->pin_by_caller && cfg->client) { /* a dialer pinning nothing, its host unchecked: any server of the role */
+        snprintf(err, cap, "TLS: pin_by_caller is for a server (a client pins its server)");
+        return NULL;
+    }
     if (conn_idx < 0) conn_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
     oc_tls_t *t = calloc(1, sizeof(*t));
     if (t == NULL) {

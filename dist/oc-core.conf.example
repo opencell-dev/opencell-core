@@ -36,7 +36,9 @@ admin_group = oc-admin
 #api_ca = /etc/opencell/tls/ca.crt
 #api_portal_fpr = <64 hex digits>
 # Cells over TLS (single-board cells, cells on other hosts): all four or none.
-#cell_listen = 0.0.0.0:7443
+# cell_listen: the core's public address. A wildcard (0.0.0.0:7443) clashes
+# with an ocss_listen on the same port (EADDRINUSE).
+#cell_listen = 203.0.113.10:7443
 #cell_cert = cell-server.crt
 #cell_key = cell-server.key
 #cell_ca = /etc/opencell/ca.crt

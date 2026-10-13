@@ -38,8 +38,8 @@ typedef struct {
     uint8_t     pin[OC_TLS_PINS][32]; /* SHA-256 of each peer certificate (DER) allowed */
     unsigned    npin;
     int         client; /* 0: a server (accepts); 1: a client (dials) */
-    int         pin_by_caller; /* 1: npin must be 0, any certificate with the chain, purpose and
-                                * role is let in, and the caller checks c->peer. */
+    int         pin_by_caller; /* 1 (a server only): npin must be 0, any certificate with the chain,
+                                * purpose and role is let in, and the caller checks c->peer. */
 } oc_tls_cfg_t;
 
 typedef struct {

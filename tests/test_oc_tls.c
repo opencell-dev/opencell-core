@@ -424,6 +424,19 @@ static void test_pin_by_caller_with_pins_is_refused(void)
     TEST_ASSERT_NULL(oc_tls_new(&cfg, err, sizeof(err)));
 }
 
+/* pin_by_caller is for the cell listener's server: a dialer with it would
+ * take any server of the role, pinned by nobody, its host unchecked. */
+static void test_pin_by_caller_on_a_client_is_refused(void)
+{
+    char err[256] = "";
+    oc_tls_cfg_t cfg = cell_server_cfg();
+    cfg.client = 1;
+    oc_tls_t *t = oc_tls_new(&cfg, err, sizeof(err));
+    if (t != NULL) oc_tls_free(t);
+    TEST_ASSERT_NULL(t);
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(err, "pin_by_caller"), err);
+}
+
 /* oc_tls's own client against its own server, both stepped here. 1, or -1
  * with the client's reason in why. */
 static int oc_pair(const oc_tls_cfg_t *scfg, const oc_tls_client_cfg_t *ccfg, char *why, size_t cap)
@@ -549,6 +562,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_cell_gets_in_unpinned_and_its_fingerprint_is_kept);
     RUN_TEST(test_the_cell_server_still_wants_the_cell_role);
     RUN_TEST(test_pin_by_caller_with_pins_is_refused);
+    RUN_TEST(test_pin_by_caller_on_a_client_is_refused);
     RUN_TEST(test_the_oc_tls_client_talks_to_the_cell_server);
     RUN_TEST(test_the_client_refuses_the_wrong_host);
     RUN_TEST(test_the_client_refuses_a_server_without_the_core_role);

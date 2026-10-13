@@ -164,6 +164,33 @@ static void test_at_most_four_handshakes_and_each_has_a_deadline(void)
     oc_tls_free(t);
 }
 
+/* A listener that never opened (or is closed) serves nothing, and has no
+ * clock to read. */
+static void test_serve_on_a_listener_never_opened_is_harmless(void)
+{
+    char err[256];
+    oc_cellsrv_t s;
+    TEST_ASSERT_EQUAL_INT(-1, oc_cellsrv_open(&s, "nonsense", NULL, now_us, err, sizeof(err)));
+    struct pollfd p[1 + OC_CELLSRV_PENDING];
+    TEST_ASSERT_EQUAL_UINT(0, oc_cellsrv_fds(&s, p));
+    nready = 0;
+    oc_cellsrv_serve(&s, p, 0, on_ready, NULL);
+    TEST_ASSERT_EQUAL_INT(0, nready);
+}
+
+/* IPv6: [::1] (IPV6_FREEBIND on an IPv6 socket, as oc_ocss). */
+static void test_an_ipv6_address_is_listened_on(void)
+{
+    char err[256], l6[48];
+    oc_cellsrv_t s;
+    oc_tls_t *t = server();
+    snprintf(l6, sizeof(l6), "[::1]:%u", PORT);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_cellsrv_open(&s, l6, t, now_us, err, sizeof(err)), err);
+    TEST_ASSERT_EQUAL_UINT16(PORT, oc_cellsrv_port(&s));
+    oc_cellsrv_close(&s);
+    oc_tls_free(t);
+}
+
 static int count(const char *buf, const char *needle)
 {
     int n = 0;
@@ -233,5 +260,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_portal_certificate_is_not_handed_on);
     RUN_TEST(test_at_most_four_handshakes_and_each_has_a_deadline);
     RUN_TEST(test_failed_handshakes_are_logged_5_per_10_s);
+    RUN_TEST(test_serve_on_a_listener_never_opened_is_harmless);
+    RUN_TEST(test_an_ipv6_address_is_listened_on);
     return UNITY_END();
 }

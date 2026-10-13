@@ -44,7 +44,8 @@ int oc_cellsrv_open(oc_cellsrv_t *s, const char *text, oc_tls_t *tls, uint64_t (
     }
     int fd = socket(sa.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), one = 1;
     if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
-        setsockopt(fd, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one)) != 0 ||
+        (sa.ss_family == AF_INET && setsockopt(fd, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one)) != 0) ||
+        (sa.ss_family == AF_INET6 && setsockopt(fd, IPPROTO_IPV6, IPV6_FREEBIND, &one, sizeof(one)) != 0) ||
         bind(fd, (struct sockaddr *)&sa, len) != 0 || listen(fd, 16) != 0) {
         snprintf(err, cap, "cell_listen = '%s': %s", text, strerror(errno));
         if (fd >= 0) close(fd);
@@ -134,6 +135,7 @@ static void hs_close(oc_cellsrv_t *s, oc_cellsrv_hs_t *h, int prio, const char *
 
 void oc_cellsrv_serve(oc_cellsrv_t *s, const struct pollfd *p, unsigned n, oc_cellsrv_ready_fn ready, void *ctx)
 {
+    if (s->lfd < 0) return; /* never opened, or closed: nothing to serve, and maybe no clock */
     for (unsigned k = 0; k < n; k++) {
         if (s->at[k] < 0) {
             if (p[k].revents & POLLIN) accept_one(s);

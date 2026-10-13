@@ -179,7 +179,7 @@ oc_tls_t *oc_tls_new(const oc_tls_cfg_t *cfg, char *err, size_t cap)
     }
     SSL_CTX_set_verify_depth(t->ctx, 2);
     SSL_CTX_set_session_cache_mode(t->ctx, SSL_SESS_CACHE_OFF);
-    SSL_CTX_set_options(t->ctx, SSL_OP_NO_TICKET);
+    SSL_CTX_set_options(t->ctx, SSL_OP_NO_TICKET | SSL_OP_CLEANSE_PLAINTEXT); /* OpenSSL wipes each record after SSL_read, as oc_conn wipes its buffers */
     SSL_CTX_set_num_tickets(t->ctx, 0);
     return t;
 fail:
@@ -239,7 +239,7 @@ oc_tls_t *oc_tls_client_new(const oc_tls_client_cfg_t *cfg, char *err, size_t ca
         goto fail;
     }
     SSL_CTX_set_session_cache_mode(t->ctx, SSL_SESS_CACHE_OFF);
-    SSL_CTX_set_options(t->ctx, SSL_OP_NO_TICKET);
+    SSL_CTX_set_options(t->ctx, SSL_OP_NO_TICKET | SSL_OP_CLEANSE_PLAINTEXT); /* OpenSSL wipes each record after SSL_read, as oc_conn wipes its buffers */
     return t;
 fail:
     oc_tls_free(t);

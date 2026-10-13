@@ -45,6 +45,7 @@
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +125,7 @@ static struct {
     oc_cellsrv_t    cellsrv; /* must not move while open: its TLS ex_data points into it */
     oc_tls_t       *cell_tls;
     const char     *cell_listen;
+    oc_cellsrv_throttle_t gate_log; /* the HELLO gate's refusals, and TLS links refused for want of a slot */
 } D = { .cell_l = -1, .admin_l = -1, .apisrv = { .lfd = -1 }, .ocss = { .lfd = -1 }, .cellsrv = { .lfd = -1 } };
 
 static volatile sig_atomic_t g_stop;
@@ -665,6 +667,20 @@ static uint32_t k_unix(void *c)
  * must be HELLO from a cell whose pinned certificate is the peer's. Every
  * refusal answers UNKNOWN_CELL; the log says why. Returns 1 if m goes on
  * to oc_core. */
+/* A cell TLS refusal, logged one by one only OC_CELLSRV_LOG_N per
+ * OC_CELLSRV_LOG_S (a public port: oc_cellsrv_log_ok); a warning. */
+static void gate_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void gate_warn(const char *fmt, ...)
+{
+    if (!oc_cellsrv_log_ok(&D.gate_log, mono_us())) return;
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    oc_log(OC_LOG_WARNING, "%s", line);
+}
+
 static void send_nak(dlink_t *l)
 {
     oc_core_msg_t nak;
@@ -678,8 +694,8 @@ static int gate_frame(dlink_t *l, const oc_core_msg_t *m)
 {
     char pin[65];
     if (m->type != OC_CORE_HELLO) {
-        oc_log(OC_LOG_WARNING, "cell TLS: %s (%.16s...): first frame is not HELLO (type 0x%02x): closed", l->addr,
-               l->peer, m->type);
+        gate_warn("cell TLS: %s (%.16s...): first frame is not HELLO (type 0x%02x): closed", l->addr, l->peer,
+                  m->type);
         l->drop = 1;
         return 0;
     }
@@ -691,8 +707,8 @@ static int gate_frame(dlink_t *l, const oc_core_msg_t *m)
                       : strcmp(pin, l->peer) != 0 ? "certificate differs from the pin"
                                                   : NULL;
     if (why != NULL) {
-        oc_log(OC_LOG_WARNING, "cell TLS: %s: cell %u: %s: certificate %.16s... (HELLO_NAK unknown cell)", l->addr,
-               (unsigned)id, why, l->peer);
+        gate_warn("cell TLS: %s: cell %u: %s: certificate %.16s... (HELLO_NAK unknown cell)", l->addr, (unsigned)id,
+                  why, l->peer);
         send_nak(l);
         l->drop = 1;
         return 0;
@@ -713,8 +729,8 @@ static void on_frame(void *ctx, const oc_core_msg_t *m)
      * later HELLO naming another (oc_core would let the newest win) is
      * refused, and the link goes down. The same cell may HELLO again. */
     if (l->tls && m->type == OC_CORE_HELLO && m->u.hello.cell_id != l->cell_id) {
-        oc_log(OC_LOG_WARNING, "cell TLS: %s: let in as cell %u, HELLO names cell %u: closed (HELLO_NAK unknown cell)",
-               l->addr, (unsigned)l->cell_id, (unsigned)m->u.hello.cell_id);
+        gate_warn("cell TLS: %s: let in as cell %u, HELLO names cell %u: closed (HELLO_NAK unknown cell)", l->addr,
+                  (unsigned)l->cell_id, (unsigned)m->u.hello.cell_id);
         send_nak(l);
         l->dead = 1; /* oc_core has it: link_lost, from the loop */
         return;
@@ -792,8 +808,8 @@ static void on_cell_tls(void *ctx, oc_tls_conn_t *tls, const char *addr)
     unsigned gated = 0;
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) gated += D.link[i].used && D.link[i].gated ? 1u : 0u;
     if (gated >= OC_CELLSRV_PENDING) {
-        oc_log(OC_LOG_WARNING, "cell TLS: %s: %u links behind the HELLO gate already, connection refused", addr,
-               OC_CELLSRV_PENDING);
+        gate_warn("cell TLS: %s: %u links behind the HELLO gate already, connection refused", addr,
+                  OC_CELLSRV_PENDING);
         return;
     }
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
@@ -812,7 +828,7 @@ static void on_cell_tls(void *ctx, oc_tls_conn_t *tls, const char *addr)
         oc_conn_init_io(&l->c, l->t.fd, &io);
         return;
     }
-    oc_log(OC_LOG_WARNING, "cell TLS: %s: %u links already, connection refused", addr, OC_CORE_LINKS);
+    gate_warn("cell TLS: %s: %u links already, connection refused", addr, OC_CORE_LINKS);
 }
 
 /* ---- the admin socket ---- */
@@ -1100,7 +1116,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
             dlink_t *l = &D.link[i];
             if (!l->used || !l->gated) continue;
             if (!l->drop && !l->dead && now_gate - l->since_us >= (uint64_t)GATE_S * 1000000u) {
-                oc_log(OC_LOG_WARNING, "cell TLS: %s (%.16s...): no HELLO in 10 s: closed", l->addr, l->peer);
+                gate_warn("cell TLS: %s (%.16s...): no HELLO in 10 s: closed", l->addr, l->peer);
                 l->drop = 1;
             }
             if (l->drop || l->dead) { /* oc_core never heard of it: no link_down */
@@ -1109,6 +1125,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
                 l->used = 0;
             }
         }
+        oc_cellsrv_log_tick(&D.gate_log, now_gate);
     }
     oc_log(OC_LOG_NOTICE, "oc-core: stopping");
     oc_apisrv_close(&D.apisrv);

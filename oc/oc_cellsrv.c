@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
@@ -11,6 +12,24 @@
 
 #include "oc_addr.h"
 #include "oc_log.h"
+
+void oc_cellsrv_log_tick(oc_cellsrv_throttle_t *t, uint64_t now_us)
+{
+    if (t->n == 0 || now_us - t->start_us < (uint64_t)OC_CELLSRV_LOG_S * 1000000u) return;
+    if (t->n > OC_CELLSRV_LOG_N) {
+        oc_log(OC_LOG_WARNING, "cell TLS: %u more refusals in the last %u s (not logged one by one)",
+               t->n - OC_CELLSRV_LOG_N, OC_CELLSRV_LOG_S);
+    }
+    t->n = 0;
+}
+
+int oc_cellsrv_log_ok(oc_cellsrv_throttle_t *t, uint64_t now_us)
+{
+    oc_cellsrv_log_tick(t, now_us);
+    if (t->n == 0) t->start_us = now_us;
+    if (t->n < UINT_MAX) t->n++;
+    return t->n <= OC_CELLSRV_LOG_N;
+}
 
 int oc_cellsrv_open(oc_cellsrv_t *s, const char *text, oc_tls_t *tls, uint64_t (*now_us)(void), char *err, size_t cap)
 {
@@ -106,9 +125,9 @@ unsigned oc_cellsrv_fds(oc_cellsrv_t *s, struct pollfd *p)
     return n;
 }
 
-static void hs_close(oc_cellsrv_hs_t *h, int prio, const char *why)
+static void hs_close(oc_cellsrv_t *s, oc_cellsrv_hs_t *h, int prio, const char *why)
 {
-    if (why != NULL) oc_log(prio, "cell TLS: %s: closed: %s", h->addr, why);
+    if (why != NULL && oc_cellsrv_log_ok(&s->fail, s->now_us())) oc_log(prio, "cell TLS: %s: closed: %s", h->addr, why);
     oc_tls_conn_close(&h->tls);
     h->used = 0;
 }
@@ -124,7 +143,7 @@ void oc_cellsrv_serve(oc_cellsrv_t *s, const struct pollfd *p, unsigned n, oc_ce
         if (!h->used || p[k].revents == 0) continue;
         int r = oc_tls_conn_handshake(&h->tls);
         if (r < 0) {
-            hs_close(h, OC_LOG_WARNING, h->tls.why[0] != '\0' ? h->tls.why : "handshake failed");
+            hs_close(s, h, OC_LOG_WARNING, h->tls.why[0] != '\0' ? h->tls.why : "handshake failed");
         } else if (r == 1) {
             char addr[64];
             snprintf(addr, sizeof(addr), "%s", h->addr);
@@ -137,15 +156,16 @@ void oc_cellsrv_serve(oc_cellsrv_t *s, const struct pollfd *p, unsigned n, oc_ce
     for (unsigned i = 0; i < OC_CELLSRV_PENDING; i++) {
         oc_cellsrv_hs_t *h = &s->hs[i];
         if (h->used && now - h->since_us >= (uint64_t)OC_CELLSRV_HANDSHAKE_S * 1000000u) {
-            hs_close(h, OC_LOG_WARNING, "no handshake in 10 s");
+            hs_close(s, h, OC_LOG_WARNING, "no handshake in 10 s");
         }
     }
+    oc_cellsrv_log_tick(&s->fail, now);
 }
 
 void oc_cellsrv_close(oc_cellsrv_t *s)
 {
     for (unsigned i = 0; i < OC_CELLSRV_PENDING; i++) {
-        if (s->hs[i].used) hs_close(&s->hs[i], 0, NULL);
+        if (s->hs[i].used) hs_close(s, &s->hs[i], 0, NULL);
     }
     if (s->lfd >= 0) close(s->lfd);
     s->lfd = -1;

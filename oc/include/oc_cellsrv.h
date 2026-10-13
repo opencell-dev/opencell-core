@@ -17,11 +17,22 @@
   #define OC_CELLSRV_PENDING     4u
   #define OC_CELLSRV_HANDSHAKE_S 10u
   typedef struct { int used; uint64_t since_us; oc_tls_conn_t tls; char addr[64]; } oc_cellsrv_hs_t;
+  /* Refusals on a public port, logged OC_CELLSRV_LOG_N per OC_CELLSRV_LOG_S
+   * at most: the rest are counted, and one line says how many once the
+   * window is over (journald would otherwise rate-limit the whole service). */
+  #define OC_CELLSRV_LOG_N 5u
+  #define OC_CELLSRV_LOG_S 10u
+  typedef struct { uint64_t start_us; unsigned n; } oc_cellsrv_throttle_t;
+  /* 1: log this refusal one by one; 0: counted only. */
+  int  oc_cellsrv_log_ok(oc_cellsrv_throttle_t *t, uint64_t now_us);
+  /* Every turn: a window over logs its count of the refusals not logged. */
+  void oc_cellsrv_log_tick(oc_cellsrv_throttle_t *t, uint64_t now_us);
   typedef struct {
       int             lfd; /* -1: closed */
       oc_tls_t       *tls;
       uint64_t      (*now_us)(void);
       uint64_t        full_logged_us;
+      oc_cellsrv_throttle_t fail; /* failed and timed-out handshakes */
       oc_cellsrv_hs_t hs[OC_CELLSRV_PENDING];
       int             at[1 + OC_CELLSRV_PENDING]; /* poll entry -> hs index (-1: the listener), from the last _fds */
   } oc_cellsrv_t;

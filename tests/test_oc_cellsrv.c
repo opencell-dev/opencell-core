@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -163,6 +164,64 @@ static void test_at_most_four_handshakes_and_each_has_a_deadline(void)
     oc_tls_free(t);
 }
 
+static int count(const char *buf, const char *needle)
+{
+    int n = 0;
+    for (const char *p = strstr(buf, needle); p != NULL; p = strstr(p + 1, needle)) n++;
+    return n;
+}
+
+/* A public port: an internet host can fail handshakes as fast as it can
+ * connect. Per 10 s, 5 failures are logged one by one; the rest are
+ * counted, and one line says how many once the 10 s are over. Captured from
+ * stderr, oc_log's only destination. */
+static void test_failed_handshakes_are_logged_5_per_10_s(void)
+{
+    char err[256];
+    oc_cellsrv_t s;
+    oc_tls_t *t = server();
+    TEST_ASSERT_EQUAL_INT(0, oc_cellsrv_open(&s, LISTEN, t, now_us, err, sizeof(err)));
+    NOW = 50000000;
+    char tmp[] = "/tmp/oc_cellsrv_log_XXXXXX";
+    int lf = mkstemp(tmp);
+    TEST_ASSERT_TRUE(lf >= 0);
+    unlink(tmp);
+    fflush(stderr);
+    int saved = dup(2);
+    TEST_ASSERT_TRUE(saved >= 0);
+    dup2(lf, 2);
+    for (int k = 0; k < 20; k++) {
+        int fd = dial(PORT);
+        static const char junk[] = "GET / HTTP/1.0\r\n\r\n"; /* not a ClientHello: the handshake fails */
+        TEST_ASSERT_EQUAL_INT((int)sizeof(junk) - 1, (int)send(fd, junk, sizeof(junk) - 1u, 0));
+        turn(&s); /* the accept */
+        for (int i = 0; i < 50 && (s.hs[0].used || s.hs[1].used || s.hs[2].used || s.hs[3].used); i++) turn(&s);
+        close(fd);
+    }
+    turn(&s);
+    fflush(stderr);
+    char buf[16384] = { 0 };
+    ssize_t n = pread(lf, buf, sizeof(buf) - 1u, 0);
+    int one_by_one = count(buf, ": closed: "), summary = count(buf, "more refusals in the last 10 s");
+    NOW += (uint64_t)10 * 1000000u + 1u;
+    turn(&s);
+    fflush(stderr);
+    char buf2[16384] = { 0 };
+    ssize_t n2 = pread(lf, buf2, sizeof(buf2) - 1u, 0);
+    dup2(saved, 2);
+    close(saved);
+    close(lf);
+    TEST_ASSERT_TRUE(n > 0 && n2 > 0);
+    for (unsigned i = 0; i < OC_CELLSRV_PENDING; i++) TEST_ASSERT_FALSE(s.hs[i].used);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(5, one_by_one, buf);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, summary, buf);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(5, count(buf2, ": closed: "), buf2);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, count(buf2, "cell TLS: 15 more refusals in the last 10 s (not logged one by one)"),
+                                  buf2);
+    oc_cellsrv_close(&s);
+    oc_tls_free(t);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) PKI = argv[1];
@@ -173,5 +232,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_cell_handshake_is_handed_on);
     RUN_TEST(test_a_portal_certificate_is_not_handed_on);
     RUN_TEST(test_at_most_four_handshakes_and_each_has_a_deadline);
+    RUN_TEST(test_failed_handshakes_are_logged_5_per_10_s);
     return UNITY_END();
 }

@@ -4,7 +4,7 @@
  *   tool_oc_call hss FILE
  *       writes an ocbench HSS file (import-ocb-hss): a network key and
  *       +883160655501234 activated on TMID 76ad0488 with this tool's K/OPc
- *   tool_oc_call SOCKET CELL_ID BOOT_ID [CALLED SECONDS]
+ *   tool_oc_call SOCKET|tls:HOST:PORT:PKI:NAME CELL_ID BOOT_ID [CALLED SECONDS]
  *       HELLO as the cell, registers that terminal as the terminal would
  *       (AV_REQ, the RES from K/OPc, LOC_UPDATE), calls the echo service
  *       (or CALLED), prints "answered" once the call is up, then holds the
@@ -24,6 +24,7 @@
 #include "oc_conn.h"
 #include "oc_sig_crypto.h"
 #include "oc_sig_milenage.h"
+#include "tool_dial.h"
 
 #define NUMBER "+883160655501234"
 #define TMID   0x76ad0488u
@@ -159,7 +160,7 @@ int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "hss") == 0) return write_hss(argv[2]);
     if (argc != 4 && argc != 6) {
-        fprintf(stderr, "usage: tool_oc_call hss FILE | tool_oc_call SOCKET CELL_ID BOOT_ID [CALLED SECONDS]\n");
+        fprintf(stderr, "usage: tool_oc_call hss FILE | tool_oc_call SOCKET|tls:HOST:PORT:PKI:NAME CELL_ID BOOT_ID [CALLED SECONDS]\n");
         return 2;
     }
     if (argc == 6) {
@@ -167,12 +168,7 @@ int main(int argc, char **argv)
         talk_s = strtod(argv[5], NULL);
     }
     oc_sig_number_to_bcd(NUMBER, strlen(NUMBER), num);
-    int fd = oc_unix_connect_wait(argv[1], 10000);
-    if (fd < 0) {
-        perror(argv[1]);
-        return 1;
-    }
-    oc_conn_init(&C, fd);
+    if (tool_dial(argv[1], &C) != 0) return 1;
     oc_core_msg_t h;
     memset(&h, 0, sizeof(h));
     h.type = OC_CORE_HELLO;

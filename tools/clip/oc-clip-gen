@@ -5,16 +5,26 @@
 
 Speaks "This is OpenCell core WORD. Playback test. Your call is
 connected." and then Harvard sentences list 1, sentences 1-5 (IEEE 1969),
-with flite's cmu_us_slt voice (the Debian package libflite1, through
-ctypes: no flite program is needed) at 16 kHz; resamples to 8 kHz
-(scipy); puts 0.5 s of silence after each part and 1 s at the end; scales
-the peak to -3 dBFS; pads to whole 120 ms blocks (960 samples). OUT.raw is
-8 kHz mono s16le, so `c2enc 1200 OUT.raw OUT.bit` (a .bit name: a .c2 name
-makes c2enc write a header) gives whole 18-byte payloads. The same WORD
-gives the same bytes on the same flite. Run on the laptop, never on a core.
+in one Piper run (the piper-tts program: OC_PIPER, default `piper` on the
+PATH) with the en_US-lessac-medium voice (OC_PIPER_MODEL, default
+~/.cache/opencell-piper/en_US-lessac-medium.onnx) at 1.2x length;
+resamples to 8 kHz (scipy); adds 1 s of silence at the end; pads to whole
+120 ms blocks (960 samples). Nothing else: no band filter and no level
+change, except a scale down to a -1 dBFS peak where the resampled speech
+would clip (filtering and a hot level cost Codec2 1200 words: 23% word
+errors against 8% unprocessed, 2026-10-12). OUT.raw is 8 kHz mono s16le,
+so `c2enc 1200 OUT.raw OUT.bit` (a .bit name: a .c2 name makes c2enc
+write a header) gives whole 18-byte payloads. Piper's voice samples noise,
+so each run differs a little: the committed clip is the reference, not
+this program's output. Run on the laptop, never on a core.
 """
-import ctypes
+import os
+import subprocess
 import sys
+import tempfile
+import wave
+from math import gcd
+from pathlib import Path
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -28,51 +38,29 @@ HARVARD_1 = [
 ]
 WORDS = ("one", "two", "three", "four")
 RATE, BLOCK = 8000, 960
+PIPER = os.environ.get("OC_PIPER", "piper")
+MODEL = os.environ.get("OC_PIPER_MODEL", str(Path.home() / ".cache/opencell-piper/en_US-lessac-medium.onnx"))
 
 
-class _Wave(ctypes.Structure):  # flite's cst_wave
-    _fields_ = [("type", ctypes.c_char_p), ("rate", ctypes.c_int), ("n", ctypes.c_int),
-                ("ch", ctypes.c_int), ("samples", ctypes.POINTER(ctypes.c_short))]
-
-
-class Flite:
-    def __init__(self) -> None:
-        g = ctypes.RTLD_GLOBAL
-        self.fl = ctypes.CDLL("libflite.so.1", mode=g)
-        for lib in ("libflite_usenglish.so.1", "libflite_cmulex.so.1"):
-            ctypes.CDLL(lib, mode=g)
-        slt = ctypes.CDLL("libflite_cmu_us_slt.so.1")
-        self.fl.flite_init()
-        slt.register_cmu_us_slt.restype = ctypes.c_void_p
-        slt.register_cmu_us_slt.argtypes = [ctypes.c_char_p]
-        self.voice = slt.register_cmu_us_slt(None)
-        self.fl.flite_text_to_wave.restype = ctypes.c_void_p
-        self.fl.flite_text_to_wave.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
-        self.fl.delete_wave.argtypes = [ctypes.c_void_p]
-
-    def say(self, text: str) -> np.ndarray:
-        """text spoken, at 8 kHz, floats in [-1, 1]."""
-        w = self.fl.flite_text_to_wave(text.encode(), self.voice)
-        cw = _Wave.from_address(w)
-        x = np.ctypeslib.as_array(cw.samples, shape=(cw.n * cw.ch,)).astype(np.float64) / 32768.0
-        rate = cw.rate
-        self.fl.delete_wave(w)
-        if rate != 16000:
-            raise SystemExit(f"oc-clip-gen: flite gave {rate} Hz, expected 16000 (cmu_us_slt)")
-        return resample_poly(x, 1, 2)
+def say(text: str) -> np.ndarray:
+    """text spoken by Piper, at 8 kHz, floats."""
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "say.wav"
+        subprocess.run([PIPER, "-m", MODEL, "-f", str(out), "--length-scale", "1.2"],
+                       input=text.encode(), check=True, capture_output=True)
+        with wave.open(str(out)) as w:
+            rate = w.getframerate()
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float64) / 32768.0
+    g = gcd(rate, RATE)
+    return resample_poly(x, RATE // g, rate // g)
 
 
 def main() -> None:
     if len(sys.argv) != 3 or sys.argv[1] not in WORDS:
         raise SystemExit("usage: oc-clip-gen one|two|three|four OUT.raw")
-    f = Flite()
-    gap = np.zeros(RATE // 2)
-    parts = [f.say(f"This is OpenCell core {sys.argv[1]}. Playback test. Your call is connected."), gap]
-    for s in HARVARD_1:
-        parts += [f.say(s), gap]
-    parts.append(np.zeros(RATE))
-    x = np.concatenate(parts)
-    x *= (10 ** (-3 / 20)) / max(1e-9, float(np.max(np.abs(x))))
+    text = f"This is OpenCell core {sys.argv[1]}. Playback test. Your call is connected. " + " ".join(HARVARD_1)
+    x = np.concatenate([say(text), np.zeros(RATE)])
+    x *= min(1.0, (10 ** (-1 / 20)) / max(1e-9, float(np.max(np.abs(x)))))
     x = np.concatenate([x, np.zeros((-len(x)) % BLOCK)])
     pcm = np.clip(np.round(x * 32767), -32768, 32767).astype("<i2")
     pcm.tofile(sys.argv[2])

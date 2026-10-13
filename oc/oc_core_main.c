@@ -45,6 +45,7 @@
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,7 @@
 #include "oc_admin.h"
 #include "oc_api.h"
 #include "oc_apisrv.h"
+#include "oc_cellsrv.h"
 #include "oc_clip.h"
 #include "oc_conn.h"
 #include "oc_core.h"
@@ -90,6 +92,14 @@ typedef struct {
     uint32_t  id;   /* oc_core's link handle: never reused */
     int       dead; /* the peer vanished, or a send or read failed: oc_core hears of it after the call in progress */
     oc_conn_t c;
+    int           tls;      /* over the cell listener: behind the HELLO gate until let in */
+    int           gated;    /* a TLS link oc_core has not heard of yet (no link_up) */
+    uint64_t      since_us; /* gated: when the handshake finished */
+    oc_tls_conn_t t;        /* tls: the connection oc_conn runs over */
+    char          peer[65]; /* tls: the certificate's SHA-256 */
+    uint32_t      cell_id;  /* tls, let in: the cell its HELLO named, the only one it may speak for */
+    char          addr[64];
+    int           drop;     /* a gated link refused: flushed and closed; oc_core never heard of it */
 } dlink_t;
 
 static struct {
@@ -112,7 +122,11 @@ static struct {
     uint8_t         clip[OC_CORE_CLIP_MAX]; /* the playback service's, from playback_clip */
     oc_ocss_cfg_t   ocss_cfg;               /* npeer 0: no OCSS */
     oc_ocss_t       ocss;
-} D = { .cell_l = -1, .admin_l = -1, .apisrv = { .lfd = -1 }, .ocss = { .lfd = -1 } };
+    oc_cellsrv_t    cellsrv; /* must not move while open: its TLS ex_data points into it */
+    oc_tls_t       *cell_tls;
+    const char     *cell_listen;
+    oc_cellsrv_throttle_t gate_log; /* the HELLO gate's refusals, and TLS links refused for want of a slot */
+} D = { .cell_l = -1, .admin_l = -1, .apisrv = { .lfd = -1 }, .ocss = { .lfd = -1 }, .cellsrv = { .lfd = -1 } };
 
 static volatile sig_atomic_t g_stop;
 
@@ -171,7 +185,8 @@ static const char *const KEYS[] = { "core_id",      "key_id",       "echo",     
                                     "cell_socket",  "cell_group",   "admin_socket",  "admin_group",    "name",
                                     "api_listen",   "api_cert",     "api_key",       "api_ca",         "api_portal_fpr",
                                     "api_rate",     "playback",     "playback_clip", "peer",           "ocss_listen",
-                                    "ocss_cert",    "ocss_key",     "ocss_ca",       NULL };
+                                    "ocss_cert",    "ocss_key",     "ocss_ca",       "cell_listen",    "cell_cert",
+                                    "cell_key",     "cell_ca",      NULL };
 
 /* playback_clip: an 8 kHz mono 16-bit WAV (playback clip spec 2026-10-12
  * §4), read whole, encoded with Codec2 1200 into D.clip, then freed. 0 or
@@ -398,6 +413,19 @@ static int load_config(const char *path, const char *db)
         }
         D.tls_cfg.npin = i + 1u;
     }
+    /* the cells' TLS listener: all of it or none */
+    D.cell_listen = oc_kv_get(&D.kv, "cell_listen");
+    const char *cell_keys[] = { "cell_cert", "cell_key", "cell_ca" };
+    for (unsigned i = 0; i < 3; i++) {
+        if (D.cell_listen != NULL && oc_kv_get(&D.kv, cell_keys[i]) == NULL) {
+            oc_log(OC_LOG_ERR, "config: cell_listen is set: %s is needed too", cell_keys[i]);
+            return -1;
+        }
+        if (D.cell_listen == NULL && oc_kv_get(&D.kv, cell_keys[i]) != NULL) {
+            oc_log(OC_LOG_ERR, "config: cell_* is set but cell_listen is not (cells would not be heard over TLS)");
+            return -1;
+        }
+    }
     return 0;
 bad:
     oc_log(OC_LOG_ERR, "config: %s", D.kv.err);
@@ -531,6 +559,32 @@ static int api_start(void)
     return 0;
 }
 
+/* With cell_listen: the cells' TLS listener (single-board cell spec §5),
+ * with the cell_* files as the admin API's are given. 0 or -1 (logged). */
+static int cells_tls_start(void)
+{
+    char err[400], cert[512], key[512], ca[512];
+    if (D.cell_listen == NULL) return 0;
+    oc_tls_cfg_t c;
+    memset(&c, 0, sizeof(c));
+    c.cert = cred_path(oc_kv_get(&D.kv, "cell_cert"), cert, sizeof(cert));
+    c.key = cred_path(oc_kv_get(&D.kv, "cell_key"), key, sizeof(key));
+    c.ca = cred_path(oc_kv_get(&D.kv, "cell_ca"), ca, sizeof(ca));
+    c.alpn = "oc-cell/1";
+    c.role = OC_TLS_ROLE_CELL;
+    c.pin_by_caller = 1;
+    D.cell_tls = oc_tls_new(&c, err, sizeof(err));
+    if (D.cell_tls == NULL) {
+        oc_log(OC_LOG_ERR, "cell TLS: %s", err);
+        return -1;
+    }
+    if (oc_cellsrv_open(&D.cellsrv, D.cell_listen, D.cell_tls, mono_us, err, sizeof(err)) != 0) {
+        oc_log(OC_LOG_ERR, "config: %s", err);
+        return -1;
+    }
+    return 0;
+}
+
 /* OCSS (core test services spec §6): the links to the other cores, with
  * the ocss_* files as the admin API's are given (a value with no '/' is a
  * systemd credential). 0, or -1 (logged). */
@@ -609,10 +663,79 @@ static uint32_t k_unix(void *c)
     return (uint32_t)time(NULL);
 }
 
+/* The HELLO gate (single-board cell spec §5): a TLS link's first frame
+ * must be HELLO from a cell whose pinned certificate is the peer's. Every
+ * refusal answers UNKNOWN_CELL; the log says why. Returns 1 if m goes on
+ * to oc_core. */
+/* A cell TLS refusal, logged one by one only OC_CELLSRV_LOG_N per
+ * OC_CELLSRV_LOG_S (a public port: oc_cellsrv_log_ok); a warning. */
+static void gate_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void gate_warn(const char *fmt, ...)
+{
+    if (!oc_cellsrv_log_ok(&D.gate_log, mono_us())) return;
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    oc_log(OC_LOG_WARNING, "%s", line);
+}
+
+static void send_nak(dlink_t *l)
+{
+    oc_core_msg_t nak;
+    memset(&nak, 0, sizeof(nak));
+    nak.type = OC_CORE_HELLO_NAK;
+    nak.u.hello_nak.reason = OC_CORE_NAK_UNKNOWN_CELL;
+    oc_conn_send(&l->c, &nak);
+}
+
+static int gate_frame(dlink_t *l, const oc_core_msg_t *m)
+{
+    char pin[65];
+    if (m->type != OC_CORE_HELLO) {
+        gate_warn("cell TLS: %s (%.16s...): first frame is not HELLO (type 0x%02x): closed", l->addr, l->peer,
+                  m->type);
+        l->drop = 1;
+        return 0;
+    }
+    uint32_t id = m->u.hello.cell_id;
+    int r = oc_sql_cell_cert_get(D.sql, id, pin);
+    const char *why = r == OC_CORE_STORE_NONE     ? "no such cell"
+                      : r == 1                    ? "no certificate pinned"
+                      : r != 0                    ? "the pin can't be read"
+                      : strcmp(pin, l->peer) != 0 ? "certificate differs from the pin"
+                                                  : NULL;
+    if (why != NULL) {
+        gate_warn("cell TLS: %s: cell %u: %s: certificate %.16s... (HELLO_NAK unknown cell)", l->addr, (unsigned)id,
+                  why, l->peer);
+        send_nak(l);
+        l->drop = 1;
+        return 0;
+    }
+    oc_log(OC_LOG_INFO, "cell TLS: %s: cell %u, certificate %.16s...: let in", l->addr, (unsigned)id, l->peer);
+    l->gated = 0;
+    l->cell_id = id;
+    oc_core_link_up(&D.core, l->id, mono_us());
+    return 1;
+}
+
 static void on_frame(void *ctx, const oc_core_msg_t *m)
 {
     dlink_t *l = ctx;
-    if (!l->dead) oc_core_rx(&D.core, l->id, m, mono_us());
+    if (l->dead || l->drop) return;
+    if (l->gated && !gate_frame(l, m)) return;
+    /* Let in, a TLS link speaks for the one cell whose pin it showed: a
+     * later HELLO naming another (oc_core would let the newest win) is
+     * refused, and the link goes down. The same cell may HELLO again. */
+    if (l->tls && m->type == OC_CORE_HELLO && m->u.hello.cell_id != l->cell_id) {
+        gate_warn("cell TLS: %s: let in as cell %u, HELLO names cell %u: closed (HELLO_NAK unknown cell)", l->addr,
+                  (unsigned)l->cell_id, (unsigned)m->u.hello.cell_id);
+        send_nak(l);
+        l->dead = 1; /* oc_core has it: link_lost, from the loop */
+        return;
+    }
+    oc_core_rx(&D.core, l->id, m, mono_us());
 }
 
 /* A dead link: closed, and oc_core hears of it (its calls end). Called
@@ -646,7 +769,7 @@ static void drop_cell(void *ctx, uint32_t cell_id)
 static void links_down(void)
 {
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
-        if (D.link[i].used) oc_core_link_down(&D.core, D.link[i].id, mono_us());
+        if (D.link[i].used && !D.link[i].gated) oc_core_link_down(&D.core, D.link[i].id, mono_us());
     }
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
         if (D.link[i].used && !D.link[i].dead) oc_conn_flush(&D.link[i].c);
@@ -669,6 +792,43 @@ static void accept_cell(void)
     }
     oc_log(OC_LOG_WARNING, "cell socket: %u links already, connection refused", OC_CORE_LINKS);
     close(fd);
+}
+
+#define GATE_S 10u /* a TLS link that sends no HELLO this long after its handshake is closed */
+
+/* A cell's finished TLS handshake (oc_cellsrv): a link behind the HELLO
+ * gate, which oc_core hears of only once let in. Left unmoved, tls is
+ * closed by oc_cellsrv_serve. */
+static void on_cell_tls(void *ctx, oc_tls_conn_t *tls, const char *addr)
+{
+    (void)ctx;
+    /* Any cell certificate gets this far, pinned or not: behind the gate
+     * it may hold a link slot (shared with the Unix cells) GATE_S, so at
+     * most OC_CELLSRV_PENDING at once. */
+    unsigned gated = 0;
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) gated += D.link[i].used && D.link[i].gated ? 1u : 0u;
+    if (gated >= OC_CELLSRV_PENDING) {
+        gate_warn("cell TLS: %s: %u links behind the HELLO gate already, connection refused", addr,
+                  OC_CELLSRV_PENDING);
+        return;
+    }
+    for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
+        if (D.link[i].used) continue;
+        dlink_t *l = &D.link[i];
+        memset(l, 0, sizeof(*l));
+        l->used = 1;
+        l->tls = 1;
+        l->gated = 1;
+        l->id = ++D.next_id;
+        l->since_us = mono_us();
+        snprintf(l->peer, sizeof(l->peer), "%s", tls->peer);
+        snprintf(l->addr, sizeof(l->addr), "%s", addr);
+        oc_tls_conn_move(&l->t, tls);
+        oc_conn_io_t io = oc_tls_conn_io(&l->t);
+        oc_conn_init_io(&l->c, l->t.fd, &io);
+        return;
+    }
+    gate_warn("cell TLS: %s: %u links already, connection refused", addr, OC_CORE_LINKS);
 }
 
 /* ---- the admin socket ---- */
@@ -874,16 +1034,18 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     if (D.cell_l < 0) goto out;
     D.admin_l = listen_on(D.admin_sock, oc_kv_get(&D.kv, "admin_group"));
     if (D.admin_l < 0) goto out;
-    if (api_start() != 0 || ocss_start() != 0) goto out;
+    if (api_start() != 0 || cells_tls_start() != 0 || ocss_start() != 0) goto out;
     oc_log(OC_LOG_NOTICE,
-           "oc-core %s: core %u (%s), key %u, %u blocks, db %s (v%d), cells on %s, admin on %s, API %s, "
+           "oc-core %s: core %u (%s), key %u, %u blocks, db %s (v%d), cells on %s%s%s%s, admin on %s, API %s, "
            "playback %s, OCSS %u peers%s%s",
            OC_VERSION, D.cfg.core_id, D.name, D.cfg.key_id, D.route.n, D.db, oc_sql_version(D.sql), D.cell_sock,
-           D.admin_sock, D.api_listen != NULL ? D.api_listen : "off", D.cfg.clip_len != 0 ? "on" : "off",
+           D.cell_listen != NULL ? " and " : "", D.cell_listen != NULL ? D.cell_listen : "",
+           D.cell_listen != NULL ? " (TLS)" : "", D.admin_sock, D.api_listen != NULL ? D.api_listen : "off",
+           D.cfg.clip_len != 0 ? "on" : "off",
            D.ocss_cfg.npeer, D.ocss_cfg.listen != NULL ? ", listening on " : "",
            D.ocss_cfg.listen != NULL ? D.ocss_cfg.listen : "");
     while (!g_stop) {
-        struct pollfd p[2 + OC_CORE_LINKS + 1 + OC_APISRV_CONNS + 1 + OC_OCSS_CONNS];
+        struct pollfd p[2 + OC_CORE_LINKS + 1 + OC_APISRV_CONNS + 1 + OC_CELLSRV_PENDING + 1 + OC_OCSS_CONNS];
         dlink_t *who[2 + OC_CORE_LINKS];
         nfds_t np = 0;
         p[np] = (struct pollfd){ D.cell_l, POLLIN, 0 };
@@ -893,7 +1055,9 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
         for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
             dlink_t *l = &D.link[i];
             if (!l->used || l->dead) continue;
-            p[np] = (struct pollfd){ l->c.fd, (short)(POLLIN | (l->c.tn > 0 ? POLLOUT : 0)), 0 };
+            /* a TLS link may want to write to go on reading (t.want) */
+            int out = l->c.tn > 0 || (l->tls && l->t.want == POLLOUT);
+            p[np] = (struct pollfd){ l->c.fd, (short)(POLLIN | (out ? POLLOUT : 0)), 0 };
             who[np++] = l;
         }
         int timeout = 100; /* oc_core_tick at least every 100 ms (CELL_CFG retries, PING, timers) */
@@ -906,6 +1070,9 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
         nfds_t api_at = np;
         unsigned api_n = oc_apisrv_fds(&D.apisrv, p + np, &timeout);
         np += api_n;
+        nfds_t cellsrv_at = np;
+        unsigned cellsrv_n = oc_cellsrv_fds(&D.cellsrv, p + np);
+        np += cellsrv_n;
         nfds_t ocss_at = np;
         unsigned ocss_n = oc_ocss_fds(&D.ocss, p + np, &timeout);
         np += ocss_n;
@@ -926,8 +1093,8 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
                 }
                 /* A read hands every whole frame to oc_core first: what a
                  * cell sent before it hung up is served. */
-                if ((p[i].revents & (POLLIN | POLLHUP | POLLERR)) && oc_conn_read(&l->c, on_frame, l) != 0 &&
-                    l->used) {
+                short rd = (short)(POLLIN | POLLHUP | POLLERR | (l->tls ? POLLOUT : 0));
+                if ((p[i].revents & rd) && oc_conn_read(&l->c, on_frame, l) != 0 && l->used) {
                     l->dead = 1;
                 }
             }
@@ -936,15 +1103,33 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
             for (nfds_t i = api_at; i < np; i++) p[i].revents = 0;
         }
         oc_apisrv_serve(&D.apisrv, p + api_at, api_n); /* deadlines too, so every turn */
+        if (D.cell_listen != NULL) /* deadlines too; never opened, it has no clock */
+            oc_cellsrv_serve(&D.cellsrv, p + cellsrv_at, cellsrv_n, on_cell_tls, NULL);
         oc_ocss_serve(&D.ocss, p + ocss_at, ocss_n);   /* dials and deadlines too */
         oc_core_tick(&D.core, mono_us());
         oc_api_tick(&D.api);
         for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
-            if (D.link[i].used && D.link[i].dead) link_lost(&D.link[i]);
+            if (D.link[i].used && D.link[i].dead && !D.link[i].gated) link_lost(&D.link[i]);
         }
+        uint64_t now_gate = mono_us();
+        for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
+            dlink_t *l = &D.link[i];
+            if (!l->used || !l->gated) continue;
+            if (!l->drop && !l->dead && now_gate - l->since_us >= (uint64_t)GATE_S * 1000000u) {
+                gate_warn("cell TLS: %s (%.16s...): no HELLO in 10 s: closed", l->addr, l->peer);
+                l->drop = 1;
+            }
+            if (l->drop || l->dead) { /* oc_core never heard of it: no link_down */
+                if (!l->dead) oc_conn_flush(&l->c); /* the HELLO_NAK, if any */
+                oc_conn_close(&l->c);
+                l->used = 0;
+            }
+        }
+        oc_cellsrv_log_tick(&D.gate_log, now_gate);
     }
     oc_log(OC_LOG_NOTICE, "oc-core: stopping");
     oc_apisrv_close(&D.apisrv);
+    oc_cellsrv_close(&D.cellsrv);
     oc_ocss_close(&D.ocss); /* its calls end with their CDRs, the cells' legs released */
     links_down();
     rc = 0;
@@ -961,8 +1146,10 @@ out:
         unlink(D.admin_sock);
     }
     oc_apisrv_close(&D.apisrv);
+    oc_cellsrv_close(&D.cellsrv);
     oc_ocss_close(&D.ocss);
     oc_tls_free(D.tls);
+    oc_tls_free(D.cell_tls);
     if (D.sql != NULL) oc_sql_close(D.sql);
     oc_sig_wipe(D.key, sizeof(D.key));
     return rc;

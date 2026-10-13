@@ -417,7 +417,13 @@ static int cmd_cell(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         if (oc_sql_cell_cert_set(a->sql, (uint32_t)id, none ? NULL : fpr) != 0) {
             return store_error(o, "the fingerprint was not stored");
         }
-        oc_buf_printf(o, "cell %lu: %s\n", id, none ? "no certificate pinned" : "certificate pinned");
+        if (a->drop_cell != NULL && linked(a, (uint32_t)id)) {
+            a->drop_cell(a->ctx, (uint32_t)id); /* a revoked or replaced certificate does not stay connected */
+            oc_buf_printf(o, "cell %lu: %s; its link was dropped\n", id,
+                          none ? "no certificate pinned" : "certificate pinned");
+        } else {
+            oc_buf_printf(o, "cell %lu: %s\n", id, none ? "no certificate pinned" : "certificate pinned");
+        }
         return 0;
     }
     if (mode) {

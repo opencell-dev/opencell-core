@@ -1,7 +1,7 @@
 # The Linux side of the core (network core 2): oc_util (logging, config
 # files, framed connections: oc-cell uses it too), oc_store (the SQLite
 # store with sealed keys and the admin commands) and the oc-core program.
-add_library(oc_util STATIC oc_log.c oc_kv.c oc_conn.c)
+add_library(oc_util STATIC oc_log.c oc_kv.c oc_conn.c oc_conn_fd.c)
 target_include_directories(oc_util PUBLIC include)
 target_link_libraries(oc_util PUBLIC oc_core)
 
@@ -36,7 +36,8 @@ endif()
 
 # The admin API's TLS (portal plan P4): oc_tls (OpenSSL 3, TLS 1.3, pinned
 # peer certificates) and oc_apisrv (its listener and connections); oc_ocss,
-# the OCSS links to other cores (core test services spec §6).
-add_library(oc_net STATIC oc_tls.c oc_apisrv.c oc_ocss.c)
+# the OCSS links to other cores (core test services spec §6); oc_cellsrv,
+# the cells' TLS listener (single-board cell plan A).
+add_library(oc_net STATIC oc_tls.c oc_apisrv.c oc_addr.c oc_ocss.c oc_cellsrv.c)
 target_include_directories(oc_net PUBLIC include)
 target_link_libraries(oc_net PUBLIC oc_store OpenSSL::SSL)

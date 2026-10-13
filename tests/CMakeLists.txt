@@ -37,9 +37,9 @@ add_test(NAME test_oc_clip COMMAND test_oc_clip ${CMAKE_CURRENT_SOURCE_DIR}/data
 # cell with a terminal in a call (tool_oc_call) and a slow admin peer
 # (tool_oc_drip).
 add_executable(tool_oc_hello tool_oc_hello.c)
-target_link_libraries(tool_oc_hello PRIVATE oc_util)
+target_link_libraries(tool_oc_hello PRIVATE oc_net)
 add_executable(tool_oc_call tool_oc_call.c)
-target_link_libraries(tool_oc_call PRIVATE oc_util)
+target_link_libraries(tool_oc_call PRIVATE oc_net)
 add_executable(tool_oc_drip tool_oc_drip.c)
 target_link_libraries(tool_oc_drip PRIVATE oc_util)
 add_test(NAME test_oc_core_proc
@@ -67,9 +67,13 @@ add_test(NAME test_oc_db_alert_mail COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/
 add_test(NAME test_oc_db_upgrade COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_db_upgrade.py
                                    ${PROJECT_SOURCE_DIR}/tools/db/oc-db-upgrade)
 add_executable(test_oc_tls test_oc_tls.c)
-target_link_libraries(test_oc_tls PRIVATE oc_net unity)
+target_link_libraries(test_oc_tls PRIVATE oc_net oc_util unity)
 add_test(NAME test_oc_tls COMMAND test_oc_tls ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_tls PROPERTIES FIXTURES_REQUIRED pki)
+add_executable(test_oc_cellsrv test_oc_cellsrv.c)
+target_link_libraries(test_oc_cellsrv PRIVATE oc_net unity)
+add_test(NAME test_oc_cellsrv COMMAND test_oc_cellsrv ${CMAKE_BINARY_DIR}/pki)
+set_tests_properties(test_oc_cellsrv PROPERTIES FIXTURES_REQUIRED pki)
 add_executable(test_oc_ocss test_oc_ocss.c)
 target_link_libraries(test_oc_ocss PRIVATE oc_net unity)
 add_test(NAME test_oc_ocss COMMAND test_oc_ocss ${CMAKE_BINARY_DIR}/pki)
@@ -88,6 +92,11 @@ add_test(NAME test_oc_api_proc
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_api_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_api>
                  $<TARGET_FILE:tool_oc_hello> ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_api_proc PROPERTIES FIXTURES_REQUIRED pki)
+# oc-core's cell listener: cells over TLS behind the HELLO gate.
+add_test(NAME test_oc_cell_tls_proc
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_cell_tls_proc.sh $<TARGET_FILE:oc-core>
+                 $<TARGET_FILE:tool_oc_hello> $<TARGET_FILE:tool_oc_call> ${CMAKE_BINARY_DIR}/pki)
+set_tests_properties(test_oc_cell_tls_proc PROPERTIES FIXTURES_REQUIRED pki)
 
 # The playback clip's generator (laptop only: skipped without piper and its voice, numpy, scipy).
 add_test(NAME test_oc_clip_gen COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_clip_gen.sh ${PROJECT_SOURCE_DIR}/tools/clip/oc-clip-gen)

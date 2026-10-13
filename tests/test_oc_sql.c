@@ -856,6 +856,29 @@ static void test_cert_pins_and_the_expiry_scan(void)
     oc_sql_close(s);
 }
 
+static void test_cell_cert_get(void)
+{
+    char err[256], fpr[65];
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_cell_t c;
+    memset(&c, 0, sizeof(c));
+    c.cell_id = 4;
+    strcpy(c.name, "x");
+    c.enabled = 1;
+    TEST_ASSERT_EQUAL_INT(0, st.cell_put(st.ctx, &c));
+    TEST_ASSERT_EQUAL_INT(1, oc_sql_cell_cert_get(s, 4, fpr));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, oc_sql_cell_cert_get(s, 5, fpr));
+    const char *pin = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_cell_cert_set(s, 4, pin));
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_cell_cert_get(s, 4, fpr));
+    TEST_ASSERT_EQUAL_STRING(pin, fpr);
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_cell_cert_set(s, 4, NULL));
+    TEST_ASSERT_EQUAL_INT(1, oc_sql_cell_cert_get(s, 4, fpr));
+    oc_sql_close(s);
+}
+
 static void test_sqn_rises_across_a_core_restart(void)
 {
     char err[256];
@@ -899,5 +922,6 @@ int main(void)
     RUN_TEST(test_a_v1_database_migrates_to_v2);
     RUN_TEST(test_v2_rolls_back_to_v1_by_dropping_its_indexes);
     RUN_TEST(test_cert_pins_and_the_expiry_scan);
+    RUN_TEST(test_cell_cert_get);
     return UNITY_END();
 }

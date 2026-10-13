@@ -350,6 +350,88 @@ static void test_kv(void)
     TEST_ASSERT_EQUAL_STRING("/nonexistent/oc.conf: No such file or directory", kv.err);
 }
 
+/* A scripted transport: recv hands out chunks, send takes bytes while room lasts. */
+typedef struct {
+    const uint8_t *in;
+    size_t in_n, in_off, chunk;
+    uint8_t out[4096];
+    size_t out_n, room;
+    int closed, eof;
+} fake_io_t;
+
+static long fake_recv(void *ctx, void *buf, size_t n)
+{
+    fake_io_t *f = ctx;
+    if (f->in_off == f->in_n) return f->eof ? -1 : 0;
+    size_t k = f->in_n - f->in_off;
+    if (k > f->chunk) k = f->chunk;
+    if (k > n) k = n;
+    memcpy(buf, f->in + f->in_off, k);
+    f->in_off += k;
+    return (long)k;
+}
+
+static long fake_send(void *ctx, const void *buf, size_t n)
+{
+    fake_io_t *f = ctx;
+    size_t k = n < f->room ? n : f->room;
+    memcpy(f->out + f->out_n, buf, k);
+    f->out_n += k;
+    f->room -= k;
+    return (long)k;
+}
+
+static void fake_close(void *ctx) { ((fake_io_t *)ctx)->closed++; }
+
+static void test_frames_split_across_reads_decode(void)
+{
+    uint8_t w[64];
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_HELLO;
+    m.u.hello.proto = OC_CORE_PROTO;
+    m.u.hello.cell_id = 7;
+    size_t n = oc_core_encode(&m, w, sizeof(w));
+    m.type = OC_CORE_PING;
+    n += oc_core_encode(&m, w + n, sizeof(w) - n);
+    fake_io_t f = { .in = w, .in_n = n, .chunk = 3, .room = 4096 };
+    const oc_conn_io_t io = { &f, fake_recv, fake_send, fake_close };
+    oc_conn_t c;
+    oc_conn_init_io(&c, 99, &io);
+    ngot = 0;
+    close_on_rx = NULL;
+    TEST_ASSERT_EQUAL_INT(0, oc_conn_read(&c, on_rx, NULL));
+    TEST_ASSERT_EQUAL_INT(2, ngot);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_HELLO, got[0].type);
+    TEST_ASSERT_EQUAL_UINT32(7, got[0].u.hello.cell_id);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_PING, got[1].type);
+    f.eof = 1;
+    TEST_ASSERT_EQUAL_INT(-1, oc_conn_read(&c, on_rx, NULL)); /* the peer closed */
+    oc_conn_close(&c);
+    oc_conn_close(&c);
+    TEST_ASSERT_EQUAL_INT(1, f.closed); /* once */
+    TEST_ASSERT_EQUAL_INT(-1, c.fd);
+}
+
+static void test_a_full_transport_queues_and_flushes(void)
+{
+    fake_io_t f = { .room = 2 };
+    const oc_conn_io_t io = { &f, fake_recv, fake_send, fake_close };
+    oc_conn_t c;
+    oc_conn_init_io(&c, 99, &io);
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_PING;
+    TEST_ASSERT_EQUAL_INT(0, oc_conn_send(&c, &m));
+    TEST_ASSERT_EQUAL_UINT(2, f.out_n);
+    TEST_ASSERT_TRUE(c.tn > 0);
+    f.room = 4096;
+    TEST_ASSERT_EQUAL_INT(0, oc_conn_flush(&c));
+    TEST_ASSERT_EQUAL_UINT(0, c.tn);
+    TEST_ASSERT_EQUAL_UINT(3, f.out_n); /* len 2 | type 1 */
+    oc_conn_close(&c);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -365,5 +447,7 @@ int main(void)
     RUN_TEST(test_a_dial_never_blocks);
     RUN_TEST(test_backoff);
     RUN_TEST(test_kv);
+    RUN_TEST(test_frames_split_across_reads_decode);
+    RUN_TEST(test_a_full_transport_queues_and_flushes);
     return UNITY_END();
 }

@@ -925,6 +925,25 @@ int oc_sql_cell_cert_set(oc_sql_t *s, uint32_t cell_id, const char *fpr)
     return sqlite3_changes(s->db) > 0 ? 0 : OC_CORE_STORE_NONE;
 }
 
+int oc_sql_cell_cert_get(oc_sql_t *s, uint32_t cell_id, char out[65])
+{
+    out[0] = '\0';
+    sqlite3_stmt *st = prep(s, "SELECT cert_fpr FROM cell WHERE cell_id = ?");
+    int r = get_step(st, st != NULL ? sqlite3_bind_int64(st, 1, cell_id) : SQLITE_ERROR);
+    if (r == 0) {
+        const unsigned char *t = sqlite3_column_text(st, 0);
+        if (t == NULL) {
+            r = 1;
+        } else if (strlen((const char *)t) == 64) {
+            memcpy(out, t, 65);
+        } else {
+            r = OC_CORE_STORE_FAILED; /* oc_admin_fpr only ever stores 64 digits */
+        }
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
 int oc_sql_expired(oc_sql_t *s, uint32_t now, uint8_t (*out)[OC_SIG_NUMBER_LEN], int max)
 {
     int n = 0, rc = SQLITE_DONE;

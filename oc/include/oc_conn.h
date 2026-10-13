@@ -1,8 +1,8 @@
 /* The cell <-> core protocol over a stream socket (network-core spec §6):
  * frames of oc_core_msg.h ("len (2, BE) | type (1) | body", at most
  * OC_CORE_FRAME_MAX bytes) read and written on a non-blocking fd, plus the
- * Unix-socket helpers both daemons use. Linux only; plan 9 adds TLS under
- * the same calls.
+ * Unix-socket helpers both daemons use. Linux only; a TLS connection runs under
+ * the same calls (oc_conn_init_io, oc_tls_conn_io).
  *
  * A frame whose length is impossible (0, or more than OC_CORE_FRAME_MAX in
  * all) breaks the stream: oc_conn_read fails and the caller closes. A frame
@@ -25,6 +25,15 @@
 #define OC_CONN_RX 2048u
 #define OC_CONN_TX 16384u /* about 30 s of one call's MEDIA each way: a peer that reads nothing for longer is dropped */
 
+/* What oc_conn reads and writes through: a plain fd (oc_conn_init) or a
+ * TLS connection (oc_tls_conn_io). Never blocks. */
+typedef struct {
+    void *ctx;
+    long (*recv)(void *ctx, void *buf, size_t n);       /* > 0 bytes; 0 nothing now; -1 closed or failed */
+    long (*send)(void *ctx, const void *buf, size_t n); /* > 0 bytes taken; 0 no room now; -1 failed */
+    void (*close)(void *ctx);                           /* closes the transport and its fd */
+} oc_conn_io_t;
+
 typedef struct {
     int      fd; /* -1: closed */
     uint8_t  rx[OC_CONN_RX];
@@ -32,12 +41,15 @@ typedef struct {
     uint8_t  tx[OC_CONN_TX];
     size_t   tn;
     uint32_t bad; /* frames dropped because they did not decode */
+    oc_conn_io_t io;
 } oc_conn_t;
 
 typedef void (*oc_conn_rx_fn)(void *ctx, const oc_core_msg_t *m);
 
 /* Takes fd (made non-blocking and close-on-exec). */
 void oc_conn_init(oc_conn_t *c, int fd);
+/* As oc_conn_init, over io; fd is what the caller polls (io's own). */
+void oc_conn_init_io(oc_conn_t *c, int fd, const oc_conn_io_t *io);
 /* Reads what the socket has and hands every whole frame to cb, in order. cb
  * may close the connection; reading then stops. 0, or -1: the peer closed,
  * a read error, a broken frame length, or the connection was closed. */

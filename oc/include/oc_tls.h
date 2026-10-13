@@ -12,12 +12,18 @@
  * here ever waits). No session tickets or resumption: every connection
  * shows its certificate, so once the pins change (a new oc_tls_t: for
  * oc-core, a restart, as its config is read at start) no connection gets
- * in on an old one. */
+ * in on an old one.
+ *
+ * Also the cell listener's server (pin_by_caller: the core checks the pin
+ * against the cell's HELLO, network-core spec §6) and a client (tests, and
+ * a cell over TLS). */
 #ifndef OC_TLS_H
 #define OC_TLS_H
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "oc_conn.h"
 
 #define OC_TLS_PINS 4u
 #define OC_TLS_ROLE_CORE   "2.25.39025894690731581968303886031091540846.1.1"
@@ -32,7 +38,17 @@ typedef struct {
     uint8_t     pin[OC_TLS_PINS][32]; /* SHA-256 of each peer certificate (DER) allowed */
     unsigned    npin;
     int         client; /* 0: a server (accepts); 1: a client (dials) */
+    int         pin_by_caller; /* 1 (a server only): npin must be 0, any certificate with the chain,
+                                * purpose and role is let in, and the caller checks c->peer. */
 } oc_tls_cfg_t;
+
+typedef struct {
+    const char *cert, *key; /* this client's certificate and key (PEM) */
+    const char *ca;         /* the root the server's certificate must chain to */
+    const char *alpn;       /* the one protocol offered */
+    const char *role;       /* the policy OID the server's certificate must carry */
+    const char *host;       /* the name or IP the server's certificate must match */
+} oc_tls_client_cfg_t;
 
 typedef struct oc_tls oc_tls_t;
 
@@ -48,9 +64,12 @@ typedef struct {
  * not the certificate's, no pin, no ALPN or role. */
 oc_tls_t *oc_tls_new(const oc_tls_cfg_t *cfg, char *err, size_t cap);
 void      oc_tls_free(oc_tls_t *t);
+/* A client that checks the server by chain, role and host name, not by pin
+ * (c->peer holds the server certificate's SHA-256 after the handshake). */
+oc_tls_t *oc_tls_client_new(const oc_tls_client_cfg_t *cfg, char *err, size_t cap);
 
 /* Takes fd (made non-blocking; for a client, a connected socket): 0, or -1
- * (fd closed). */
+ * (fd closed). A client context starts the connect side. */
 int  oc_tls_conn_start(oc_tls_t *t, oc_tls_conn_t *c, int fd);
 /* One step of the handshake: 1 done and verified (c->peer set), 0 not yet
  * (poll c->fd for c->want), -1 refused or failed (c->why says why). */
@@ -65,6 +84,11 @@ int  oc_tls_conn_pending(const oc_tls_conn_t *c);
 /* Closes the connection and its fd (a close_notify if the socket takes
  * it now); safe to call twice. */
 void oc_tls_conn_close(oc_tls_conn_t *c);
+
+/* Moves a connection (its SSL callbacks follow); src is left closed. */
+void oc_tls_conn_move(oc_tls_conn_t *dst, oc_tls_conn_t *src);
+/* recv/send/close over c, for oc_conn_init_io; c must outlive the oc_conn. */
+oc_conn_io_t oc_tls_conn_io(oc_tls_conn_t *c);
 
 /* 64 hex digits (either case) into 32 bytes: 0 or -1. */
 int  oc_tls_fpr_parse(const char *hex, uint8_t out[32]);

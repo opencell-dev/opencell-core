@@ -96,6 +96,7 @@ typedef struct {
     uint64_t      since_us; /* gated: when the handshake finished */
     oc_tls_conn_t t;        /* tls: the connection oc_conn runs over */
     char          peer[65]; /* tls: the certificate's SHA-256 */
+    uint32_t      cell_id;  /* tls, let in: the cell its HELLO named, the only one it may speak for */
     char          addr[64];
     int           drop;     /* a gated link refused: flushed and closed; oc_core never heard of it */
 } dlink_t;
@@ -664,6 +665,15 @@ static uint32_t k_unix(void *c)
  * must be HELLO from a cell whose pinned certificate is the peer's. Every
  * refusal answers UNKNOWN_CELL; the log says why. Returns 1 if m goes on
  * to oc_core. */
+static void send_nak(dlink_t *l)
+{
+    oc_core_msg_t nak;
+    memset(&nak, 0, sizeof(nak));
+    nak.type = OC_CORE_HELLO_NAK;
+    nak.u.hello_nak.reason = OC_CORE_NAK_UNKNOWN_CELL;
+    oc_conn_send(&l->c, &nak);
+}
+
 static int gate_frame(dlink_t *l, const oc_core_msg_t *m)
 {
     char pin[65];
@@ -683,16 +693,13 @@ static int gate_frame(dlink_t *l, const oc_core_msg_t *m)
     if (why != NULL) {
         oc_log(OC_LOG_WARNING, "cell TLS: %s: cell %u: %s: certificate %.16s... (HELLO_NAK unknown cell)", l->addr,
                (unsigned)id, why, l->peer);
-        oc_core_msg_t nak;
-        memset(&nak, 0, sizeof(nak));
-        nak.type = OC_CORE_HELLO_NAK;
-        nak.u.hello_nak.reason = OC_CORE_NAK_UNKNOWN_CELL;
-        oc_conn_send(&l->c, &nak);
+        send_nak(l);
         l->drop = 1;
         return 0;
     }
     oc_log(OC_LOG_INFO, "cell TLS: %s: cell %u, certificate %.16s...: let in", l->addr, (unsigned)id, l->peer);
     l->gated = 0;
+    l->cell_id = id;
     oc_core_link_up(&D.core, l->id, mono_us());
     return 1;
 }
@@ -702,6 +709,16 @@ static void on_frame(void *ctx, const oc_core_msg_t *m)
     dlink_t *l = ctx;
     if (l->dead || l->drop) return;
     if (l->gated && !gate_frame(l, m)) return;
+    /* Let in, a TLS link speaks for the one cell whose pin it showed: a
+     * later HELLO naming another (oc_core would let the newest win) is
+     * refused, and the link goes down. The same cell may HELLO again. */
+    if (l->tls && m->type == OC_CORE_HELLO && m->u.hello.cell_id != l->cell_id) {
+        oc_log(OC_LOG_WARNING, "cell TLS: %s: let in as cell %u, HELLO names cell %u: closed (HELLO_NAK unknown cell)",
+               l->addr, (unsigned)l->cell_id, (unsigned)m->u.hello.cell_id);
+        send_nak(l);
+        l->dead = 1; /* oc_core has it: link_lost, from the loop */
+        return;
+    }
     oc_core_rx(&D.core, l->id, m, mono_us());
 }
 

@@ -9,7 +9,9 @@
  * if the core drops the link while held, and "PONG" for each PONG. Exit 0 on
  * HELLO_ACK. BOOT_ID is a number, or a mode for the HELLO gate's tests:
  * ping-first (a PING, then HELLO boot 1), ping-none (no frame at all: hold
- * HOLD_S), hello-ping (HELLO boot 1 and a PING right behind it). */
+ * HOLD_S), hello-ping (HELLO boot 1 and a PING right behind it),
+ * hello-other (HELLO boot 1, and once HELLO_ACK is in, a HELLO for
+ * CELL_ID+1 on the same link). */
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,7 @@
 
 static oc_conn_t C;
 static int acked = -1;
+static uint32_t other; /* hello-other: the second HELLO's cell_id, 0 once sent */
 
 static void on_rx(void *ctx, const oc_core_msg_t *m)
 {
@@ -28,6 +31,16 @@ static void on_rx(void *ctx, const oc_core_msg_t *m)
     if (m->type == OC_CORE_HELLO_ACK) {
         printf("HELLO_ACK mode %u period %u\n", m->u.hello_ack.mode, m->u.hello_ack.period_s);
         acked = 1;
+        if (other != 0) {
+            oc_core_msg_t h;
+            memset(&h, 0, sizeof(h));
+            h.type = OC_CORE_HELLO;
+            h.u.hello.proto = OC_CORE_PROTO;
+            h.u.hello.cell_id = other;
+            h.u.hello.boot_id = 1;
+            other = 0;
+            oc_conn_send(&C, &h);
+        }
     } else if (m->type == OC_CORE_HELLO_NAK) {
         printf("HELLO_NAK reason %u\n", m->u.hello_nak.reason);
         acked = 0;
@@ -74,6 +87,10 @@ int main(int argc, char **argv)
             if (w < 0) return 1;
             off += (size_t)w;
         }
+    } else if (strcmp(argv[3], "hello-other") == 0) { /* the gate: a second HELLO naming another cell */
+        h.u.hello.boot_id = 1;
+        other = h.u.hello.cell_id + 1u;
+        oc_conn_send(&C, &h);
     } else {
         oc_conn_send(&C, &h);
     }

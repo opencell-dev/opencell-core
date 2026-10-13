@@ -139,4 +139,17 @@ out=$("$HELLO" "$TLS" 1 13 1)
 expect "$out" "HELLO_NAK reason 1"
 check "cell cert none drops the TLS link"
 
+# A link let in as cell 1 can't become cell 2 (unpinned) by a second HELLO.
+adm cell cert 1 "$(cat "$PKI/cell.fpr")" >/dev/null
+"$HELLO" "$TLS" 1 hello-other 3 >"$T/other" &
+BG+=($!)
+for _ in $(seq 20); do grep -q "HELLO_NAK\|closed" "$T/other" && break; sleep 0.1; done
+sleep 0.3
+expect "$(adm cell list)" 'cell 2 "other".*not linked'
+wait "${BG[-1]}"
+out=$(cat "$T/other")
+expect "$out" "HELLO_ACK mode"
+grep -q "HELLO_NAK reason 1\|closed" <<<"$out" || fail "hello-other: no HELLO_NAK: $out"
+expect "$(cat "$T/log")" "let in as cell 1, HELLO names cell 2"
+check "a second HELLO for another cell is refused, and that cell is not linked"
 echo "PASS"

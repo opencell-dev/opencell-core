@@ -25,14 +25,14 @@ PORT=$((20000 + RANDOM % 20000))
 FPR1=$(cat "$PKI/core.fpr")
 FPR2=$(cat "$PKI/core2.fpr")
 for n in 1 2; do head -c 32 /dev/urandom >"$T/key$n" && chmod 0400 "$T/key$n"; done
-head -c 180 /dev/urandom >"$T/clip.bit" # 10 payloads: 1.2 s
+cp "$(dirname "$0")/data/clip_10.wav" "$T/clip.wav" # 1.2 s: 10 payloads
 
 cat >"$T/core1.conf" <<EOF2
 core_id = 1
 key_id = 1
 echo = +883160655500100
 playback = +883160655500101
-playback_clip = $T/clip.bit
+playback_clip = $T/clip.wav
 block = 8831606 1
 block = 8831503 2 2
 db = $T/core1.db
@@ -48,7 +48,7 @@ core_id = 2
 key_id = 2
 echo = +883150355500100
 playback = +883150355500101
-playback_clip = $T/clip.bit
+playback_clip = $T/clip.wav
 block = 8831503 2
 block = 8831606 1 1
 db = $T/core2.db
@@ -71,8 +71,15 @@ refused() { # WHAT SED-EXPR MESSAGE [BASE_CONF KEY_FILE]
 }
 refused "a block homed on a core with no peer line" '/^peer/d' "add a peer = 2"
 refused "a playback number with no clip" '/^playback_clip/d' "playback and playback_clip go together"
-head -c 17 /dev/urandom >"$T/short.bit"
-refused "a clip that is not whole payloads" "s|$T/clip.bit|$T/short.bit|" "a whole number of 18-byte payloads"
+python3 -I -c 'import sys, wave; w = wave.open(sys.argv[1], "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050); w.writeframes(bytes(44100)); w.close()' "$T/22k.wav"
+refused "a clip at 22050 Hz" "s|$T/clip.wav|$T/22k.wav|" "22050 Hz, 1 channel, 16-bit, format 1; it must be 8000 Hz mono 16-bit PCM"
+head -c 180 /dev/urandom >"$T/old.bit"
+refused "an old .bit clip" "s|$T/clip.wav|$T/old.bit|" "not a RIFF/WAVE file (tools/clip/oc-clip-gen)" # Review Focus 5
+mkdir "$T/adir"
+refused "a clip that is a directory" "s|$T/clip.wav|$T/adir|" "not a regular file"
+mkfifo "$T/fifo.wav"
+refused "a clip that is a FIFO (must not hang)" "s|$T/clip.wav|$T/fifo.wav|" "not a regular file"
+refused "a missing clip" "s|$T/clip.wav|$T/none.wav|" "No such file or directory"
 refused "a service number of another core's block" 's/^playback = .*/playback = +883150355500102/' \
     "not in a block this core is home for"
 refused "a peer with a bad fingerprint" 's/^peer = 2 \(.*\) .*/peer = 2 \1 abc/' "CORE_ID ADDRESS|- SHA256"
@@ -112,7 +119,7 @@ start 1
 linked 1
 out=$("$OC" admin --socket "$T/admin1.sock" status 2>&1) || fail "status: $out"
 expect "$out" "block 8831503: home core 2, peer linked"
-expect "$out" "playback +883160655500101: clip of 10 payloads (1.20 s)"
+expect "$out" "playback +883160655500101: clip of 1.20 s (8 kHz WAV), Codec2 1200 10 payloads"
 grep -q 'ocss: 127.0.0.1:[0-9]*: core 1, certificate .*, accepted' "$T/log2" || fail "core 2 did not log core 1's certificate"
 
 read -r _ n _ gap <<<"$(call +883150355500101 3)" # core 2's playback, through core 1

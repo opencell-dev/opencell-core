@@ -1,0 +1,60 @@
+Codec2 vocoder vendored by tools/codec2/vendor.sh. Do not edit: re-run the script.
+
+Upstream:  https://github.com/drowe67/codec2.git
+Commit:    310777b1c6f1af0bc7c72f5b32f80f6fd9136962
+Licence:   GNU LGPL 2.1 (COPYING). oc-core links it statically; this repository
+           carries the library's full source and build, so oc-core can be
+           relinked with a modified library (LGPL 2.1 section 6(a)).
+Generated: src/codebook*.c by upstream's generate_codebook from src/codebook/*.txt;
+           include/codec2/version.h from cmake/version.h.in (1.2.0).
+
+Files:
+  COPYING
+  include/codec2/version.h
+  src/_kiss_fft_guts.h
+  src/bpf.h
+  src/bpfb.h
+  src/codebook.c
+  src/codebookd.c
+  src/codebookge.c
+  src/codebookjmv.c
+  src/codebooknewamp1.c
+  src/codebooknewamp1_energy.c
+  src/codec2.c
+  src/codec2.h
+  src/codec2_fft.c
+  src/codec2_fft.h
+  src/codec2_internal.h
+  src/comp.h
+  src/comp_prim.h
+  src/debug_alloc.h
+  src/defines.h
+  src/dump.c
+  src/dump.h
+  src/interp.c
+  src/interp.h
+  src/kiss_fft.c
+  src/kiss_fft.h
+  src/kiss_fftr.c
+  src/kiss_fftr.h
+  src/lpc.c
+  src/lpc.h
+  src/lsp.c
+  src/lsp.h
+  src/machdep.h
+  src/mbest.c
+  src/mbest.h
+  src/newamp1.c
+  src/newamp1.h
+  src/nlp.c
+  src/nlp.h
+  src/os.h
+  src/pack.c
+  src/phase.c
+  src/phase.h
+  src/postfilter.c
+  src/postfilter.h
+  src/quantise.c
+  src/quantise.h
+  src/sine.c
+  src/sine.h

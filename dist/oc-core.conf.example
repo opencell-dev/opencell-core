@@ -4,10 +4,11 @@ core_id = 1
 key_id = 1
 echo = +883160655500100
 # The playback service (core test services spec §5): a second service
-# number in this core's block, and its clip (headerless Codec2 1200, whole
-# 18-byte payloads: dist/clips/, tools/clip/oc-clip-gen). Both or neither.
+# number in this core's block, and its clip: an 8 kHz mono 16-bit WAV,
+# encoded at start (playback clip spec 2026-10-12; dist/clips/,
+# tools/clip/oc-clip-gen). Both or neither.
 #playback = +883160655500101
-#playback_clip = /etc/opencell/playback.bit
+#playback_clip = /etc/opencell/playback.wav
 # PREFIX INDEX [HOME_CORE]: a numbering block (one line each). Without
 # HOME_CORE it is this core's; with another core's id, calls to its numbers
 # go to that core over OCSS, which needs a peer line for it.

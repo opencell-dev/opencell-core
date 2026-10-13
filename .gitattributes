@@ -1,0 +1,2 @@
+tests/data/*.bit binary
+tests/data/*.raw binary

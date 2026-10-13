@@ -58,6 +58,7 @@
 #include "oc_admin.h"
 #include "oc_api.h"
 #include "oc_apisrv.h"
+#include "oc_clip.h"
 #include "oc_conn.h"
 #include "oc_core.h"
 #include "oc_kv.h"
@@ -172,26 +173,56 @@ static const char *const KEYS[] = { "core_id",      "key_id",       "echo",     
                                     "api_rate",     "playback",     "playback_clip", "peer",           "ocss_listen",
                                     "ocss_cert",    "ocss_key",     "ocss_ca",       NULL };
 
-/* playback_clip: read whole, checked as oc_core_clip_ok wants it. 0 or -1 (logged). */
+/* playback_clip: an 8 kHz mono 16-bit WAV (playback clip spec 2026-10-12
+ * §4), read whole, encoded with Codec2 1200 into D.clip, then freed. 0 or
+ * -1 (logged). */
+#define CLIP_FILE_MAX (16u << 20) /* 10 min of samples is 9.6 MB; room for other chunks */
+static ssize_t read_all(int fd, uint8_t *b, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t k = read(fd, b + got, n - got);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        got += (size_t)k;
+    }
+    return (ssize_t)got;
+}
 static int load_clip(const char *path)
 {
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        oc_log(OC_LOG_ERR, "config: playback_clip = '%s': %s", path, strerror(errno));
-        return -1;
+    char why[160] = "";
+    uint8_t *buf = NULL;
+    int16_t *pcm = NULL;
+    size_t n = 0, bytes = 0;
+    ssize_t r;
+    struct stat st;
+    /* O_NONBLOCK: a FIFO must not hang the open; only a regular file is read */
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(why, sizeof(why), "%s", strerror(errno));
+    } else if (fstat(fd, &st) != 0) {
+        snprintf(why, sizeof(why), "%s", strerror(errno));
+    } else if (!S_ISREG(st.st_mode)) {
+        snprintf(why, sizeof(why), "not a regular file");
+    } else if (st.st_size > (off_t)CLIP_FILE_MAX) {
+        snprintf(why, sizeof(why), "larger than %u MB", CLIP_FILE_MAX >> 20);
+    } else if ((buf = malloc((size_t)st.st_size + 1u)) == NULL) {
+        snprintf(why, sizeof(why), "out of memory");
+    } else if ((r = read_all(fd, buf, (size_t)st.st_size)) != (ssize_t)st.st_size) {
+        snprintf(why, sizeof(why), "short read");
+    } else if (oc_wav_read(buf, (size_t)r, &pcm, &n, why, sizeof(why)) == 0) {
+        bytes = oc_clip_encode_c2_1200(pcm, n, D.clip, sizeof(D.clip));
+        if (bytes == 0 || !oc_core_clip_ok(D.clip, (uint32_t)bytes)) snprintf(why, sizeof(why), "Codec2 1200 encoding failed");
     }
-    size_t n = fread(D.clip, 1, sizeof(D.clip), f);
-    int more = fgetc(f) != EOF;
-    fclose(f);
-    if (more || !oc_core_clip_ok(D.clip, (uint32_t)n)) {
-        oc_log(OC_LOG_ERR,
-               "config: playback_clip = '%s': %zu%s bytes; it must be 1 to %u, a whole number of %u-byte payloads "
-               "(headerless c2enc 1200 output: tools/clip/oc-clip-gen)",
-               path, n, more ? "+" : "", OC_CORE_CLIP_MAX, OC_CORE_PLAY_BYTES);
+    if (fd >= 0) close(fd);
+    free(buf);
+    free(pcm);
+    if (bytes == 0 || why[0] != '\0') {
+        oc_log(OC_LOG_ERR, "config: playback_clip = '%s': %s (tools/clip/oc-clip-gen)", path, why);
         return -1;
     }
     D.cfg.clip = D.clip;
-    D.cfg.clip_len = (uint32_t)n;
+    D.cfg.clip_len = (uint32_t)bytes;
     return 0;
 }
 

@@ -313,7 +313,8 @@ static int cmd_status(oc_admin_t *a, oc_buf_t *o)
         char t[OC_SIG_NUMBER_TEXT];
         unsigned n = a->cfg->clip_len / OC_CORE_PLAY_BYTES;
         oc_sig_number_to_text(a->cfg->playback_number, t);
-        oc_buf_printf(o, "playback %s: clip of %u payloads (%u.%02u s)\n", t, n, n * 12u / 100u, n * 12u % 100u);
+        oc_buf_printf(o, "playback %s: clip of %u.%02u s (8 kHz WAV), Codec2 1200 %u payloads\n", t, n * 12u / 100u,
+                      n * 12u % 100u, n);
     }
     for (unsigned i = 0; i < a->route->n; i++) { /* blocks reached over OCSS (spec §6) */
         const oc_core_block_t *b = &a->route->b[i];

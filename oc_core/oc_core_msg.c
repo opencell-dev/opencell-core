@@ -52,6 +52,15 @@ static void rnum(rd_t *r, uint8_t num[OC_SIG_NUMBER_LEN])
     rb(r, num, OC_SIG_NUMBER_LEN);
     if (!oc_sig_number_valid(num)) r->bad = 1;
 }
+/* The byte protocol 3 (OCSS 2) adds at the end of a call message: read if
+ * the frame has it (form CODEC), else old's meaning. A frame longer still
+ * fails the final length check. */
+static uint8_t codec_tail(rd_t *r, oc_core_msg_t *m, uint8_t old)
+{
+    if (r->bad || r->at >= r->n) return old;
+    m->form = OC_CORE_FORM_CODEC;
+    return r8(r);
+}
 
 static void w_radio(wr_t *w, const oc_core_radio_t *x)
 {
@@ -176,6 +185,7 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         wb(&w, m->u.setup.caller, OC_SIG_NUMBER_LEN);
         wb(&w, m->u.setup.called, OC_SIG_NUMBER_LEN);
         w8(&w, m->u.setup.hop);
+        if (m->form == OC_CORE_FORM_CODEC) w8(&w, m->u.setup.caps);
         break;
     case OC_CORE_CELL_CFG: {
         oc_sig_msg_t cl;
@@ -253,17 +263,22 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         w32(&w, m->u.call_route.leg_ref);
         wb(&w, m->u.call_route.caller, OC_SIG_NUMBER_LEN);
         wb(&w, m->u.call_route.called, OC_SIG_NUMBER_LEN);
+        if (m->form == OC_CORE_FORM_CODEC) w8(&w, m->u.call_route.caps);
         break;
     case OC_CORE_CALL_OFFER:
         w32(&w, m->u.call_offer.call_ref);
         wb(&w, m->u.call_offer.callee, OC_SIG_NUMBER_LEN);
         wb(&w, m->u.call_offer.caller, OC_SIG_NUMBER_LEN);
+        if (m->form == OC_CORE_FORM_CODEC) w8(&w, m->u.call_offer.caps);
         break;
     case OC_CORE_CALL_ALERT:
-    case OC_CORE_CALL_ANSWER:
     case OC_OCSS_CALL_ALERT:
+        w32(&w, m->u.call.ref);
+        break;
+    case OC_CORE_CALL_ANSWER:
     case OC_OCSS_CALL_ANSWER:
         w32(&w, m->u.call.ref);
+        if (m->form == OC_CORE_FORM_CODEC) w8(&w, m->u.call.codec);
         break;
     case OC_CORE_CALL_RELEASE:
     case OC_OCSS_CALL_RELEASE:
@@ -328,6 +343,7 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         rnum(&r, m->u.setup.caller);
         rnum(&r, m->u.setup.called);
         m->u.setup.hop = r8(&r);
+        m->u.setup.caps = codec_tail(&r, m, OC_CODEC_CAPS_DEFAULT);
         break;
     case OC_CORE_CELL_CFG: {
         oc_sig_msg_t cl;
@@ -407,17 +423,22 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         m->u.call_route.leg_ref = r32(&r);
         rnum(&r, m->u.call_route.caller);
         rnum(&r, m->u.call_route.called);
+        m->u.call_route.caps = codec_tail(&r, m, OC_CODEC_CAPS_DEFAULT);
         break;
     case OC_CORE_CALL_OFFER:
         m->u.call_offer.call_ref = r32(&r);
         rnum(&r, m->u.call_offer.callee);
         rnum(&r, m->u.call_offer.caller);
+        m->u.call_offer.caps = codec_tail(&r, m, OC_CODEC_CAPS_DEFAULT);
         break;
     case OC_CORE_CALL_ALERT:
-    case OC_CORE_CALL_ANSWER:
     case OC_OCSS_CALL_ALERT:
+        m->u.call.ref = r32(&r);
+        break;
+    case OC_CORE_CALL_ANSWER:
     case OC_OCSS_CALL_ANSWER:
         m->u.call.ref = r32(&r);
+        m->u.call.codec = codec_tail(&r, m, OC_CODEC_C2_1200);
         break;
     case OC_CORE_CALL_RELEASE:
     case OC_OCSS_CALL_RELEASE:

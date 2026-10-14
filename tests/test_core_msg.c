@@ -53,6 +53,7 @@ static void test_golden_bytes(void)
     m.u.call_route.leg_ref = 7;
     num("+883160655501234", m.u.call_route.caller);
     num("+883160655501235", m.u.call_route.called);
+    m.u.call_route.caps = OC_CODEC_CAPS_DEFAULT;
     static const uint8_t route[] = { 0x00, 0x15, 0x20, 0x07, 0x00, 0x00, 0x00, 0x88, 0x31, 0x60, 0x65, 0x55,
                                      0x01, 0x23, 0x4F, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23, 0x5F };
     golden(&m, route, sizeof(route));
@@ -182,15 +183,18 @@ static void test_every_type_round_trips(void)
     memset(ms[k++].u.loc_cancel.rand, 0x99, 16);
     ms[k].type = OC_CORE_CALL_ROUTE;
     num("+883160655501234", ms[k].u.call_route.caller);
+    ms[k].u.call_route.caps = OC_CODEC_CAPS_DEFAULT;
     num("+883442079460000", ms[k++].u.call_route.called);
     ms[k].type = OC_CORE_CALL_OFFER;
     ms[k].u.call_offer.call_ref = OC_CORE_REF_CORE | 3u;
     num("+883160655501235", ms[k].u.call_offer.callee);
+    ms[k].u.call_offer.caps = OC_CODEC_CAPS_DEFAULT;
     num("+883160655501234", ms[k++].u.call_offer.caller);
     ms[k].type = OC_CORE_CALL_ALERT;
     ms[k++].u.call.ref = 3;
     ms[k].type = OC_CORE_CALL_ANSWER;
-    ms[k++].u.call.ref = 4;
+    ms[k].u.call.ref = 4;
+    ms[k++].u.call.codec = OC_CODEC_C2_1200;
     ms[k].type = OC_CORE_CALL_RELEASE;
     ms[k].u.call.ref = 5;
     ms[k++].u.call.cause = OC_SIG_CAUSE_BUSY;
@@ -241,7 +245,8 @@ static void test_the_largest_av_res_fits_a_frame(void)
  * vector) does not decode. */
 static void test_proto_2_and_the_old_av_res_does_not_decode(void)
 {
-    TEST_ASSERT_EQUAL_UINT(2, OC_CORE_PROTO);
+    TEST_ASSERT_EQUAL_UINT(2, OC_CORE_PROTO_MIN); /* still spoken: 2 is the oldest a core accepts */
+    TEST_ASSERT_EQUAL_UINT(3, OC_CORE_PROTO);
     uint8_t old[2 + 1 + 16 + 72];
     static const uint8_t head[] = { 0x00, 0x59, 0x13, 0x01, 0x00, 0x88, 0x04, 0xAD, 0x76, 0x00,
                                     0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23, 0x4F, 0x01 };
@@ -338,7 +343,7 @@ static void test_ocss_golden_bytes(void)
     m.u.peer_hello.proto = OC_OCSS_PROTO;
     m.u.peer_hello.core_id = 0x0102;
     m.u.peer_hello.table_ver = 0x03040506u;
-    static const uint8_t hello[] = { 0x00, 0x08, 0x41, 0x01, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03 };
+    static const uint8_t hello[] = { 0x00, 0x08, 0x41, 0x02, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03 };
     golden(&m, hello, sizeof(hello));
 
     memset(&m, 0, sizeof(m));
@@ -363,6 +368,7 @@ static void test_ocss_golden_bytes(void)
     m.u.setup.call_ref = OC_CORE_REF_CORE | 1u;
     num("+883160655501234", m.u.setup.caller);
     num("+883150355500101", m.u.setup.called);
+    m.u.setup.caps = OC_CODEC_CAPS_DEFAULT;
     static const uint8_t setup[] = { 0x00, 0x16, 0x60, 0x01, 0x00, 0x00, 0x80, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23,
                                      0x4F, 0x88, 0x31, 0x50, 0x35, 0x55, 0x00, 0x10, 0x1F, 0x00 };
     golden(&m, setup, sizeof(setup));
@@ -390,6 +396,7 @@ static void test_ocss_golden_bytes(void)
         memset(&m, 0, sizeof(m));
         m.type = types[i];
         m.u.call.ref = types[i] == OC_OCSS_PONG ? 0 : 9;
+        m.u.call.codec = types[i] == OC_OCSS_CALL_ANSWER ? OC_CODEC_C2_1200 : 0;
         size_t n = oc_core_encode(&m, buf, sizeof(buf));
         TEST_ASSERT_NOT_EQUAL(0, n);
         TEST_ASSERT_EQUAL_INT(0, oc_core_decode(buf, n, &back));
@@ -503,6 +510,92 @@ static void test_cell_status(void)
     TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(buf, n - 1u, &back)); /* cut short, length consistent */
 }
 
+/* Codec negotiation §6.1-6.2: the call messages protocol 3 (OCSS 2)
+ * extended, in both forms: CODEC appends caps or the codec; OLD is the
+ * protocol-2 frame, which decodes as caps 0x01, codec 1. */
+static void test_codec_forms(void)
+{
+    oc_core_msg_t m, back;
+    uint8_t buf[OC_CORE_FRAME_MAX];
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CALL_ROUTE;
+    m.form = OC_CORE_FORM_CODEC;
+    m.u.call_route.leg_ref = 7;
+    num("+883160655501234", m.u.call_route.caller);
+    num("+883160655501235", m.u.call_route.called);
+    m.u.call_route.caps = 0x21;
+    static const uint8_t route[] = { 0x00, 0x16, 0x20, 0x07, 0x00, 0x00, 0x00, 0x88, 0x31, 0x60, 0x65, 0x55,
+                                     0x01, 0x23, 0x4F, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23, 0x5F, 0x21 };
+    golden(&m, route, sizeof(route));
+    m.form = OC_CORE_FORM_OLD; /* the same call on a protocol-2 link: no caps byte */
+    TEST_ASSERT_EQUAL_size_t(sizeof(route) - 1u, oc_core_encode(&m, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_HEX8(0x15, buf[1]);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_decode(buf, sizeof(route) - 1u, &back));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, back.form);
+    TEST_ASSERT_EQUAL_HEX8(OC_CODEC_CAPS_DEFAULT, back.u.call_route.caps);
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CALL_OFFER;
+    m.form = OC_CORE_FORM_CODEC;
+    m.u.call_offer.call_ref = OC_CORE_REF_CORE | 3u;
+    num("+883160655501235", m.u.call_offer.callee);
+    num("+883160655501234", m.u.call_offer.caller);
+    m.u.call_offer.caps = 0x05;
+    static const uint8_t offer[] = { 0x00, 0x16, 0x21, 0x03, 0x00, 0x00, 0x80, 0x88, 0x31, 0x60, 0x65, 0x55,
+                                     0x01, 0x23, 0x5F, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23, 0x4F, 0x05 };
+    golden(&m, offer, sizeof(offer));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CALL_ANSWER;
+    m.form = OC_CORE_FORM_CODEC;
+    m.u.call.ref = 4;
+    m.u.call.codec = OC_CODEC_OVX_1200;
+    static const uint8_t answer[] = { 0x00, 0x06, 0x23, 0x04, 0x00, 0x00, 0x00, 0x06 };
+    golden(&m, answer, sizeof(answer));
+    static const uint8_t answer_old[] = { 0x00, 0x05, 0x23, 0x04, 0x00, 0x00, 0x00 };
+    TEST_ASSERT_EQUAL_INT(0, oc_core_decode(answer_old, sizeof(answer_old), &back));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, back.form);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, back.u.call.codec);
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CALL_SETUP;
+    m.form = OC_CORE_FORM_CODEC;
+    m.u.setup.call_ref = OC_CORE_REF_CORE | 1u;
+    num("+883160655501234", m.u.setup.caller);
+    num("+883150355500101", m.u.setup.called);
+    m.u.setup.caps = 0x20;
+    static const uint8_t setup[] = { 0x00, 0x17, 0x60, 0x01, 0x00, 0x00, 0x80, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01,
+                                     0x23, 0x4F, 0x88, 0x31, 0x50, 0x35, 0x55, 0x00, 0x10, 0x1F, 0x00, 0x20 };
+    golden(&m, setup, sizeof(setup));
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CALL_ANSWER;
+    m.form = OC_CORE_FORM_CODEC;
+    m.u.call.ref = OC_CORE_REF_CORE | 1u;
+    m.u.call.codec = OC_CODEC_OVX_600;
+    static const uint8_t ocss_answer[] = { 0x00, 0x06, 0x63, 0x01, 0x00, 0x00, 0x80, 0x03 };
+    golden(&m, ocss_answer, sizeof(ocss_answer));
+}
+
+/* Only the two lengths: one byte more than the CODEC form, or a byte on a
+ * message protocol 3 did not extend (ALERT, RELEASE), does not decode. */
+static void test_codec_forms_other_lengths_do_not_decode(void)
+{
+    oc_core_msg_t m;
+    static const uint8_t answer_long[] = { 0x00, 0x07, 0x23, 0x04, 0x00, 0x00, 0x00, 0x06, 0x00 };
+    static const uint8_t alert_long[] = { 0x00, 0x06, 0x22, 0x04, 0x00, 0x00, 0x00, 0x06 };
+    static const uint8_t release_long[] = { 0x00, 0x07, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00, 0x06 };
+    static const uint8_t ocss_answer_long[] = { 0x00, 0x07, 0x63, 0x01, 0x00, 0x00, 0x80, 0x06, 0x00 };
+    static const uint8_t route_long[] = { 0x00, 0x17, 0x20, 0x07, 0x00, 0x00, 0x00, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01,
+                                          0x23, 0x4F, 0x88, 0x31, 0x60, 0x65, 0x55, 0x01, 0x23, 0x5F, 0x21, 0x00 };
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(answer_long, sizeof(answer_long), &m));
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(alert_long, sizeof(alert_long), &m));
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(release_long, sizeof(release_long), &m));
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(ocss_answer_long, sizeof(ocss_answer_long), &m));
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(route_long, sizeof(route_long), &m));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -515,5 +608,7 @@ int main(void)
     RUN_TEST(test_ocss_golden_bytes);
     RUN_TEST(test_ocss_what_does_not_decode);
     RUN_TEST(test_cell_status);
+    RUN_TEST(test_codec_forms);
+    RUN_TEST(test_codec_forms_other_lengths_do_not_decode);
     return UNITY_END();
 }

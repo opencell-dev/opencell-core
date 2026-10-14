@@ -28,6 +28,10 @@
  * that would mean the *receiver's* own calls, is refused (cause 5): spec
  * §6.4 (review finding I1).
  *
+ * Protocol 3 (OCSS 2) appends caps to CALL_ROUTE, CALL_OFFER and OCSS
+ * CALL_SETUP and the codec to CALL_ANSWER and OCSS CALL_ANSWER (codec
+ * negotiation spec §6.1-6.2); both lengths decode.
+ *
  * CELL_STATUS (C->K, NOC design §7.3): the cell's radios and the signal of
  * the terminals it hears, every 60 s and when PPS or the timebase changes.
  * ver (1) | part (1: OC_CORE_STATUS_LAST | index) | n radios (1) | the
@@ -40,15 +44,25 @@
 #ifndef OC_CORE_MSG_H
 #define OC_CORE_MSG_H
 
+#include "oc_codec.h"   /* the caps and codec bytes of the call messages */
 #include "oc_sig_hss.h" /* oc_sig_cell_av_t, oc_sig_av_status_t */
 #include "oc_sig_msg.h" /* oc_sig_msg_t, oc_sig_body_encode/decode */
 
 #define OC_CORE_FRAME_MAX 512u
-#define OC_CORE_PROTO     2u /* 2: AV_RES carries HXRES, not XRES (§19.1); LOC_CANCEL names its RAND (§19 follow-ups) */
+#define OC_CORE_PROTO       3u /* 3: CALL_ROUTE and CALL_OFFER carry caps, CALL_ANSWER the codec (codec negotiation spec §6.1) */
+#define OC_CORE_PROTO_MIN   2u /* 2: AV_RES carries HXRES, not XRES (§19.1); LOC_CANCEL names its RAND (§19 follow-ups) */
+#define OC_CORE_PROTO_CODEC 3u /* the first cell-link version with caps and codec */
 #define OC_CORE_AV_MAX    4u
 #define OC_CORE_REF_CORE  0x80000000u
 #define OC_CORE_REF_DIR   0x40000000u /* an OCSS call_ref: set by the calling core when self > peer (review I1) */
-#define OC_OCSS_PROTO     1u /* OCSS HELLO's proto (the test-services slice: link and call control only) */
+#define OC_OCSS_PROTO       2u /* 2: OCSS CALL_SETUP carries caps, CALL_ANSWER the codec (§6.2) */
+#define OC_OCSS_PROTO_MIN   1u /* 1: the test-services slice: link and call control only */
+#define OC_OCSS_PROTO_CODEC 2u
+/* The two shapes of the call messages protocol 3 (OCSS 2) extended: OLD,
+ * without caps or codec - what a protocol-2 (OCSS 1) link carries, meaning
+ * caps 0x01 and codec 1 - and CODEC, with the byte at the end. */
+#define OC_CORE_FORM_OLD    0u
+#define OC_CORE_FORM_CODEC  1u
 #define OC_OCSS_OFFSET    0x40u /* an OCSS type is its §6 analogue + this */
 #define OC_CORE_STATUS_VER    1u
 #define OC_CORE_STATUS_RADIOS 2u     /* radios in one CELL_STATUS part (48 bytes each) */
@@ -139,6 +153,12 @@ typedef struct {
 
 typedef struct {
     uint8_t type; /* oc_core_type_t */
+    /* CALL_ROUTE, CALL_OFFER, CALL_ANSWER, OCSS CALL_SETUP and CALL_ANSWER:
+     * OC_CORE_FORM_CODEC writes their caps or codec byte, OLD leaves it out
+     * (the sender sets it from the link's version: ruling R7).
+     * oc_core_decode says which it read and fills caps 0x01 / codec 1 into an
+     * OLD one. Other types ignore it. */
+    uint8_t form;
     union {
         struct { uint8_t proto; uint32_t cell_id; uint64_t boot_id; uint8_t sw_version[3]; } hello;
         struct { uint8_t mode; uint16_t period_s, key_id; uint8_t echo_number[OC_SIG_NUMBER_LEN]; } hello_ack;
@@ -167,14 +187,14 @@ typedef struct {
          * the registration cancelled (moved), so a cell keeps a newer one of
          * the same TMID; all zero (reactivated, disabled): whatever it is */
         struct { uint32_t tmid; uint8_t cause, rand[16]; } loc_cancel;
-        struct { uint32_t leg_ref; uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN]; } call_route;
-        struct { uint32_t call_ref; uint8_t callee[OC_SIG_NUMBER_LEN], caller[OC_SIG_NUMBER_LEN]; } call_offer;
-        struct { uint32_t ref; uint8_t cause; } call; /* CALL_ALERT, CALL_ANSWER (no cause), CALL_RELEASE */
+        struct { uint32_t leg_ref; uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN]; uint8_t caps; } call_route;
+        struct { uint32_t call_ref; uint8_t callee[OC_SIG_NUMBER_LEN], caller[OC_SIG_NUMBER_LEN]; uint8_t caps; } call_offer;
+        struct { uint32_t ref; uint8_t cause, codec; } call; /* CALL_ALERT, CALL_ANSWER (codec), CALL_RELEASE (cause) */
         struct { uint32_t ref; uint16_t seq; uint8_t len; uint8_t data[OC_SIG_APP_MAX]; } media; /* and OCSS MEDIA */
         /* OCSS HELLO and HELLO_ACK: the sender's core_id and the version of
          * the block table it routes by (0: its config, no signed table yet) */
         struct { uint8_t proto; uint16_t core_id; uint32_t table_ver; } peer_hello; /* HELLO_ACK: no proto */
-        struct { uint32_t call_ref; uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN]; uint8_t hop; } setup;
+        struct { uint32_t call_ref; uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN]; uint8_t hop, caps; } setup;
         /* OCSS HELLO_NAK uses hello_nak; CALL_ALERT, _ANSWER, _RELEASE use call */
     } u;
 } oc_core_msg_t;

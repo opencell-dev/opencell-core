@@ -132,6 +132,25 @@ in_range "$n" 13 19 || fail "core 1's playback: $n payloads in 2 s"
 [ "$gap" -lt 300 ] || fail "core 1's playback: a gap of $gap ms"
 grep -q 'playback sent [0-9]* payloads, skipped 0' "$T/log2" || fail "core 2 skipped payloads on an idle loop"
 
+# codec negotiation (§6.3; OpenVoxNB spec V7): playback answers with the
+# best codec it has a copy in and sends that copy; over OCSS too; caps it
+# has no copy for get cause 7
+call_caps() { # CAPS CALLED SECONDS -> the tool's output
+    "$CALL" --caps "$1" "$T/core1.sock" 1 7 "$2" "$3" >"$T/call" || fail "call to $2 with caps $1: $(cat "$T/call")"
+    cat "$T/call"
+}
+out=$(call_caps 0x21 +883160655500101 1)
+expect "$out" "answered codec 6"
+expect "$out" "^len 18$"
+out=$(call_caps 0x04 +883160655500101 1)
+expect "$out" "answered codec 3"
+expect "$out" "^len 9$"
+out=$(call_caps 0x21 +883150355500101 1) # core 2's playback: the caps cross OCSS 2
+expect "$out" "answered codec 6"
+expect "$out" "^len 18$"
+"$CALL" --caps 0x02 "$T/core1.sock" 1 7 +883160655500101 1 >"$T/call" && fail "LPCNet only was answered"
+expect "$(cat "$T/call")" "released cause 7"
+
 out=$("$OC" admin --socket "$T/admin2.sock" cdr 2>&1) || fail "core 2 cdr: $out"
 expect "$out" "+883160655501234 -> +883150355500101  cells 0 -> 0  answered"
 expect "$out" "+883160655501234 -> +883150355500100  cells 0 -> 0  answered"

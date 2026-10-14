@@ -4,7 +4,7 @@
  *   tool_oc_call hss FILE
  *       writes an ocbench HSS file (import-ocb-hss): a network key and
  *       +883160655501234 activated on TMID 76ad0488 with this tool's K/OPc
- *   tool_oc_call SOCKET|tls:HOST:PORT:PKI:NAME CELL_ID BOOT_ID [CALLED SECONDS]
+ *   tool_oc_call [--caps CAPS] SOCKET|tls:HOST:PORT:PKI:NAME CELL_ID BOOT_ID [CALLED SECONDS]
  *       HELLO as the cell, registers that terminal as the terminal would
  *       (AV_REQ, the RES from K/OPc, LOC_UPDATE), calls the echo service
  *       (or CALLED), prints "answered" once the call is up, then holds the
@@ -14,7 +14,10 @@
  *       every 120 ms as a terminal does, counts the MEDIA that comes back,
  *       and after SECONDS hangs up and prints "media N maxgap G" (G: the
  *       longest wait between two, ms; core test services spec §5.3); a
- *       release from the core ends it at once. */
+ *       release from the core ends it at once. With --caps the CALL_ROUTE
+ *       carries those caps (protocol 3's form); "answered" names the codec;
+ *       with SECONDS a "len L" line follows, L the length of the last MEDIA
+ *       that came. */
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +38,8 @@ static const char *called_text = ECHO;
 static double      talk_s;    /* 0: hold, as before */
 static int         media_n;   /* MEDIA received */
 static double      last_rx_s, maxgap_s, answered_s;
+static uint8_t     caps;      /* --caps: CALL_ROUTE carries them (protocol 3's form); 0: the old form */
+static unsigned    media_len; /* the last MEDIA's length */
 
 static const uint8_t K[16] = { 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
                                0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60 };
@@ -122,12 +127,16 @@ static void on_rx(void *ctx, const oc_core_msg_t *m)
         r.u.call_route.leg_ref = LEG;
         memcpy(r.u.call_route.caller, num, OC_SIG_NUMBER_LEN);
         oc_sig_number_to_bcd(called_text, strlen(called_text), r.u.call_route.called);
+        if (caps != 0) {
+            r.form = OC_CORE_FORM_CODEC;
+            r.u.call_route.caps = caps;
+        }
         send_msg(&r);
         break;
     }
     case OC_CORE_CALL_ANSWER:
         if (m->u.call.ref == LEG) {
-            printf("answered\n");
+            printf("answered codec %u\n", m->u.call.codec);
             answered = 1;
             answered_s = mono_s();
         }
@@ -138,6 +147,7 @@ static void on_rx(void *ctx, const oc_core_msg_t *m)
             if (media_n > 0 && t - last_rx_s > maxgap_s) maxgap_s = t - last_rx_s;
             last_rx_s = t;
             media_n++;
+            media_len = m->u.media.len;
         }
         break;
     case OC_CORE_CALL_RELEASE:
@@ -159,8 +169,14 @@ static void on_rx(void *ctx, const oc_core_msg_t *m)
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "hss") == 0) return write_hss(argv[2]);
+    if (argc > 3 && strcmp(argv[1], "--caps") == 0) {
+        caps = (uint8_t)strtoul(argv[2], NULL, 0);
+        argv += 2;
+        argc -= 2;
+    }
     if (argc != 4 && argc != 6) {
-        fprintf(stderr, "usage: tool_oc_call hss FILE | tool_oc_call SOCKET|tls:HOST:PORT:PKI:NAME CELL_ID BOOT_ID [CALLED SECONDS]\n");
+        fprintf(stderr, "usage: tool_oc_call hss FILE | tool_oc_call [--caps CAPS] SOCKET|tls:HOST:PORT:PKI:NAME CELL_ID "
+                        "BOOT_ID [CALLED SECONDS]\n");
         return 2;
     }
     if (argc == 6) {
@@ -195,6 +211,7 @@ int main(int argc, char **argv)
             r.u.call.ref = LEG;
             send_msg(&r);
             printf("media %d maxgap %d\n", media_n, (int)(maxgap_s * 1000.0));
+            printf("len %u\n", media_len);
             break;
         }
         if (t >= next_tx) { /* one 18-byte payload per 120 ms frame, as a terminal sends */

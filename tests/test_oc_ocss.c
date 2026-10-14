@@ -210,6 +210,7 @@ static void test_a_call_from_core_1_reaches_core_2s_echo(void)
     m.u.call_route.leg_ref = LEG;
     memcpy(m.u.call_route.caller, na, OC_SIG_NUMBER_LEN);
     memcpy(m.u.call_route.called, echo2, OC_SIG_NUMBER_LEN);
+    m.u.call_route.caps = OC_CODEC_CAPS_DEFAULT;
     oc_core_rx(&C1.k, CELL, &m, NOW);
     int answered = 0, echoed = 0;
     for (int i = 0; i < 400 && !echoed; i++) {

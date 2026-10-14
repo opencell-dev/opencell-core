@@ -560,6 +560,39 @@ static void test_ocss_versions_and_the_diallers_fallback(void)
     TEST_ASSERT_EQUAL_UINT8(OC_OCSS_PROTO, Q[(QT - 1) % 256].m.u.peer_hello.proto);
 }
 
+/* §6.2: a cell's caps cross OCSS 2 in CALL_SETUP, core 2's echo answers
+ * with the best of them and the codec comes back over OCSS to the cell.
+ * Over an OCSS-1 link (ruling R9) a caller without Codec2 1200 is
+ * refused at once, cause 7, and one with it gets Codec2 1200. */
+static void test_caps_and_codec_cross_ocss(void)
+{
+    world();
+    int from = NCELL;
+    dial_caps(ECHO2, 0x21);
+    advance(OC_CORE_ECHO_US);
+    const oc_core_msg_t *a = cell_got(from, OC_CORE_CALL_ANSWER);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, a->form);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1200, a->u.call.codec);
+    cell_msg(OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NORMAL);
+
+    oc_core_peer_down(&C1.k, L1, NOW);
+    oc_core_peer_down(&C2.k, L2, NOW);
+    QH = QT;
+    C1.k.ocss_old[0] = 2; /* core 1 dials core 2 at OCSS 1, as after a version refusal (Task 12) */
+    oc_core_peer_up(&C1.k, L1, 2, 1, NOW);
+    oc_core_peer_up(&C2.k, L2, 1, 0, NOW);
+    pump();
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, oc_core_peer_form(&C1.k, 2));
+    from = NCELL;
+    dial_caps(ECHO2, OC_CODEC_BIT(OC_CODEC_OVX_1200));
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, cell_got(from, OC_CORE_CALL_RELEASE)->u.call.cause);
+    from = NCELL;
+    dial(ECHO2);
+    advance(OC_CORE_ECHO_US);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, cell_got(from, OC_CORE_CALL_ANSWER)->u.call.codec);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -579,5 +612,6 @@ int main(void)
     RUN_TEST(test_a_call_setup_whose_caller_is_not_the_peers_is_refused);
     RUN_TEST(test_a_peer_flooding_call_setups_is_rate_limited);
     RUN_TEST(test_ocss_versions_and_the_diallers_fallback);
+    RUN_TEST(test_caps_and_codec_cross_ocss);
     return UNITY_END();
 }

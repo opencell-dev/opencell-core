@@ -29,12 +29,20 @@ static uint8_t service(const oc_core_t *k, const uint8_t *called)
     return 0;
 }
 
+/* The message form a cell's or a peer's leg takes: its link's version
+ * (ruling R7). */
+static uint8_t leg_form(const oc_core_t *k, const oc_core_leg_t *leg)
+{
+    return leg->kind == OC_CORE_LEG_PEER ? oc_core_peer_form(k, leg->peer) : oc_core_cell_form(k, leg->cell);
+}
+
 /* A message to a leg: a cell's §6 type, or its OCSS analogue to a peer;
  * nothing to a service. 0, or -1 (logged). */
 static int leg_send(oc_core_t *k, const oc_core_leg_t *leg, oc_core_msg_t *m)
 {
     int r;
     if (is_service(leg)) return 0;
+    m->form = leg_form(k, leg);
     if (leg->kind == OC_CORE_LEG_PEER) {
         m->type = (uint8_t)(m->type + OC_OCSS_OFFSET);
         r = oc_core_peer_send(k, leg->peer, m);
@@ -56,6 +64,17 @@ static void to_leg(oc_core_t *k, const oc_core_leg_t *leg, uint8_t type, uint8_t
     m.type = type;
     m.u.call.ref = leg->ref;
     m.u.call.cause = cause;
+    leg_send(k, leg, &m);
+}
+
+/* CALL_ANSWER to a leg, naming the call's codec (codec negotiation spec §4 step 7). */
+static void answer_to(oc_core_t *k, const oc_core_leg_t *leg, uint8_t codec)
+{
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CALL_ANSWER;
+    m.u.call.ref = leg->ref;
+    m.u.call.codec = codec;
     leg_send(k, leg, &m);
 }
 
@@ -252,6 +271,21 @@ static uint8_t resolve(oc_core_t *k, const uint8_t *called, int from_peer, oc_co
     return why;
 }
 
+static void refused(oc_core_t *k, oc_core_call_t *c, uint8_t why)
+{
+    to_leg(k, &c->a, OC_CORE_CALL_RELEASE, why);
+    end_call(k, c, why);
+}
+
+/* The codec a service answers with (codec negotiation spec §6.3): echo
+ * sends back whatever comes, so the best in the caps; playback the best it
+ * has the clip in (Codec2 1200 here). OC_CODEC_NONE: none. */
+static uint8_t service_codec(const oc_core_call_t *c)
+{
+    if (c->b.kind == OC_CORE_LEG_ECHO) return oc_codec_best(c->caps);
+    return oc_codec_in(c->caps, OC_CODEC_C2_1200) ? OC_CODEC_C2_1200 : OC_CODEC_NONE;
+}
+
 /* Leg b is resolved: a service rings at once; a cell is offered the call;
  * a peer is asked to set it up. */
 static void start_b(oc_core_t *k, oc_core_call_t *c)
@@ -259,9 +293,21 @@ static void start_b(oc_core_t *k, oc_core_call_t *c)
     oc_core_msg_t o;
     memset(&o, 0, sizeof(o));
     if (is_service(&c->b)) {
+        if ((c->codec = service_codec(c)) == OC_CODEC_NONE) {
+            refused(k, c, OC_SIG_CAUSE_NO_CODEC); /* before it rings */
+            return;
+        }
         c->state = OC_CORE_CALL_ALERTING;
         c->due = k->now + OC_CORE_ECHO_US;
         to_leg(k, &c->a, OC_CORE_CALL_ALERT, 0);
+        return;
+    }
+    /* A link of the old version carries no caps: its far end will answer
+     * Codec2 1200, so without it in the caps the call can't connect there
+     * (ruling R9) */
+    o.form = leg_form(k, &c->b);
+    if (o.form == OC_CORE_FORM_OLD && !oc_codec_in(c->caps, OC_CODEC_C2_1200)) {
+        refused(k, c, OC_SIG_CAUSE_NO_CODEC);
         return;
     }
     c->state = OC_CORE_CALL_ROUTING;
@@ -278,6 +324,7 @@ static void start_b(oc_core_t *k, oc_core_call_t *c)
         memcpy(o.u.setup.caller, c->caller, OC_SIG_NUMBER_LEN);
         memcpy(o.u.setup.called, c->called, OC_SIG_NUMBER_LEN);
         o.u.setup.hop = 0;
+        o.u.setup.caps = c->caps;
         if (oc_core_peer_send(k, c->b.peer, &o) != 0) oc_core_logf(k, "peer %u: CALL_SETUP failed", (unsigned)c->b.peer);
         return;
     }
@@ -285,13 +332,8 @@ static void start_b(oc_core_t *k, oc_core_call_t *c)
     o.u.call_offer.call_ref = c->b.ref;
     memcpy(o.u.call_offer.callee, c->called, OC_SIG_NUMBER_LEN);
     memcpy(o.u.call_offer.caller, c->caller, OC_SIG_NUMBER_LEN);
+    o.u.call_offer.caps = c->caps;
     oc_core_send(k, c->b.cell, &o);
-}
-
-static void refused(oc_core_t *k, oc_core_call_t *c, uint8_t why)
-{
-    to_leg(k, &c->a, OC_CORE_CALL_RELEASE, why);
-    end_call(k, c, why);
 }
 
 static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
@@ -304,6 +346,7 @@ static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     oc_core_call_t full, *c = new_call(k, &full, m->u.call_route.caller, m->u.call_route.called);
     c->a.cell = cell;
     c->a.ref = m->u.call_route.leg_ref;
+    c->caps = m->u.call_route.caps;
     uint8_t why = 0;
     if (c == &full) {
         why = OC_SIG_CAUSE_NET_FAILURE;
@@ -311,6 +354,8 @@ static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         /* a cell calls only as a subscriber registered on it */
         oc_core_logf(k, "cell %u: CALL_ROUTE from a caller not registered there", (unsigned)cell);
         why = OC_SIG_CAUSE_NET_FAILURE;
+    } else if (c->caps == 0) {
+        why = OC_SIG_CAUSE_NO_CODEC; /* nothing offered (ruling R6) */
     } else {
         why = resolve(k, c->called, 0, &c->b);
     }
@@ -374,12 +419,15 @@ static void on_setup(oc_core_t *k, uint16_t peer, const oc_core_msg_t *m)
     c->a.kind = OC_CORE_LEG_PEER;
     c->a.peer = peer;
     c->a.ref = m->u.setup.call_ref;
+    c->caps = m->u.setup.caps;
     uint8_t why = 0;
     if (c == &full || peer_calls(k, peer) > OC_CORE_PEER_CALLS) {
         oc_core_logf(k, "peer %u: CALL_SETUP refused: %s", (unsigned)peer, c == &full ? "no room" : "too many calls");
         why = OC_SIG_CAUSE_NET_FAILURE;
     } else if (m->u.setup.hop > OC_CORE_HOP_MAX) {
         why = OC_SIG_CAUSE_NET_FAILURE;
+    } else if (c->caps == 0) {
+        why = OC_SIG_CAUSE_NO_CODEC;
     } else {
         why = resolve(k, c->called, 1, &c->b);
     }
@@ -404,9 +452,20 @@ static void leg_rx(oc_core_t *k, oc_core_call_t *c, oc_core_leg_t *leg, oc_core_
         break;
     case OC_CORE_CALL_ANSWER:
         if (leg == &c->b && c->state != OC_CORE_CALL_ACTIVE) {
+            if (!oc_codec_in(c->caps, m->u.call.codec)) {
+                /* a codec the caller never offered (codec negotiation spec
+                 * §4, checks): both legs end, cause 7 */
+                oc_core_logf(k, "call %08x: answered with codec %u, not in caps 0x%02x", (unsigned)c->a.ref,
+                             (unsigned)m->u.call.codec, (unsigned)c->caps);
+                to_leg(k, &c->a, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NO_CODEC);
+                to_leg(k, &c->b, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NO_CODEC);
+                end_call(k, c, OC_SIG_CAUSE_NO_CODEC);
+                break;
+            }
+            c->codec = m->u.call.codec;
             c->state = OC_CORE_CALL_ACTIVE;
             c->answer = oc_core_unix(k);
-            to_leg(k, &c->a, OC_CORE_CALL_ANSWER, 0);
+            answer_to(k, &c->a, c->codec);
         }
         break;
     case OC_CORE_CALL_RELEASE:
@@ -521,7 +580,7 @@ void oc_core_sw_tick(oc_core_t *k)
         } else if (c->state == OC_CORE_CALL_ALERTING) { /* a service answers */
             c->state = OC_CORE_CALL_ACTIVE;
             c->answer = oc_core_unix(k);
-            to_leg(k, &c->a, OC_CORE_CALL_ANSWER, 0);
+            answer_to(k, &c->a, c->codec);
             if (c->b.kind == OC_CORE_LEG_PLAY) {
                 c->play_next = k->now + OC_CORE_PLAY_LEAD_US;
                 c->due = k->now + OC_CORE_PLAY_MAX_US;

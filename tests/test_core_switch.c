@@ -41,7 +41,7 @@ static void sw_world(void)
     subscriber(NB, TB, 2);
 }
 
-static void route(uint32_t link, uint32_t leg, const uint8_t caller[], const uint8_t called[])
+static void route_caps(uint32_t link, uint32_t leg, const uint8_t caller[], const uint8_t called[], uint8_t caps)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
@@ -49,9 +49,16 @@ static void route(uint32_t link, uint32_t leg, const uint8_t caller[], const uin
     m.u.call_route.leg_ref = leg;
     memcpy(m.u.call_route.caller, caller, OC_SIG_NUMBER_LEN);
     memcpy(m.u.call_route.called, called, OC_SIG_NUMBER_LEN);
+    m.u.call_route.caps = caps;
     rx(link, &m);
 }
 
+static void route(uint32_t link, uint32_t leg, const uint8_t caller[], const uint8_t called[])
+{
+    route_caps(link, leg, caller, called, OC_CODEC_CAPS_DEFAULT);
+}
+
+/* A call message as a cell sends it; CALL_ANSWER names Codec2 1200, as an old-form one means. */
 static void call_msg(uint32_t link, uint8_t type, uint32_t ref, uint8_t cause)
 {
     oc_core_msg_t m;
@@ -59,7 +66,26 @@ static void call_msg(uint32_t link, uint8_t type, uint32_t ref, uint8_t cause)
     m.type = type;
     m.u.call.ref = ref;
     m.u.call.cause = cause;
+    m.u.call.codec = type == OC_CORE_CALL_ANSWER ? OC_CODEC_C2_1200 : 0;
     rx(link, &m);
+}
+
+static void answer_codec(uint32_t link, uint32_t ref, uint8_t codec)
+{
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_CALL_ANSWER;
+    m.u.call.ref = ref;
+    m.u.call.codec = codec;
+    rx(link, &m);
+}
+
+static const oc_core_call_t *the_call(void)
+{
+    for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+        if (K.calls[i].used) return &K.calls[i];
+    }
+    return NULL;
 }
 
 static void media(uint32_t link, uint32_t ref, const char *s)
@@ -454,6 +480,85 @@ static void test_cdr_add_failure_does_not_break_release(void)
     TEST_ASSERT_EQUAL_UINT(0, used); /* the slot was freed despite the CDR write failing */
 }
 
+/* Codec negotiation §6.1: the caller's caps go from CALL_ROUTE into
+ * CALL_OFFER, in the form of the callee's link; the callee's codec comes
+ * back in CALL_ANSWER and is the call's. */
+static void test_caps_out_and_codec_back_between_cells(void)
+{
+    sw_world();
+    int from = NSENT;
+    route_caps(10, LEG, NA, NB, 0x21);
+    const oc_core_msg_t *o = sent_since(from, 20, OC_CORE_CALL_OFFER);
+    TEST_ASSERT_NOT_NULL(o);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, o->form);
+    TEST_ASSERT_EQUAL_HEX8(0x21, o->u.call_offer.caps);
+    answer_codec(20, o->u.call_offer.call_ref, OC_CODEC_OVX_1200);
+    const oc_core_msg_t *a = sent_since(from, 10, OC_CORE_CALL_ANSWER);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, a->form);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1200, a->u.call.codec);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1200, the_call()->codec);
+}
+
+/* §4 checks: a codec outside the caps ends both legs, cause 7, and the CDR
+ * says so; caps 0 are refused at once (ruling R6). */
+static void test_a_codec_outside_the_caps_or_no_caps_is_cause_7(void)
+{
+    sw_world();
+    int from = NSENT;
+    route_caps(10, LEG, NA, NB, 0x21);
+    uint32_t ref = sent_since(from, 20, OC_CORE_CALL_OFFER)->u.call_offer.call_ref;
+    answer_codec(20, ref, OC_CODEC_OVX_800);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, sent_since(from, 10, OC_CORE_CALL_RELEASE)->u.call.cause);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, sent_since(from, 20, OC_CORE_CALL_RELEASE)->u.call.cause);
+    TEST_ASSERT_NULL(sent_since(from, 10, OC_CORE_CALL_ANSWER));
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, last_cdr()->cause);
+
+    from = NSENT;
+    route_caps(10, LEG + 1u, NA, NB, 0);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, sent_since(from, 10, OC_CORE_CALL_RELEASE)->u.call.cause);
+    TEST_ASSERT_NULL(sent_since(from, 20, OC_CORE_CALL_OFFER));
+}
+
+/* Ruling R9: a callee cell on a protocol-2 link is offered the call in the
+ * old form when the caps have Codec2 1200 (and its old answer means codec
+ * 1); without it the call is refused at once, cause 7. */
+static void test_an_old_callee_link_gets_the_old_form_or_cause_7(void)
+{
+    core_world();
+    number("+883160655501234", NA);
+    number("+883160655501235", NB);
+    hello(10, 1, 1);
+    hello_proto(20, 2, 1, OC_CORE_PROTO_MIN);
+    subscriber(NA, TA, 1);
+    subscriber(NB, TB, 2);
+    int from = NSENT;
+    route_caps(10, LEG, NA, NB, 0x21);
+    const oc_core_msg_t *o = sent_since(from, 20, OC_CORE_CALL_OFFER);
+    TEST_ASSERT_NOT_NULL(o);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, o->form);
+    call_msg(20, OC_CORE_CALL_ANSWER, o->u.call_offer.call_ref, 0);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, sent_since(from, 10, OC_CORE_CALL_ANSWER)->u.call.codec);
+    call_msg(10, OC_CORE_CALL_RELEASE, LEG, OC_SIG_CAUSE_NORMAL);
+
+    from = NSENT;
+    route_caps(10, LEG + 1u, NA, NB, OC_CODEC_BIT(OC_CODEC_OVX_1200));
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, sent_since(from, 10, OC_CORE_CALL_RELEASE)->u.call.cause);
+    TEST_ASSERT_NULL(sent_since(from, 20, OC_CORE_CALL_OFFER));
+}
+
+/* §6.3: echo sends back whatever comes, so it answers with the best codec
+ * in the caps. */
+static void test_echo_answers_with_the_best_codec(void)
+{
+    sw_world();
+    int from = NSENT;
+    route_caps(10, LEG, NA, ECHO, OC_CODEC_CAPS_DEFAULT | OC_CODEC_BIT(OC_CODEC_OVX_600) |
+                                      OC_CODEC_BIT(OC_CODEC_OVX_1000));
+    advance(OC_CORE_ECHO_US);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1000, sent_since(from, 10, OC_CORE_CALL_ANSWER)->u.call.codec);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -473,5 +578,9 @@ int main(void)
     RUN_TEST(test_caller_hangs_up_while_echo_rings);
     RUN_TEST(test_cdr_count_delta_is_exactly_one);
     RUN_TEST(test_cdr_add_failure_does_not_break_release);
+    RUN_TEST(test_caps_out_and_codec_back_between_cells);
+    RUN_TEST(test_a_codec_outside_the_caps_or_no_caps_is_cause_7);
+    RUN_TEST(test_an_old_callee_link_gets_the_old_form_or_cause_7);
+    RUN_TEST(test_echo_answers_with_the_best_codec);
     return UNITY_END();
 }

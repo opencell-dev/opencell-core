@@ -58,6 +58,7 @@ static void route_to(const uint8_t called[OC_SIG_NUMBER_LEN])
     m.u.call_route.leg_ref = LEG;
     memcpy(m.u.call_route.caller, NA, OC_SIG_NUMBER_LEN);
     memcpy(m.u.call_route.called, called, OC_SIG_NUMBER_LEN);
+    m.u.call_route.caps = OC_CODEC_CAPS_DEFAULT;
     rx(10, &m);
 }
 

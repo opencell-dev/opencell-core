@@ -135,6 +135,8 @@ typedef struct {
     uint8_t       caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN];
     uint64_t      due;           /* ROUTING: give up then; a service ALERTING: answer then; PLAY ACTIVE: hang up then */
     uint32_t      setup, answer; /* unix s; answer 0 = not answered */
+    uint8_t       caps;          /* the caller's codec caps (CALL_ROUTE, OCSS CALL_SETUP): codec negotiation spec §6 */
+    uint8_t       codec;         /* the agreed codec: a service's choice, or the callee's CALL_ANSWER; 0 until then */
     /* b is the playback service: */
     uint64_t      play_next;     /* ACTIVE: when the next payload is due */
     uint32_t      play_at;       /* the clip offset of the next payload */

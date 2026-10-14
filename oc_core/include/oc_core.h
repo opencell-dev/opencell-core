@@ -84,6 +84,7 @@ typedef struct {
     int      used;
     uint32_t link;
     uint32_t cell_id; /* 0 until its HELLO is accepted */
+    uint8_t  proto;   /* its HELLO's version (2 or 3): the form of the call messages sent on it */
     uint64_t last_rx, last_tx;
     uint8_t  cfg_pending;  /* CELL_CFG is owed to this cell: retried from oc_core_tick */
     uint8_t  cfg_backoff_s; /* the next retry's wait: 1 s doubling to 60 s */
@@ -192,6 +193,11 @@ void oc_core_peer_down(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
 /* 1 if a link to core_id is up (HELLO done). */
 int  oc_core_peer_linked(const oc_core_t *k, uint16_t core_id);
+
+/* The form the call messages take on cell_id's link (codec negotiation
+ * spec §6.1): OC_CORE_FORM_CODEC on a protocol-3 link, OLD otherwise (or
+ * with no link). */
+uint8_t oc_core_cell_form(const oc_core_t *k, uint32_t cell_id);
 /* Liveness (PING, dead links), timers, pruning, and CELL_CFG a cell is owed:
  * a HELLO is acked even when its cell's channel list can't be read then -
  * the cell serves on the list it has (network-core spec §7.10) - and the

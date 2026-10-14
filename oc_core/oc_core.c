@@ -66,6 +66,12 @@ int oc_core_linked(const oc_core_t *k, uint32_t cell_id)
     return link_of_cell((oc_core_t *)k, cell_id) != NULL;
 }
 
+uint8_t oc_core_cell_form(const oc_core_t *k, uint32_t cell_id)
+{
+    const oc_core_link_t *l = link_of_cell((oc_core_t *)k, cell_id);
+    return l != NULL && l->proto >= OC_CORE_PROTO_CODEC ? OC_CORE_FORM_CODEC : OC_CORE_FORM_OLD;
+}
+
 static int send_link(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m)
 {
     l->last_tx = k->now;
@@ -234,7 +240,7 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     int got_cell = OC_CORE_STORE_NONE, got_key = OC_CORE_STORE_NONE;
     memset(&r, 0, sizeof(r));
     memset(&key, 0, sizeof(key));
-    if (m->u.hello.proto != OC_CORE_PROTO) {
+    if (m->u.hello.proto < OC_CORE_PROTO_MIN || m->u.hello.proto > OC_CORE_PROTO) {
         reason = OC_CORE_NAK_VERSION;
     } else if (id == 0 || (got_cell = k->st.cell_get(k->st.ctx, id, &c)) == OC_CORE_STORE_NONE) {
         reason = OC_CORE_NAK_UNKNOWN_CELL;
@@ -285,6 +291,7 @@ static void on_hello(oc_core_t *k, oc_core_link_t *l, const oc_core_msg_t *m, ui
     c.last_seen = oc_core_unix(k);
     k->st.cell_put(k->st.ctx, &c);
     l->cell_id = id;
+    l->proto = m->u.hello.proto;
     r.type = OC_CORE_HELLO_ACK;
     r.u.hello_ack.mode = c.mode;
     r.u.hello_ack.period_s = key.period_s;

@@ -100,17 +100,23 @@ static inline void rx(uint32_t link, const oc_core_msg_t *m)
     oc_core_rx(&K, link, m, NOW);
 }
 
-/* Link `link` connects and says HELLO as cell_id. */
-static inline void hello(uint32_t link, uint32_t cell_id, uint64_t boot_id)
+/* Link `link` connects and says HELLO as cell_id, in protocol proto. */
+static inline void hello_proto(uint32_t link, uint32_t cell_id, uint64_t boot_id, uint8_t proto)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = OC_CORE_HELLO;
-    m.u.hello.proto = OC_CORE_PROTO;
+    m.u.hello.proto = proto;
     m.u.hello.cell_id = cell_id;
     m.u.hello.boot_id = boot_id;
     oc_core_link_up(&K, link, NOW);
     rx(link, &m);
+}
+
+/* ...in the newest protocol. */
+static inline void hello(uint32_t link, uint32_t cell_id, uint64_t boot_id)
+{
+    hello_proto(link, cell_id, boot_id, OC_CORE_PROTO);
 }
 
 /* The newest message of type sent on link (NULL if none since index from). */

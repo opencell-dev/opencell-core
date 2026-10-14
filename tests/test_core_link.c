@@ -43,7 +43,7 @@ static void test_hello_refusals_close_the_link_and_are_audited(void)
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = OC_CORE_HELLO;
-    m.u.hello.proto = OC_CORE_PROTO - 1u; /* proto 1: AV_RES with XRES (network-core spec §19.1), not spoken */
+    m.u.hello.proto = OC_CORE_PROTO_MIN - 1u; /* proto 1: AV_RES with XRES (network-core spec §19.1), not spoken */
     m.u.hello.cell_id = 1;
     oc_core_link_up(&K, 12, NOW);
     rx(12, &m);
@@ -537,12 +537,32 @@ static void test_a_link_that_changes_cell_loses_the_old_cells_report(void)
     TEST_ASSERT_EQUAL_HEX32(0x900, oc_core_cell_tel(&K, 2)->term[0].tmid);
 }
 
+/* Codec negotiation §6.1: protocols 2 and 3 are accepted and kept on the
+ * link - the form of the call messages the core sends there; 1 and 4 are
+ * refused (version). */
+static void test_hello_2_and_3_accepted_and_kept_on_the_link(void)
+{
+    core_world();
+    hello_proto(20, 1, 1, OC_CORE_PROTO_MIN - 1u);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_NAK_VERSION, sent(20, OC_CORE_HELLO_NAK)->u.hello_nak.reason);
+    hello_proto(21, 1, 1, OC_CORE_PROTO + 1u);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_NAK_VERSION, sent(21, OC_CORE_HELLO_NAK)->u.hello_nak.reason);
+    hello_proto(10, 1, 1, OC_CORE_PROTO_MIN);
+    TEST_ASSERT_NOT_NULL(sent(10, OC_CORE_HELLO_ACK));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, oc_core_cell_form(&K, 1));
+    hello_proto(11, 2, 1, OC_CORE_PROTO);
+    TEST_ASSERT_NOT_NULL(sent(11, OC_CORE_HELLO_ACK));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, oc_core_cell_form(&K, 2));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, oc_core_cell_form(&K, 9)); /* no link */
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_channel_list_goes_to_the_group);
     RUN_TEST(test_hello_is_acked_with_the_cell_settings);
     RUN_TEST(test_hello_refusals_close_the_link_and_are_audited);
+    RUN_TEST(test_hello_2_and_3_accepted_and_kept_on_the_link);
     RUN_TEST(test_nothing_but_hello_before_hello);
     RUN_TEST(test_new_boot_purges_same_boot_keeps);
     RUN_TEST(test_ping_when_idle_and_down_when_silent);

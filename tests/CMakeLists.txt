@@ -33,7 +33,7 @@ add_executable(test_oc_clip test_oc_clip.c)
 target_link_libraries(test_oc_clip PRIVATE oc_clip unity)
 add_test(NAME test_oc_clip COMMAND test_oc_clip ${CMAKE_CURRENT_SOURCE_DIR}/data)
 # oc-core's oc_vox is the fixed-point production code only (ruling R10).
-add_test(NAME test_oc_vox_fixed COMMAND sh -c "! nm $<TARGET_FILE:oc_vox> | grep -q ' oc_vox_ref_'")
+add_test(NAME test_oc_vox_fixed COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_vox_fixed.sh $<TARGET_FILE:oc_vox>)
 
 # oc-core as a process, with a bare cell (tool_oc_hello) to speak HELLO, a
 # cell with a terminal in a call (tool_oc_call) and a slow admin peer

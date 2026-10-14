@@ -309,12 +309,15 @@ static int cmd_status(oc_admin_t *a, oc_buf_t *o)
     }
     sqlite3_finalize(s);
     if (rc != SQLITE_DONE) bad |= store_error(o, "the cells can't be listed");
-    if (a->cfg->clip_len != 0) { /* core test services spec §5 */
+    if (a->cfg->nclips != 0) { /* core test services spec §5; a copy per codec: OpenVoxNB spec V7 */
         char t[OC_SIG_NUMBER_TEXT];
-        unsigned n = a->cfg->clip_len / OC_CORE_PLAY_BYTES;
+        const oc_core_clip_t *c0 = &a->cfg->clips[0];
+        unsigned n = c0->len / oc_codec_block_bytes(c0->codec);
         oc_sig_number_to_text(a->cfg->playback_number, t);
-        oc_buf_printf(o, "playback %s: clip of %u.%02u s (8 kHz WAV), Codec2 1200 %u payloads\n", t, n * 12u / 100u,
-                      n * 12u % 100u, n);
+        oc_buf_printf(o, "playback %s: clip of %u.%02u s (8 kHz WAV), %s %u payloads", t, n * 12u / 100u,
+                      n * 12u % 100u, oc_codec_name(c0->codec), n);
+        for (unsigned i = 1; i < a->cfg->nclips; i++) oc_buf_printf(o, ", %s %u", oc_codec_name(a->cfg->clips[i].codec), n);
+        oc_buf_printf(o, "\n");
     }
     for (unsigned i = 0; i < a->route->n; i++) { /* blocks reached over OCSS (spec §6) */
         const oc_core_block_t *b = &a->route->b[i];

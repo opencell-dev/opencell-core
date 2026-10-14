@@ -15,17 +15,20 @@ void tearDown(void) {}
 #define LEG      7u
 #define PLAY_NUM "+883160655500101"
 
-/* Three payloads, each byte its payload's index + 1. */
-static uint8_t CLIP[3 * OC_CORE_PLAY_BYTES];
+/* Three payloads, each byte its payload's index + 1; the same three blocks
+ * in OVX-600 (9 bytes, 0x91, 0x92, 0x93): the copies of one clip. */
+static uint8_t CLIP[3 * OC_CORE_PLAY_BYTES], CLIP9[3 * 9];
 static uint8_t NA[OC_SIG_NUMBER_LEN], PLAY[OC_SIG_NUMBER_LEN];
 
 static oc_core_cfg_t play_cfg(void)
 {
     oc_core_cfg_t cfg = core_cfg();
     for (unsigned i = 0; i < sizeof(CLIP); i++) CLIP[i] = (uint8_t)(i / OC_CORE_PLAY_BYTES + 1u);
+    for (unsigned i = 0; i < sizeof(CLIP9); i++) CLIP9[i] = (uint8_t)(0x91u + i / 9u);
     number(PLAY_NUM, cfg.playback_number);
-    cfg.clip = CLIP;
-    cfg.clip_len = sizeof(CLIP);
+    cfg.clips[0] = (oc_core_clip_t){ OC_CODEC_C2_1200, CLIP, sizeof(CLIP) };
+    cfg.clips[1] = (oc_core_clip_t){ OC_CODEC_OVX_600, CLIP9, sizeof(CLIP9) };
+    cfg.nclips = 2;
     return cfg;
 }
 
@@ -50,7 +53,7 @@ static void play_world(void)
     TEST_ASSERT_EQUAL_INT(0, ST.loc_put(ST.ctx, &l));
 }
 
-static void route_to(const uint8_t called[OC_SIG_NUMBER_LEN])
+static void route_caps_to(const uint8_t called[OC_SIG_NUMBER_LEN], uint8_t caps)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
@@ -58,9 +61,11 @@ static void route_to(const uint8_t called[OC_SIG_NUMBER_LEN])
     m.u.call_route.leg_ref = LEG;
     memcpy(m.u.call_route.caller, NA, OC_SIG_NUMBER_LEN);
     memcpy(m.u.call_route.called, called, OC_SIG_NUMBER_LEN);
-    m.u.call_route.caps = OC_CODEC_CAPS_DEFAULT;
+    m.u.call_route.caps = caps;
     rx(10, &m);
 }
+
+static void route_to(const uint8_t called[OC_SIG_NUMBER_LEN]) { route_caps_to(called, OC_CODEC_CAPS_DEFAULT); }
 
 static void uplink(const char *s)
 {
@@ -217,17 +222,64 @@ static void test_due_names_the_next_payload(void)
     TEST_ASSERT_EQUAL_UINT64(NOW - 10u + OC_CORE_PLAY_US, oc_core_due(&K));
 }
 
+/* OpenVoxNB spec V7: playback answers with the best codec in the caps it
+ * has a copy in (OVX-600 here: there is no OVX-1200 copy) and sends that
+ * copy's blocks, at its size, in order, looping, on the same clock. */
+static void test_playback_sends_the_copy_for_the_calls_codec(void)
+{
+    play_world();
+    int from = NSENT;
+    route_caps_to(PLAY, OC_CODEC_BIT(OC_CODEC_OVX_600) | OC_CODEC_BIT(OC_CODEC_OVX_1200));
+    advance(OC_CORE_ECHO_US);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_600, sent_since(from, 10, OC_CORE_CALL_ANSWER)->u.call.codec);
+    from = NSENT;
+    advance(OC_CORE_PLAY_LEAD_US);
+    for (unsigned i = 0; i < 4; i++) {
+        const oc_core_msg_t *d = sent_since(from, 10, OC_CORE_MEDIA);
+        TEST_ASSERT_NOT_NULL(d);
+        TEST_ASSERT_EQUAL_UINT16(i, d->u.media.seq);
+        TEST_ASSERT_EQUAL_UINT8(9, d->u.media.len);
+        TEST_ASSERT_EQUAL_MEMORY(CLIP9 + (i % 3u) * 9u, d->u.media.data, 9);
+        from = NSENT;
+        advance(OC_CORE_PLAY_US);
+    }
+}
+
+/* §6.3: caps with no copy (LPCNet only) end the call before it rings, cause 7. */
+static void test_caps_with_no_copy_get_cause_7(void)
+{
+    play_world();
+    int from = NSENT;
+    route_caps_to(PLAY, OC_CODEC_BIT(OC_CODEC_LPCNET_1733));
+    TEST_ASSERT_NULL(sent_since(from, 10, OC_CORE_CALL_ALERT));
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, sent_since(from, 10, OC_CORE_CALL_RELEASE)->u.call.cause);
+}
+
 static void test_no_clip_no_playback_service(void)
 {
     oc_core_cfg_t cfg = play_cfg();
     core_world();
-    cfg.clip_len = OC_CORE_PLAY_BYTES - 1u; /* not a whole payload */
+    cfg.clips[0].len = OC_CORE_PLAY_BYTES - 1u; /* not a whole payload */
     TEST_ASSERT_EQUAL_INT(-1, oc_core_init(&K, &CORE_IO, &ST, &RT, &cfg));
-    cfg.clip = NULL;
-    cfg.clip_len = 0;
+    cfg = play_cfg();
+    cfg.clips[1].len = 2u * 9u; /* the copies disagree on the clip's length */
     TEST_ASSERT_EQUAL_INT(-1, oc_core_init(&K, &CORE_IO, &ST, &RT, &cfg));
-    TEST_ASSERT_FALSE(oc_core_clip_ok(CLIP, OC_CORE_CLIP_MAX + OC_CORE_PLAY_BYTES));
-    TEST_ASSERT_TRUE(oc_core_clip_ok(CLIP, OC_CORE_PLAY_BYTES));
+    cfg = play_cfg();
+    cfg.clips[1] = cfg.clips[0]; /* one codec twice */
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_init(&K, &CORE_IO, &ST, &RT, &cfg));
+    cfg = play_cfg();
+    cfg.nclips = 0;
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_init(&K, &CORE_IO, &ST, &RT, &cfg));
+    const oc_core_clip_t too_long = { OC_CODEC_C2_1200, CLIP, OC_CORE_CLIP_MAX + OC_CORE_PLAY_BYTES };
+    const oc_core_clip_t one = { OC_CODEC_C2_1200, CLIP, OC_CORE_PLAY_BYTES };
+    const oc_core_clip_t ovx = { OC_CODEC_OVX_600, CLIP9, 9 };
+    const oc_core_clip_t ovx_cut = { OC_CODEC_OVX_600, CLIP9, 10 };
+    const oc_core_clip_t lpcnet = { OC_CODEC_LPCNET_1733, CLIP, OC_CORE_PLAY_BYTES };
+    TEST_ASSERT_FALSE(oc_core_clip_ok(&too_long));
+    TEST_ASSERT_TRUE(oc_core_clip_ok(&one));
+    TEST_ASSERT_TRUE(oc_core_clip_ok(&ovx));
+    TEST_ASSERT_FALSE(oc_core_clip_ok(&ovx_cut));
+    TEST_ASSERT_FALSE(oc_core_clip_ok(&lpcnet)); /* no block size: no copy of it */
     /* the playback number unset: a call to 00101 is a call to a reserved number, unreachable */
     play_world();
     cfg = core_cfg();
@@ -251,6 +303,8 @@ int main(void)
     RUN_TEST(test_the_service_hangs_up_after_10_minutes);
     RUN_TEST(test_the_cell_going_ends_the_playback);
     RUN_TEST(test_due_names_the_next_payload);
+    RUN_TEST(test_playback_sends_the_copy_for_the_calls_codec);
+    RUN_TEST(test_caps_with_no_copy_get_cause_7);
     RUN_TEST(test_no_clip_no_playback_service);
     return UNITY_END();
 }

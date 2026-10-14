@@ -75,7 +75,8 @@ static void test_ten_minutes_fills_the_clip_exactly(void)
     int16_t *pcm = calloc(OC_CLIP_MAX_SAMPLES, sizeof(int16_t));
     uint8_t *out = malloc(OC_CORE_CLIP_MAX);
     TEST_ASSERT_EQUAL(OC_CORE_CLIP_MAX, oc_clip_encode_c2_1200(pcm, OC_CLIP_MAX_SAMPLES, out, OC_CORE_CLIP_MAX));
-    TEST_ASSERT_TRUE(oc_core_clip_ok(out, OC_CORE_CLIP_MAX));
+    const oc_core_clip_t c = { OC_CODEC_C2_1200, out, OC_CORE_CLIP_MAX };
+    TEST_ASSERT_TRUE(oc_core_clip_ok(&c));
     free(pcm);
     free(out);
 }

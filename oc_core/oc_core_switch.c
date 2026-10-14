@@ -279,11 +279,18 @@ static void refused(oc_core_t *k, oc_core_call_t *c, uint8_t why)
 
 /* The codec a service answers with (codec negotiation spec §6.3): echo
  * sends back whatever comes, so the best in the caps; playback the best it
- * has the clip in (Codec2 1200 here). OC_CODEC_NONE: none. */
-static uint8_t service_codec(const oc_core_call_t *c)
+ * has a copy of the clip in (OpenVoxNB spec V7), which it notes in c->clip.
+ * OC_CODEC_NONE: none. */
+static uint8_t service_codec(const oc_core_t *k, oc_core_call_t *c)
 {
     if (c->b.kind == OC_CORE_LEG_ECHO) return oc_codec_best(c->caps);
-    return oc_codec_in(c->caps, OC_CODEC_C2_1200) ? OC_CODEC_C2_1200 : OC_CODEC_NONE;
+    uint8_t have = 0;
+    for (unsigned i = 0; i < k->cfg.nclips; i++) have = (uint8_t)(have | OC_CODEC_BIT(k->cfg.clips[i].codec));
+    uint8_t codec = oc_codec_best((uint8_t)(c->caps & have));
+    for (unsigned i = 0; i < k->cfg.nclips; i++) {
+        if (k->cfg.clips[i].codec == codec) c->clip = (uint8_t)i;
+    }
+    return codec;
 }
 
 /* Leg b is resolved: a service rings at once; a cell is offered the call;
@@ -293,7 +300,7 @@ static void start_b(oc_core_t *k, oc_core_call_t *c)
     oc_core_msg_t o;
     memset(&o, 0, sizeof(o));
     if (is_service(&c->b)) {
-        if ((c->codec = service_codec(c)) == OC_CODEC_NONE) {
+        if ((c->codec = service_codec(k, c)) == OC_CODEC_NONE) {
             refused(k, c, OC_SIG_CAUSE_NO_CODEC); /* before it rings */
             return;
         }
@@ -524,25 +531,28 @@ void oc_core_sw_peer_rx(oc_core_t *k, uint16_t core_id, const oc_core_msg_t *m)
 }
 
 /* The playback service's clock (core test services spec §5.3): every
- * payload that is due goes to the caller, in clip order, looping. One that
+ * payload that is due goes to the caller, in the order of the call's copy
+ * of the clip, looping. One that
  * is OC_CORE_PLAY_LATE_US late or more (the loop stalled: a slow disk, an
  * admin command) is skipped with every other missed one, so the cell's DL
  * queue never takes a burst of more than two. */
 static void play_tick(oc_core_t *k, oc_core_call_t *c)
 {
+    const oc_core_clip_t *cl = &k->cfg.clips[c->clip];
+    uint32_t bytes = oc_codec_block_bytes(cl->codec), blocks = cl->len / bytes;
     while (k->now >= c->play_next) {
         uint64_t late = k->now - c->play_next;
         if (late >= OC_CORE_PLAY_LATE_US) {
             uint64_t n = late / OC_CORE_PLAY_US;
             c->play_skipped += (uint32_t)n;
             c->play_seq = (uint16_t)(c->play_seq + n);
-            c->play_at = (uint32_t)((c->play_at + n * OC_CORE_PLAY_BYTES) % k->cfg.clip_len);
+            c->play_at = (uint32_t)((c->play_at + n) % blocks);
             c->play_next += n * OC_CORE_PLAY_US;
             continue;
         }
-        media_to(k, &c->a, c->play_seq++, k->cfg.clip + c->play_at, OC_CORE_PLAY_BYTES);
+        media_to(k, &c->a, c->play_seq++, cl->data + (size_t)c->play_at * bytes, (uint8_t)bytes);
         c->play_sent++;
-        c->play_at = (c->play_at + OC_CORE_PLAY_BYTES) % k->cfg.clip_len;
+        c->play_at = (c->play_at + 1u) % blocks;
         c->play_next += OC_CORE_PLAY_US;
     }
 }

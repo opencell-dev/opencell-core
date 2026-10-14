@@ -227,7 +227,8 @@ static int load_clip(const char *path)
         snprintf(why, sizeof(why), "short read");
     } else if (oc_wav_read(buf, (size_t)r, &pcm, &n, why, sizeof(why)) == 0) {
         bytes = oc_clip_encode_c2_1200(pcm, n, D.clip, sizeof(D.clip));
-        if (bytes == 0 || !oc_core_clip_ok(D.clip, (uint32_t)bytes)) snprintf(why, sizeof(why), "Codec2 1200 encoding failed");
+        const oc_core_clip_t c2 = { OC_CODEC_C2_1200, D.clip, (uint32_t)bytes };
+        if (bytes == 0 || !oc_core_clip_ok(&c2)) snprintf(why, sizeof(why), "Codec2 1200 encoding failed");
     }
     if (fd >= 0) close(fd);
     free(buf);
@@ -236,8 +237,8 @@ static int load_clip(const char *path)
         oc_log(OC_LOG_ERR, "config: playback_clip = '%s': %s (tools/clip/oc-clip-gen)", path, why);
         return -1;
     }
-    D.cfg.clip = D.clip;
-    D.cfg.clip_len = (uint32_t)bytes;
+    D.cfg.clips[0] = (oc_core_clip_t){ OC_CODEC_C2_1200, D.clip, (uint32_t)bytes };
+    D.cfg.nclips = 1;
     return 0;
 }
 
@@ -1041,7 +1042,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
            OC_VERSION, D.cfg.core_id, D.name, D.cfg.key_id, D.route.n, D.db, oc_sql_version(D.sql), D.cell_sock,
            D.cell_listen != NULL ? " and " : "", D.cell_listen != NULL ? D.cell_listen : "",
            D.cell_listen != NULL ? " (TLS)" : "", D.admin_sock, D.api_listen != NULL ? D.api_listen : "off",
-           D.cfg.clip_len != 0 ? "on" : "off",
+           D.cfg.nclips != 0 ? "on" : "off",
            D.ocss_cfg.npeer, D.ocss_cfg.listen != NULL ? ", listening on " : "",
            D.ocss_cfg.listen != NULL ? D.ocss_cfg.listen : "");
     while (!g_stop) {

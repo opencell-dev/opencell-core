@@ -116,8 +116,8 @@ static void make_core(core_t *c, uint16_t id, const oc_core_io_t *io, const char
     number(echo, cfg.echo_number);
     if (play != NULL) {
         number(play, cfg.playback_number);
-        cfg.clip = CLIP;
-        cfg.clip_len = sizeof(CLIP);
+        cfg.clips[0] = (oc_core_clip_t){ OC_CODEC_C2_1200, CLIP, sizeof(CLIP) };
+        cfg.nclips = 1;
     }
     TEST_ASSERT_EQUAL_INT(0, oc_core_init(&c->k, io, &c->st, &c->rt, &cfg));
 }

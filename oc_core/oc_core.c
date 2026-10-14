@@ -116,9 +116,28 @@ int oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t peri
     return r;
 }
 
-int oc_core_clip_ok(const uint8_t *clip, uint32_t len)
+int oc_core_clip_ok(const oc_core_clip_t *c)
 {
-    return clip != NULL && len > 0 && len <= OC_CORE_CLIP_MAX && len % OC_CORE_PLAY_BYTES == 0;
+    uint32_t bytes = oc_codec_block_bytes(c->codec);
+    return c->data != NULL && bytes != 0 && c->len > 0 && c->len % bytes == 0 && c->len / bytes <= OC_CORE_CLIP_BLOCKS;
+}
+
+/* The playback service's copies: at least one, each good, one length, no codec twice. */
+static int clips_ok(const oc_core_cfg_t *cfg)
+{
+    if (cfg->nclips == 0 || cfg->nclips > OC_CORE_CLIPS) return 0;
+    uint32_t blocks = 0;
+    for (unsigned i = 0; i < cfg->nclips; i++) {
+        const oc_core_clip_t *c = &cfg->clips[i];
+        if (!oc_core_clip_ok(c)) return 0;
+        uint32_t n = c->len / oc_codec_block_bytes(c->codec);
+        if (i == 0) blocks = n;
+        if (n != blocks) return 0;
+        for (unsigned j = 0; j < i; j++) {
+            if (cfg->clips[j].codec == c->codec) return 0;
+        }
+    }
+    return 1;
 }
 
 int oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
@@ -127,7 +146,7 @@ int oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st
     static const uint8_t none[OC_SIG_NUMBER_LEN];
     oc_core_netkey_t key;
     memset(k, 0, sizeof(*k));
-    if (memcmp(cfg->playback_number, none, OC_SIG_NUMBER_LEN) != 0 && !oc_core_clip_ok(cfg->clip, cfg->clip_len)) {
+    if (memcmp(cfg->playback_number, none, OC_SIG_NUMBER_LEN) != 0 && !clips_ok(cfg)) {
         return -1;
     }
     k->io = *io;

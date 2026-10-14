@@ -30,14 +30,25 @@
 #define OC_CORE_SETUP_BURST   10u /* ... up to this many at once */
 #define OC_CORE_SETUP_US 10000000u /* CALL_ROUTE to the callee's alert or release (§7.4) */
 #define OC_CORE_ECHO_US  3000000u  /* the echo and playback services ring this long, then answer */
-/* The playback service (core test services spec §5): one payload of the
- * clip per radio frame, the core's own clock pacing it. */
+/* The playback service (core test services spec §5): one block of the clip
+ * per radio frame, the core's own clock pacing it, from the copy for the
+ * call's codec (OpenVoxNB spec V7). */
 #define OC_CORE_PLAY_US      120000u         /* one payload per 120 ms frame */
-#define OC_CORE_PLAY_BYTES   18u             /* 3 x 6 B Codec2 1200 frames: one app data frame (voice spec §4) */
+#define OC_CORE_PLAY_BYTES   18u             /* the largest block: Codec2 1200 (3 x 6 B, one app data frame: voice spec §4) and OVX-1200 */
 #define OC_CORE_PLAY_LEAD_US 1500000u        /* answer to first payload, unless the caller's first media comes sooner */
 #define OC_CORE_PLAY_LATE_US 240000u         /* a payload this late is skipped, never sent in a burst */
 #define OC_CORE_PLAY_MAX_US  600000000ull    /* the service hangs up (cause 0) after 10 min connected */
-#define OC_CORE_CLIP_MAX     (OC_CORE_PLAY_BYTES * 5000u) /* 10 min of clip */
+#define OC_CORE_CLIPS        5u              /* copies: Codec2 1200, OVX-1200, -1000, -800, -600 */
+#define OC_CORE_CLIP_BLOCKS  5000u           /* 10 min of 120 ms blocks */
+#define OC_CORE_CLIP_MAX     (OC_CORE_PLAY_BYTES * OC_CORE_CLIP_BLOCKS) /* the largest copy */
+
+/* One copy of the playback clip: len bytes of codec's blocks
+ * (oc_codec_block_bytes), one per 120 ms frame. */
+typedef struct {
+    uint8_t        codec; /* oc_codec.h */
+    const uint8_t *data;
+    uint32_t       len;
+} oc_core_clip_t;
 /* The relay budget from a peer leg into a cell leg (review I2): at most
  * this many MEDIA at once, refilled at OC_CORE_PLAY_US (the voice spec §3
  * frame), so a burst after a stalled OCSS link can't fill the cell's
@@ -49,11 +60,12 @@ typedef struct {
     uint16_t key_id;                          /* the network key pair in use: must be in the store */
     uint8_t  echo_number[OC_SIG_NUMBER_LEN];  /* the echo service, +883160655500100 */
     /* The playback service (core test services spec §5): all zero, none.
-     * Set, it needs a clip oc_core_clip_ok accepts, which the caller keeps
-     * alive as long as the core. */
+     * Set, it needs nclips copies of its clip (OpenVoxNB spec V7), each
+     * oc_core_clip_ok, all of the same number of blocks, no codec twice;
+     * the caller keeps them alive as long as the core. */
     uint8_t        playback_number[OC_SIG_NUMBER_LEN];
-    const uint8_t *clip;
-    uint32_t       clip_len;
+    oc_core_clip_t clips[OC_CORE_CLIPS];
+    uint8_t        nclips;
 } oc_core_cfg_t;
 
 typedef struct {
@@ -139,7 +151,8 @@ typedef struct {
     uint8_t       codec;         /* the agreed codec: a service's choice, or the callee's CALL_ANSWER; 0 until then */
     /* b is the playback service: */
     uint64_t      play_next;     /* ACTIVE: when the next payload is due */
-    uint32_t      play_at;       /* the clip offset of the next payload */
+    uint8_t       clip;          /* b is the playback service: its copy (cfg.clips index) */
+    uint32_t      play_at;       /* the clip block of the next payload */
     uint16_t      play_seq;      /* its MEDIA seq */
     uint32_t      play_sent, play_skipped;
     /* A leg is a peer, the other a cell: a token bucket (review I2) bounds
@@ -174,13 +187,14 @@ typedef struct {
 int  oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t period_s, const uint8_t random32[32],
                         uint32_t unix_now);
 
-/* 1 if clip can be the playback service's: 1 to OC_CORE_CLIP_MAX bytes, a
- * whole number of OC_CORE_PLAY_BYTES payloads (the clip encoded from
+/* 1 if c can be a copy of the playback clip: a codec with a block size,
+ * 1 to OC_CORE_CLIP_BLOCKS whole blocks of it (the clip encoded from
  * playback_clip's WAV, cut to 120 ms blocks: oc_clip.h). */
-int  oc_core_clip_ok(const uint8_t *clip, uint32_t len);
+int  oc_core_clip_ok(const oc_core_clip_t *c);
 
 /* 0, or -1 when cfg->key_id is not in the store (or can't be read), or the
- * playback service is configured without a clip oc_core_clip_ok accepts.
+ * playback service is configured without copies of its clip that agree
+ * (see oc_core_cfg_t).
  * Keeps nothing of a previous run but what the store holds (a restart). */
 int  oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                   const oc_core_cfg_t *cfg);

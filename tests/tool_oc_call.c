@@ -38,7 +38,8 @@ static const char *called_text = ECHO;
 static double      talk_s;    /* 0: hold, as before */
 static int         media_n;   /* MEDIA received */
 static double      last_rx_s, maxgap_s, answered_s;
-static uint8_t     caps;      /* --caps: CALL_ROUTE carries them (protocol 3's form); 0: the old form */
+static int         caps_given; /* --caps given: CALL_ROUTE is in protocol 3's form, 0 included (the core ends caps 0 with cause 7) */
+static uint8_t     caps;       /* --caps: CALL_ROUTE carries them */
 static unsigned    media_len; /* the last MEDIA's length */
 
 static const uint8_t K[16] = { 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
@@ -127,7 +128,7 @@ static void on_rx(void *ctx, const oc_core_msg_t *m)
         r.u.call_route.leg_ref = LEG;
         memcpy(r.u.call_route.caller, num, OC_SIG_NUMBER_LEN);
         oc_sig_number_to_bcd(called_text, strlen(called_text), r.u.call_route.called);
-        if (caps != 0) {
+        if (caps_given) {
             r.form = OC_CORE_FORM_CODEC;
             r.u.call_route.caps = caps;
         }
@@ -169,12 +170,20 @@ static void on_rx(void *ctx, const oc_core_msg_t *m)
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "hss") == 0) return write_hss(argv[2]);
-    if (argc > 3 && strcmp(argv[1], "--caps") == 0) {
-        caps = (uint8_t)strtoul(argv[2], NULL, 0);
-        argv += 2;
-        argc -= 2;
+    int usage = 0;
+    if (argc > 1 && strcmp(argv[1], "--caps") == 0) { /* strictly: a number 0..0xFF, nothing after it */
+        char *end = NULL;
+        unsigned long v = argc > 2 ? strtoul(argv[2], &end, 0) : 0;
+        if (argc <= 2 || end == argv[2] || *end != '\0' || v > 0xFF) {
+            usage = 1;
+        } else {
+            caps_given = 1;
+            caps = (uint8_t)v;
+            argv += 2;
+            argc -= 2;
+        }
     }
-    if (argc != 4 && argc != 6) {
+    if (usage || (argc != 4 && argc != 6)) {
         fprintf(stderr, "usage: tool_oc_call hss FILE | tool_oc_call [--caps CAPS] SOCKET|tls:HOST:PORT:PKI:NAME CELL_ID "
                         "BOOT_ID [CALLED SECONDS]\n");
         return 2;

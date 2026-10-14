@@ -135,21 +135,41 @@ grep -q 'playback sent [0-9]* payloads, skipped 0' "$T/log2" || fail "core 2 ski
 # codec negotiation (§6.3; OpenVoxNB spec V7): playback answers with the
 # best codec it has a copy in and sends that copy; over OCSS too; caps it
 # has no copy for get cause 7
-call_caps() { # CAPS CALLED SECONDS -> the tool's output
-    "$CALL" --caps "$1" "$T/core1.sock" 1 7 "$2" "$3" >"$T/call" || fail "call to $2 with caps $1: $(cat "$T/call")"
+call_caps() { # CAPS CALLED SECONDS -> the tool's output; non-zero if the call failed
+    "$CALL" --caps "$1" "$T/core1.sock" 1 7 "$2" "$3" >"$T/call" || return 1
     cat "$T/call"
 }
-out=$(call_caps 0x21 +883160655500101 1)
+out=$(call_caps 0x21 +883160655500101 1) || fail "call with caps 0x21: $out"
 expect "$out" "answered codec 6"
 expect "$out" "^len 18$"
-out=$(call_caps 0x04 +883160655500101 1)
+out=$(call_caps 0x04 +883160655500101 1) || fail "call with caps 0x04: $out"
 expect "$out" "answered codec 3"
 expect "$out" "^len 9$"
-out=$(call_caps 0x21 +883150355500101 1) # core 2's playback: the caps cross OCSS 2
+out=$(call_caps 0x21 +883150355500101 1) || fail "call to core 2 with caps 0x21: $out" # core 2's playback: the caps cross OCSS 2
 expect "$out" "answered codec 6"
 expect "$out" "^len 18$"
 "$CALL" --caps 0x02 "$T/core1.sock" 1 7 +883160655500101 1 >"$T/call" && fail "LPCNet only was answered"
 expect "$(cat "$T/call")" "released cause 7"
+# caps 0 goes out in the new form and ends at once with cause 7 (R6)
+"$CALL" --caps 0 "$T/core1.sock" 1 7 +883160655500101 1 >"$T/call" && fail "caps 0 was answered"
+expect "$(cat "$T/call")" "released cause 7"
+# --caps is parsed strictly: text, a value over 0xFF, a negative one and a
+# missing value (the next argument is the socket) are usage errors, exit 2,
+# before any call is made
+for bad in zz 0x100 0x1g -1 ""; do
+    rc=0
+    "$CALL" --caps "$bad" "$T/core1.sock" 1 7 >"$T/call" 2>&1 || rc=$?
+    [ "$rc" -eq 2 ] || fail "--caps '$bad': exit $rc, not 2: $(cat "$T/call")"
+    expect "$(cat "$T/call")" "^usage: tool_oc_call"
+done
+rc=0
+"$CALL" --caps >"$T/call" 2>&1 || rc=$?
+[ "$rc" -eq 2 ] || fail "--caps alone: exit $rc, not 2: $(cat "$T/call")"
+expect "$(cat "$T/call")" "^usage: tool_oc_call"
+rc=0
+"$CALL" --caps "$T/core1.sock" 1 7 +883160655500101 1 >"$T/call" 2>&1 || rc=$?
+[ "$rc" -eq 2 ] || fail "--caps with no value: exit $rc, not 2: $(cat "$T/call")"
+! grep -q 'answered\|released' "$T/call" || fail "--caps with no value made a call: $(cat "$T/call")"
 
 out=$("$OC" admin --socket "$T/admin2.sock" cdr 2>&1) || fail "core 2 cdr: $out"
 expect "$out" "+883160655501234 -> +883150355500101  cells 0 -> 0  answered"

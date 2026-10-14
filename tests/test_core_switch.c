@@ -545,6 +545,26 @@ static void test_an_old_callee_link_gets_the_old_form_or_cause_7(void)
     route_caps(10, LEG + 1u, NA, NB, OC_CODEC_BIT(OC_CODEC_OVX_1200));
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, sent_since(from, 10, OC_CORE_CALL_RELEASE)->u.call.cause);
     TEST_ASSERT_NULL(sent_since(from, 20, OC_CORE_CALL_OFFER));
+
+    /* An old caller cell (protocol 2) to the same old callee: its caps are
+     * 0x01 (what its old-form CALL_ROUTE decodes as), and the CALL_ANSWER
+     * back to it must be in the old form too (N6): an old cell's decoder
+     * refuses the extra byte, and the call would time out. */
+    uint8_t nc[OC_SIG_NUMBER_LEN];
+    number("+883160655501236", nc);
+    TEST_ASSERT_EQUAL_INT(0, oc_core_cell_add(&K, 3, "C", OC_SIG_MODE_PART15, 0));
+    hello_proto(30, 3, 1, OC_CORE_PROTO_MIN);
+    subscriber(nc, 0x0000ccccu, 3);
+    from = NSENT;
+    route_caps(30, LEG, nc, NB, OC_CODEC_BIT(OC_CODEC_C2_1200));
+    o = sent_since(from, 20, OC_CORE_CALL_OFFER);
+    TEST_ASSERT_NOT_NULL(o);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, o->form);
+    call_msg(20, OC_CORE_CALL_ANSWER, o->u.call_offer.call_ref, 0);
+    const oc_core_msg_t *a = sent_since(from, 30, OC_CORE_CALL_ANSWER);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, a->form);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, a->u.call.codec);
 }
 
 /* §6.3: echo sends back whatever comes, so it answers with the best codec

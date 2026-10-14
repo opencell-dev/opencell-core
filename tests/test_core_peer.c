@@ -47,20 +47,38 @@ static int           NCELL;
 static uint8_t       CLIP[2 * OC_CORE_PLAY_BYTES];
 static uint8_t NA[OC_SIG_NUMBER_LEN], ECHO2[OC_SIG_NUMBER_LEN], PLAY2[OC_SIG_NUMBER_LEN], SUB2[OC_SIG_NUMBER_LEN];
 
+/* What the real transports do (oc_conn.c, oc_ocss.c): the message goes
+ * through the wire encoding and back, so the receiver sees only what a
+ * peer of the link's protocol would carry (a struct handed over directly
+ * would hide the form byte and the caps of an old link). */
+static void on_wire(const oc_core_msg_t *in, oc_core_msg_t *out)
+{
+    uint8_t buf[OC_CORE_FRAME_MAX];
+    size_t  n = oc_core_encode(in, buf, sizeof(buf));
+    TEST_ASSERT_TRUE_MESSAGE(n > 0, "encode");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_core_decode(buf, n, out), "decode");
+}
+
 static int send1(void *c, uint32_t link, const oc_core_msg_t *m)
 {
     (void)c;
     if (link == CELL) {
-        CELL_RX[NCELL++ % 256] = *m;
+        on_wire(m, &CELL_RX[NCELL++ % 256]);
     } else if (link == L1 && !CUT) {
-        Q[QT++ % 256] = (frame_t){ 2, *m };
+        Q[QT % 256].to = 2;
+        on_wire(m, &Q[QT % 256].m);
+        QT++;
     }
     return 0;
 }
 static int send2(void *c, uint32_t link, const oc_core_msg_t *m)
 {
     (void)c;
-    if (link == L2 && !CUT) Q[QT++ % 256] = (frame_t){ 1, *m };
+    if (link == L2 && !CUT) {
+        Q[QT % 256].to = 1;
+        on_wire(m, &Q[QT % 256].m);
+        QT++;
+    }
     return 0;
 }
 static void close1(void *c, uint32_t link) { (void)c; C1.closed[C1.nclosed++ % 8] = link; }
@@ -560,6 +578,15 @@ static void test_ocss_versions_and_the_diallers_fallback(void)
     TEST_ASSERT_EQUAL_UINT8(OC_OCSS_PROTO, Q[(QT - 1) % 256].m.u.peer_hello.proto);
 }
 
+/* The newest frame to core `to` of type queued since index at. */
+static const oc_core_msg_t *q_find(int at, int to, uint8_t type)
+{
+    for (int i = QT - 1; i >= at; i--) {
+        if (Q[i % 256].to == to && Q[i % 256].m.type == type) return &Q[i % 256].m;
+    }
+    return NULL;
+}
+
 /* §6.2: a cell's caps cross OCSS 2 in CALL_SETUP, core 2's echo answers
  * with the best of them and the codec comes back over OCSS to the cell.
  * Over an OCSS-1 link (ruling R9) a caller without Codec2 1200 is
@@ -568,6 +595,7 @@ static void test_caps_and_codec_cross_ocss(void)
 {
     world();
     int from = NCELL;
+    int at2 = QT;
     dial_caps(ECHO2, 0x21);
     advance(OC_CORE_ECHO_US);
     const oc_core_msg_t *a = cell_got(from, OC_CORE_CALL_ANSWER);
@@ -575,6 +603,14 @@ static void test_caps_and_codec_cross_ocss(void)
     TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, a->form);
     TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1200, a->u.call.codec);
     cell_msg(OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NORMAL);
+    /* and across OCSS 2 the frames carry the caps and the codec */
+    const oc_core_msg_t *s2 = q_find(at2, 2, OC_OCSS_CALL_SETUP);
+    TEST_ASSERT_NOT_NULL(s2);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, s2->form);
+    TEST_ASSERT_EQUAL_HEX8(0x21, s2->u.setup.caps);
+    const oc_core_msg_t *a2 = q_find(at2, 1, OC_OCSS_CALL_ANSWER);
+    TEST_ASSERT_NOT_NULL(a2);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, a2->form);
 
     oc_core_peer_down(&C1.k, L1, NOW);
     oc_core_peer_down(&C2.k, L2, NOW);
@@ -586,11 +622,35 @@ static void test_caps_and_codec_cross_ocss(void)
     TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, oc_core_peer_form(&C1.k, 2));
     from = NCELL;
     dial_caps(ECHO2, OC_CODEC_BIT(OC_CODEC_OVX_1200));
-    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, cell_got(from, OC_CORE_CALL_RELEASE)->u.call.cause);
+    const oc_core_msg_t *rel = cell_got(from, OC_CORE_CALL_RELEASE);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_CAUSE_NO_CODEC, rel->u.call.cause);
     from = NCELL;
     dial(ECHO2);
     advance(OC_CORE_ECHO_US);
-    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, cell_got(from, OC_CORE_CALL_ANSWER)->u.call.codec);
+    const oc_core_msg_t *ans = cell_got(from, OC_CORE_CALL_ANSWER);
+    TEST_ASSERT_NOT_NULL(ans);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, ans->u.call.codec);
+    cell_msg(OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NORMAL);
+
+    /* N6: over the OCSS-1 link the frames are the old ones, whatever the
+     * caller's caps: core 2 sees caps 0x01 (not 0x21) and its CALL_ANSWER
+     * is the old form (an old core's decoder refuses the longer one). */
+    from = NCELL;
+    int at = QT;
+    dial_caps(ECHO2, 0x21);
+    advance(OC_CORE_ECHO_US);
+    const oc_core_msg_t *s = q_find(at, 2, OC_OCSS_CALL_SETUP);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, s->form);
+    TEST_ASSERT_EQUAL_HEX8(OC_CODEC_BIT(OC_CODEC_C2_1200), s->u.setup.caps);
+    const oc_core_msg_t *pa = q_find(at, 1, OC_OCSS_CALL_ANSWER);
+    TEST_ASSERT_NOT_NULL(pa);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, pa->form);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, pa->u.call.codec);
+    const oc_core_msg_t *ca = cell_got(from, OC_CORE_CALL_ANSWER);
+    TEST_ASSERT_NOT_NULL(ca);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, ca->u.call.codec);
 }
 
 int main(void)

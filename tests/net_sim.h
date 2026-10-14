@@ -269,6 +269,12 @@ static inline void deliver(void)
     for (int i = 0; i < nd; i++) {
         oc_core_msg_t m;
         TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_core_decode(DUE[i].f, DUE[i].n, &m), "decode");
+        /* An old (protocol-2) core's decoder refuses the extended length of
+         * a call message, and its encoder never writes one (N6, ruling R7):
+         * a frame in the codec form on that link is a failure, either way. */
+        if (sim_core_proto_max != 0 && sim_core_proto_max < OC_CORE_PROTO_CODEC) {
+            TEST_ASSERT_EQUAL_UINT8_MESSAGE(OC_CORE_FORM_OLD, m.form, "the codec form on a protocol-2 core link");
+        }
         if (CELL[DUE[i].cell].link != DUE[i].link) continue;
         if (DUE[i].to_core && m.type == OC_CORE_HELLO && sim_core_proto_max != 0 &&
             m.u.hello.proto > sim_core_proto_max) {

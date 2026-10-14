@@ -119,7 +119,7 @@ start 1
 linked 1
 out=$("$OC" admin --socket "$T/admin1.sock" status 2>&1) || fail "status: $out"
 expect "$out" "block 8831503: home core 2, peer linked"
-expect "$out" "playback +883160655500101: clip of 1.20 s (8 kHz WAV), Codec2 1200 10 payloads"
+expect "$out" "playback +883160655500101: clip of 1.20 s (8 kHz WAV), Codec2 1200 10 payloads, OVX-1200 10, OVX-1000 10, OVX-800 10, OVX-600 10"
 grep -q 'ocss: 127.0.0.1:[0-9]*: core 1, certificate .*, accepted' "$T/log2" || fail "core 2 did not log core 1's certificate"
 
 read -r _ n _ gap <<<"$(call +883150355500101 3)" # core 2's playback, through core 1

@@ -478,6 +478,41 @@ static void test_chan_parse_as_ocbench_did(void)
     TEST_ASSERT_EQUAL_STRING("'917.250:fixed': 917.25 MHz twice", err);
 }
 
+/* Codec negotiation §6.3, OpenVoxNB spec V7, ruling R14: status lists each
+ * copy of the playback clip and each call with its codec (or the caps of
+ * one still being set up). */
+static void test_status_names_the_clip_copies_and_each_calls_codec(void)
+{
+    static uint8_t c2[10 * 18], o6[10 * 18], o3[10 * 9];
+    static oc_core_t k;
+    world();
+    oc_sig_number_to_bcd("+883160655500101", 16, cfg.playback_number);
+    cfg.clips[0] = (oc_core_clip_t){ OC_CODEC_C2_1200, c2, sizeof(c2) };
+    cfg.clips[1] = (oc_core_clip_t){ OC_CODEC_OVX_1200, o6, sizeof(o6) };
+    cfg.clips[2] = (oc_core_clip_t){ OC_CODEC_OVX_600, o3, sizeof(o3) };
+    cfg.nclips = 3;
+    memset(&k, 0, sizeof(k));
+    k.calls[0].used = 1;
+    k.calls[0].state = OC_CORE_CALL_ACTIVE;
+    k.calls[0].a.ref = 7;
+    k.calls[0].b.ref = OC_CORE_REF_CORE | 1u;
+    oc_sig_number_to_bcd("+883160655501234", 16, k.calls[0].caller);
+    oc_sig_number_to_bcd("+883160655500101", 16, k.calls[0].called);
+    k.calls[0].codec = OC_CODEC_OVX_1200;
+    k.calls[1] = k.calls[0];
+    k.calls[1].state = OC_CORE_CALL_ROUTING;
+    k.calls[1].a.ref = 8;
+    k.calls[1].caps = 0x21;
+    k.calls[1].codec = OC_CODEC_NONE;
+    adm.core = &k;
+    TEST_ASSERT_EQUAL_INT(0, run("status"));
+    HAS("playback +883160655500101: clip of 1.20 s (8 kHz WAV), Codec2 1200 10 payloads, OVX-1200 10, OVX-600 10\n");
+    HAS("call 00000007/80000001 +883160655501234 -> +883160655500101: active, OVX-1200\n");
+    HAS("call 00000008/80000001 +883160655501234 -> +883160655500101: setting up, caps 0x21\n");
+    adm.core = NULL;
+    done();
+}
+
 /* The commands' ordinary paths: a cell's mode and revocation, the
  * location and call listings, a subscriber disabled twice. */
 static void test_cells_locations_and_calls(void)
@@ -760,6 +795,7 @@ int main(void)
     RUN_TEST(test_import_tells_a_store_error_and_shows_no_keys);
     RUN_TEST(test_chan_parse_as_ocbench_did);
     RUN_TEST(test_cells_locations_and_calls);
+    RUN_TEST(test_status_names_the_clip_copies_and_each_calls_codec);
     RUN_TEST(test_an_allocation_failure_is_a_failure);
     RUN_TEST(test_audit_detail_drops_c1_controls);
     RUN_TEST(test_audit_names_the_operator_behind_sudo);

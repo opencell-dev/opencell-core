@@ -309,6 +309,22 @@ static int cmd_status(oc_admin_t *a, oc_buf_t *o)
     }
     sqlite3_finalize(s);
     if (rc != SQLITE_DONE) bad |= store_error(o, "the cells can't be listed");
+    if (a->core != NULL) { /* the calls now, with their codec (codec negotiation spec §6.3, ruling R14) */
+        for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+            const oc_core_call_t *c = &a->core->calls[i];
+            char from[OC_SIG_NUMBER_TEXT], to[OC_SIG_NUMBER_TEXT];
+            if (!c->used) continue;
+            oc_sig_number_to_text(c->caller, from);
+            oc_sig_number_to_text(c->called, to);
+            if (c->state == OC_CORE_CALL_ACTIVE) {
+                oc_buf_printf(o, "call %08x/%08x %s -> %s: active, %s\n", (unsigned)c->a.ref, (unsigned)c->b.ref, from,
+                              to, oc_codec_name(c->codec));
+            } else {
+                oc_buf_printf(o, "call %08x/%08x %s -> %s: setting up, caps 0x%02x\n", (unsigned)c->a.ref,
+                              (unsigned)c->b.ref, from, to, (unsigned)c->caps);
+            }
+        }
+    }
     if (a->cfg->nclips != 0) { /* core test services spec §5; a copy per codec: OpenVoxNB spec V7 */
         char t[OC_SIG_NUMBER_TEXT];
         const oc_core_clip_t *c0 = &a->cfg->clips[0];

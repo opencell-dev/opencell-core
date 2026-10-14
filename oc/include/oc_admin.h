@@ -9,7 +9,7 @@
  * and C1 control characters and bytes that are not UTF-8 shown as '?'). An
  * output buffer that could not grow (oc_buf_t.err) makes the command's result 1.
  *
- *   status
+ *   status (cells, blocks, the playback clip's copies, each call and its codec)
  *   net init [--period S]                  the network key pair (first setup)
  *   cell add ID NAME [--mode part15|part97] [--list N]
  *   cell mode ID part15|part97             the cell reconnects to take it

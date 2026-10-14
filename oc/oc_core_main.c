@@ -119,7 +119,7 @@ static struct {
     oc_api_t        api;
     oc_apisrv_t     apisrv;
     oc_tls_t       *tls;
-    uint8_t         clip[OC_CORE_CLIP_MAX]; /* the playback service's, from playback_clip */
+    uint8_t         clip[OC_CLIP_CODECS][OC_CORE_CLIP_MAX]; /* the playback service's copies (OpenVoxNB spec V7), from playback_clip */
     oc_ocss_cfg_t   ocss_cfg;               /* npeer 0: no OCSS */
     oc_ocss_t       ocss;
     oc_cellsrv_t    cellsrv; /* must not move while open: its TLS ex_data points into it */
@@ -127,6 +127,7 @@ static struct {
     const char     *cell_listen;
     oc_cellsrv_throttle_t gate_log; /* the HELLO gate's refusals, and TLS links refused for want of a slot */
 } D = { .cell_l = -1, .admin_l = -1, .apisrv = { .lfd = -1 }, .ocss = { .lfd = -1 }, .cellsrv = { .lfd = -1 } };
+_Static_assert(OC_CLIP_CODECS <= OC_CORE_CLIPS, "every copy oc_clip makes fits the core's table");
 
 static volatile sig_atomic_t g_stop;
 
@@ -189,8 +190,8 @@ static const char *const KEYS[] = { "core_id",      "key_id",       "echo",     
                                     "cell_key",     "cell_ca",      NULL };
 
 /* playback_clip: an 8 kHz mono 16-bit WAV (playback clip spec 2026-10-12
- * §4), read whole, encoded with Codec2 1200 into D.clip, then freed. 0 or
- * -1 (logged). */
+ * §4), read whole, encoded with every codec the core serves (OpenVoxNB spec
+ * V7) into D.clip, then freed. 0 or -1 (logged). */
 #define CLIP_FILE_MAX (16u << 20) /* 10 min of samples is 9.6 MB; room for other chunks */
 static ssize_t read_all(int fd, uint8_t *b, size_t n)
 {
@@ -226,19 +227,24 @@ static int load_clip(const char *path)
     } else if ((r = read_all(fd, buf, (size_t)st.st_size)) != (ssize_t)st.st_size) {
         snprintf(why, sizeof(why), "short read");
     } else if (oc_wav_read(buf, (size_t)r, &pcm, &n, why, sizeof(why)) == 0) {
-        bytes = oc_clip_encode_c2_1200(pcm, n, D.clip, sizeof(D.clip));
-        const oc_core_clip_t c2 = { OC_CODEC_C2_1200, D.clip, (uint32_t)bytes };
-        if (bytes == 0 || !oc_core_clip_ok(&c2)) snprintf(why, sizeof(why), "Codec2 1200 encoding failed");
+        for (unsigned i = 0; i < OC_CLIP_CODECS && why[0] == '\0'; i++) {
+            oc_core_clip_t *c = &D.cfg.clips[i];
+            c->codec = oc_clip_codecs[i];
+            c->data = D.clip[i];
+            c->len = (uint32_t)oc_clip_encode(c->codec, pcm, n, D.clip[i], sizeof(D.clip[i]));
+            if (c->len == 0 || !oc_core_clip_ok(c)) snprintf(why, sizeof(why), "%s encoding failed", oc_codec_name(c->codec));
+        }
+        bytes = D.cfg.clips[0].len;
     }
     if (fd >= 0) close(fd);
     free(buf);
     free(pcm);
     if (bytes == 0 || why[0] != '\0') {
         oc_log(OC_LOG_ERR, "config: playback_clip = '%s': %s (tools/clip/oc-clip-gen)", path, why);
+        D.cfg.nclips = 0;
         return -1;
     }
-    D.cfg.clips[0] = (oc_core_clip_t){ OC_CODEC_C2_1200, D.clip, (uint32_t)bytes };
-    D.cfg.nclips = 1;
+    D.cfg.nclips = OC_CLIP_CODECS;
     return 0;
 }
 

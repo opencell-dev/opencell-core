@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "oc_clip.h"
+#include "oc_codec.h"
 #include "oc_core.h"
 #include "unity.h"
 
@@ -222,6 +223,43 @@ static void test_last_odd_chunk_without_pad_is_accepted(void)
     free(pcm);
 }
 
+/* OpenVoxNB spec V7 and §5: the fixture's OVX copies are the bytes
+ * `oc-vox enc` gives on the same samples (ruling R11). */
+static void test_ovx_encoding_gives_oc_vox_enc_bytes(void)
+{
+    static const struct { uint8_t codec; const char *golden; } k[] = {
+        { OC_CODEC_OVX_1200, "clip_fixture.ovx1200" }, { OC_CODEC_OVX_600, "clip_fixture.ovx600" } };
+    size_t rlen, glen;
+    uint8_t *raw = slurp("clip_fixture.raw", &rlen);
+    int16_t *pcm = malloc(rlen);
+    for (size_t i = 0; i < rlen / 2; i++) pcm[i] = (int16_t)(raw[2 * i] | raw[2 * i + 1] << 8);
+    for (unsigned i = 0; i < 2; i++) {
+        uint8_t *g = slurp(k[i].golden, &glen);
+        uint8_t out[16 * OC_CORE_PLAY_BYTES];
+        TEST_ASSERT_EQUAL(10u * oc_codec_block_bytes(k[i].codec), glen);
+        TEST_ASSERT_EQUAL(glen, oc_clip_encode(k[i].codec, pcm, rlen / 2, out, sizeof(out)));
+        TEST_ASSERT_EQUAL_MEMORY(g, out, glen);
+        free(g);
+    }
+    free(pcm);
+    free(raw);
+}
+
+/* Every codec the core serves: one block per 960 samples at its size, the
+ * last one padded; a short buffer or a codec with no encoder gives 0. */
+static void test_every_served_codec_one_block_per_120_ms(void)
+{
+    static int16_t pcm[OC_CLIP_BLOCK + 1];
+    uint8_t out[2 * OC_CORE_PLAY_BYTES];
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, oc_clip_codecs[0]); /* admin status names it first */
+    for (unsigned i = 0; i < OC_CLIP_CODECS; i++) {
+        uint8_t c = oc_clip_codecs[i], b = oc_codec_block_bytes(c);
+        TEST_ASSERT_EQUAL(2u * b, oc_clip_encode(c, pcm, OC_CLIP_BLOCK + 1, out, sizeof(out)));
+        TEST_ASSERT_EQUAL(0, oc_clip_encode(c, pcm, OC_CLIP_BLOCK + 1, out, 2u * b - 1u));
+    }
+    TEST_ASSERT_EQUAL(0, oc_clip_encode(OC_CODEC_LPCNET_1733, pcm, OC_CLIP_BLOCK, out, sizeof(out)));
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -232,6 +270,8 @@ int main(int argc, char **argv)
     g_buf = malloc(2u * OC_CLIP_MAX_SAMPLES + 4096u);
     UNITY_BEGIN();
     RUN_TEST(test_encoding_gives_c2encs_bytes);
+    RUN_TEST(test_ovx_encoding_gives_oc_vox_enc_bytes);
+    RUN_TEST(test_every_served_codec_one_block_per_120_ms);
     RUN_TEST(test_a_part_block_is_padded_to_a_whole_payload);
     RUN_TEST(test_a_short_output_buffer_gives_0);
     RUN_TEST(test_ten_minutes_fills_the_clip_exactly);

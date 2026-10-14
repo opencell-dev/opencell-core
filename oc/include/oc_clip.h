@@ -23,4 +23,17 @@ int oc_wav_read(const uint8_t *buf, size_t len, int16_t **pcm, size_t *n, char *
  * small or the encoder can't be made. */
 size_t oc_clip_encode_c2_1200(const int16_t *pcm, size_t n, uint8_t *out, size_t out_max);
 
+/* The codecs oc-core encodes the clip with, in the order admin status
+ * lists them (OpenVoxNB spec V7). */
+#define OC_CLIP_CODECS 5u
+extern const uint8_t oc_clip_codecs[OC_CLIP_CODECS];
+
+/* n samples of pcm encoded with codec (oc_codec.h: Codec2 1200, or
+ * OVX-600 ... OVX-1200 with oc_vox's fixed-point encoder), padded with
+ * silence to whole OC_CLIP_BLOCKs: one block of oc_codec_block_bytes(codec)
+ * per 960 samples, in order, one encoder for the whole clip - the bytes
+ * c2enc or `oc-vox enc` gives. The bytes written, or 0: a codec with no
+ * encoder here, out_max too small, or an encoder that can't be made. */
+size_t oc_clip_encode(uint8_t codec, const int16_t *pcm, size_t n, uint8_t *out, size_t out_max);
+
 #endif

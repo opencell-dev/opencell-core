@@ -1,5 +1,4 @@
-/* The playback clip (playback clip spec 2026-10-12 §4): the WAV reader and
- * the Codec2 1200 encoder. */
+/* The playback clip (playback clip spec 2026-10-12 §4; OpenVoxNB spec V7): the WAV reader and the encoders. */
 #include "oc_clip.h"
 
 #include <stdio.h>
@@ -7,7 +6,9 @@
 #include <string.h>
 
 #include "codec2.h"
+#include "oc_codec.h"
 #include "oc_core.h"
+#include "oc_vox.h"
 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t le32(const uint8_t *p) { return (uint32_t)le16(p) | (uint32_t)le16(p + 2) << 16; }
@@ -104,4 +105,33 @@ size_t oc_clip_encode_c2_1200(const int16_t *pcm, size_t n, uint8_t *out, size_t
     }
     codec2_destroy(c2);
     return o;
+}
+
+_Static_assert(OC_CLIP_BLOCK == OC_VOX_BLOCK_SAMPLES, "an OpenVoxNB block is the 120 ms clip block");
+
+const uint8_t oc_clip_codecs[OC_CLIP_CODECS] = { OC_CODEC_C2_1200, OC_CODEC_OVX_1200, OC_CODEC_OVX_1000,
+                                                 OC_CODEC_OVX_800, OC_CODEC_OVX_600 };
+
+/* OpenVoxNB: 960 samples to one block of the mode's size, as `oc-vox enc`. */
+static size_t encode_ovx(oc_vox_mode_t mode, const int16_t *pcm, size_t n, uint8_t *out, size_t out_max)
+{
+    oc_vox_enc_t e;
+    int16_t block[OC_VOX_BLOCK_SAMPLES];
+    size_t blocks = (n + OC_CLIP_BLOCK - 1u) / OC_CLIP_BLOCK, bytes = oc_vox_block_bytes(mode);
+    if (bytes == 0 || blocks > out_max / bytes || oc_vox_enc_init(&e, mode) != 0) return 0;
+    for (size_t b = 0; b < blocks; b++) {
+        for (size_t j = 0; j < OC_CLIP_BLOCK; j++) {
+            size_t i = b * OC_CLIP_BLOCK + j;
+            block[j] = i < n ? pcm[i] : 0;
+        }
+        oc_vox_encode(&e, block, out + b * bytes);
+    }
+    return blocks * bytes;
+}
+
+size_t oc_clip_encode(uint8_t codec, const int16_t *pcm, size_t n, uint8_t *out, size_t out_max)
+{
+    if (codec == OC_CODEC_C2_1200) return oc_clip_encode_c2_1200(pcm, n, out, out_max);
+    int mode = oc_vox_mode_of_codec_id(codec);
+    return mode == OC_VOX_MODE_NONE ? 0 : encode_ovx((oc_vox_mode_t)mode, pcm, n, out, out_max);
 }

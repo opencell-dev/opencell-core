@@ -22,6 +22,11 @@ endif()
 add_subdirectory(${OC_FW}/firmware/components/oc_phy oc_phy)
 add_subdirectory(${OC_FW}/firmware/components/oc_link oc_link)
 add_subdirectory(${OC_FW}/firmware/components/oc_sig oc_sig)
+# OpenVoxNB (oc_vox: OpenVoxNB spec V4, V7) for the playback clip's copies:
+# the fixed-point production code only - the floating-point reference stays
+# in the firmware's own tests and tools (ruling R10).
+set(OC_VOX_REF OFF CACHE BOOL "oc_vox's floating-point reference (the firmware's host tests and tools)" FORCE)
+add_subdirectory(${OC_FW}/firmware/components/oc_vox oc_vox)
 add_subdirectory(third_party/codec2)
 add_subdirectory(oc_core)
 add_subdirectory(oc_cell)

@@ -76,6 +76,8 @@ static uint32_t        next_link;
 static oc_core_msg_t   last_loc_update[SIM_CELLS]; /* what each cell last claimed (the rogue-cell test replays it) */
 static unsigned        to_core[SIM_CELLS][256];    /* what each cell sent the core, by type */
 static oc_core_msg_t   last_loc_cancel[SIM_CELLS]; /* the last LOC_CANCEL the core sent each cell */
+static oc_core_msg_t   last_hello[SIM_CELLS];      /* the last HELLO each cell sent */
+static uint8_t         sim_core_proto_max;         /* test hook: != 0, the core is old and refuses a newer HELLO */
 
 static inline int sim_qpush(sim_q_t *q, const uint8_t *p, uint8_t n)
 {
@@ -168,6 +170,7 @@ static int c_send(void *ctx, const oc_core_msg_t *m)
     int i = (int)(s - CELL);
     if (s->link == 0) return -1;
     if (m->type == OC_CORE_LOC_UPDATE) last_loc_update[i] = *m;
+    if (m->type == OC_CORE_HELLO) last_hello[i] = *m;
     to_core[i][m->type]++;
     if (!s->mute) wire_push(1, i, s->link, m);
     return 0;
@@ -267,6 +270,17 @@ static inline void deliver(void)
         oc_core_msg_t m;
         TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_core_decode(DUE[i].f, DUE[i].n, &m), "decode");
         if (CELL[DUE[i].cell].link != DUE[i].link) continue;
+        if (DUE[i].to_core && m.type == OC_CORE_HELLO && sim_core_proto_max != 0 &&
+            m.u.hello.proto > sim_core_proto_max) {
+            /* an old core: HELLO_NAK version, and it drops the link (the
+             * cell's own close, c_close, tells the core side) */
+            oc_core_msg_t nak;
+            memset(&nak, 0, sizeof(nak));
+            nak.type = OC_CORE_HELLO_NAK;
+            nak.u.hello_nak.reason = OC_CORE_NAK_VERSION;
+            oc_cell_core_rx(&CELL[DUE[i].cell].c, &nak, now);
+            continue;
+        }
         if (DUE[i].to_core) {
             oc_core_rx(&CORE, DUE[i].link, &m, now);
         } else {
@@ -330,6 +344,8 @@ static inline void sim_world(void)
     memset(last_loc_update, 0, sizeof(last_loc_update));
     memset(to_core, 0, sizeof(to_core));
     memset(last_loc_cancel, 0, sizeof(last_loc_cancel));
+    memset(last_hello, 0, sizeof(last_hello));
+    sim_core_proto_max = 0;
     NWIRE = 0;
     now = 0;
     next_link = 0;

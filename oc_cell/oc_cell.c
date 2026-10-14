@@ -21,6 +21,8 @@ static void logf_(oc_cell_t *c, const char *fmt, ...)
 static int to_core(oc_cell_t *c, oc_core_msg_t *m)
 {
     if (!c->linked) return -1;
+    /* the call messages take the link's form (codec negotiation spec §6.1, ruling R7) */
+    m->form = c->proto >= OC_CORE_PROTO_CODEC ? OC_CORE_FORM_CODEC : OC_CORE_FORM_OLD;
     c->last_tx = c->now;
     return c->io.core_send(c->io.ctx, m);
 }
@@ -313,7 +315,14 @@ static void n_call(void *ctx, const oc_sig_net_call_ev_t *e)
         memset(&m, 0, sizeof(m));
         m.type = OC_CORE_CALL_ROUTE;
         m.u.call_route.leg_ref = e->call_id;
+        m.u.call_route.caps = e->caps;
         memcpy(m.u.call_route.called, e->number, OC_SIG_NUMBER_LEN);
+        if (c->ready && c->proto < OC_CORE_PROTO_CODEC && !oc_codec_in(e->caps, OC_CODEC_C2_1200)) {
+            /* a protocol-2 core can't carry the caps and means Codec2 1200:
+             * a caller without it can't be connected through it (ruling R9) */
+            oc_sig_net_peer_release(&c->net, e->call_id, OC_SIG_CAUSE_NO_CODEC, c->now);
+            return;
+        }
         if (!c->ready || oc_sig_net_number(&c->net, e->tmid, m.u.call_route.caller) != 0 ||
             leg_new(c, e->call_id, e->call_id, e->tmid) == NULL) {
             oc_sig_net_peer_release(&c->net, e->call_id, OC_SIG_CAUSE_NET_FAILURE, c->now);
@@ -328,7 +337,14 @@ static void n_call(void *ctx, const oc_sig_net_call_ev_t *e)
         if (e->peer_tmid == 0 && l != NULL) call_msg(c, OC_CORE_CALL_ALERT, l->ref, 0);
         return;
     case OC_SIG_NET_ANSWERED:
-        if (e->peer_tmid == 0 && l != NULL) call_msg(c, OC_CORE_CALL_ANSWER, l->ref, 0);
+        if (e->peer_tmid == 0 && l != NULL) { /* the codec the terminal answered with (§6.1) */
+            oc_core_msg_t m;
+            memset(&m, 0, sizeof(m));
+            m.type = OC_CORE_CALL_ANSWER;
+            m.u.call.ref = l->ref;
+            m.u.call.codec = e->codec;
+            to_core(c, &m);
+        }
         return;
     case OC_SIG_NET_ENDED:
         if (l != NULL) {
@@ -363,6 +379,7 @@ void oc_cell_init(oc_cell_t *c, const oc_cell_io_t *io, const oc_cell_cfg_t *cfg
     memset(c, 0, sizeof(*c));
     c->io = *io;
     c->cfg = *cfg;
+    c->hello_proto = OC_CORE_PROTO;
     const oc_sig_net_io_t nio = { c,      n_act_req, n_av_req, n_resync_req, n_registered, n_unregistered,
                                   n_send, n_channel, n_call,   n_log };
     const oc_sig_net_cfg_t ncfg = { cfg->mode, cfg->period_s };
@@ -419,10 +436,11 @@ void oc_cell_core_up(oc_cell_t *c, uint64_t now_us)
     c->now = c->last_rx = c->last_tx = now_us;
     c->linked = 1;
     c->ready = 0;
+    c->proto = 0;
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = OC_CORE_HELLO;
-    m.u.hello.proto = OC_CORE_PROTO;
+    m.u.hello.proto = c->hello_proto;
     m.u.hello.cell_id = c->cfg.cell_id;
     m.u.hello.boot_id = c->cfg.boot_id;
     memcpy(m.u.hello.sw_version, c->cfg.sw_version, 3);
@@ -434,6 +452,10 @@ void oc_cell_core_up(oc_cell_t *c, uint64_t now_us)
 void oc_cell_core_down(oc_cell_t *c, uint64_t now_us)
 {
     c->now = now_us;
+    /* a link accepted at the old version is gone: the core may be upgraded
+     * now, so the next HELLO says the newest again (ruling R8) */
+    if (c->ready && c->proto < OC_CORE_PROTO) c->hello_proto = OC_CORE_PROTO;
+    c->proto = 0;
     c->linked = 0;
     c->ready = 0;
     for (unsigned i = 0; i < OC_SIG_NET_TERMS; i++) {
@@ -455,7 +477,8 @@ static void on_offer(oc_cell_t *c, const oc_core_msg_t *m)
 {
     uint32_t cid = 0;
     uint32_t ref = m->u.call_offer.call_ref;
-    int r = oc_sig_net_call_in(&c->net, m->u.call_offer.callee, m->u.call_offer.caller, c->now, &cid);
+    int r = oc_sig_net_call_in_caps(&c->net, m->u.call_offer.callee, m->u.call_offer.caller, m->u.call_offer.caps,
+                                    c->now, &cid);
     oc_cell_leg_t *l = r == 0 ? leg_new(c, cid, ref, tmid_of_call(c, cid)) : NULL;
     if (r == 0 && l == NULL) { /* no room for the leg */
         oc_sig_net_peer_release(&c->net, cid, OC_SIG_CAUSE_NET_FAILURE, c->now);
@@ -464,6 +487,7 @@ static void on_offer(oc_cell_t *c, const oc_core_msg_t *m)
     if (l != NULL) l->mt = 1;
     if (r == OC_SIG_NET_IN_BUSY) call_msg(c, OC_CORE_CALL_RELEASE, ref, OC_SIG_CAUSE_BUSY);
     if (r == OC_SIG_NET_IN_UNREACHABLE) call_msg(c, OC_CORE_CALL_RELEASE, ref, OC_SIG_CAUSE_UNREACHABLE);
+    if (r == OC_SIG_NET_NO_CODEC) call_msg(c, OC_CORE_CALL_RELEASE, ref, OC_SIG_CAUSE_NO_CODEC);
 }
 
 void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
@@ -473,6 +497,7 @@ void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
     switch (m->type) {
     case OC_CORE_HELLO_ACK:
         c->ready = 1;
+        c->proto = c->hello_proto;
         /* the mode through oc_sig_net_set_mode, never cfg.mode directly: a
          * call registered in the other mode ends (media-gate review I2) */
         if (m->u.hello_ack.mode != c->net.cfg.mode) {
@@ -495,7 +520,7 @@ void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
             const oc_sig_net_sess_t *s = &c->net.s[i];
             if (s->used && s->av_wait && now_us - s->av_at < OC_SIG_NET_ASK_US) ask_av(c, s->tmid);
         }
-        logf_(c, "core: HELLO accepted");
+        logf_(c, "core: HELLO accepted (protocol %u)", c->proto);
         break;
     case OC_CORE_CELL_CFG: /* the core's list for this cell's group: pushed to terminals from now on */
         oc_sig_net_set_chan_list(&c->net, &m->u.cell_cfg.list);
@@ -503,6 +528,12 @@ void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
         break;
     case OC_CORE_HELLO_NAK:
         logf_(c, "core: HELLO refused (%u)", m->u.hello_nak.reason);
+        if (m->u.hello_nak.reason == OC_CORE_NAK_VERSION) {
+            /* an older (or newer) core: the next HELLO says the other
+             * version, and the link it is accepted on keeps it (§6.1) */
+            c->hello_proto = c->hello_proto == OC_CORE_PROTO ? OC_CORE_PROTO_MIN : OC_CORE_PROTO;
+            logf_(c, "core: protocol %u next", c->hello_proto);
+        }
         c->ready = 0;
         if (c->io.core_close != NULL) c->io.core_close(c->io.ctx);
         oc_cell_core_down(c, now_us);
@@ -573,8 +604,8 @@ void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
     case OC_CORE_CALL_ALERT:
         if ((l = leg_by_ref(c, m->u.call.ref)) != NULL) oc_sig_net_peer_alert(&c->net, l->call_id, now_us);
         break;
-    case OC_CORE_CALL_ANSWER:
-        if ((l = leg_by_ref(c, m->u.call.ref)) != NULL) oc_sig_net_peer_answer(&c->net, l->call_id, now_us);
+    case OC_CORE_CALL_ANSWER: /* a codec outside the caps: oc_sig_net releases the leg, cause 7, and its ENDED says so */
+        if ((l = leg_by_ref(c, m->u.call.ref)) != NULL) oc_sig_net_peer_answer_codec(&c->net, l->call_id, m->u.call.codec, now_us);
         break;
     case OC_CORE_CALL_RELEASE:
         if ((l = leg_by_ref(c, m->u.call.ref)) != NULL) {

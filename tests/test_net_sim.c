@@ -510,6 +510,90 @@ static void test_echo_service(void)
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_REGISTERED, state(0));
 }
 
+/* Codec negotiation end to end (§4): T0 on cell 1 offers Codec2 1200 and
+ * OVX-1200 (DIAL_CAPS 0x21); T1 on cell 2 sees them (CALL_CAPS) and answers
+ * OVX-1200; both CONNECTED say it, and so does the core's call. */
+static void test_a_cross_cell_call_agrees_on_a_codec(void)
+{
+    static const uint8_t dc[] = "\x08\x21" "606-555-01231";
+    static const uint8_t ans[] = { OC_SIG_CMD_ANSWER_CODEC, OC_CODEC_OVX_1200 };
+    sim_world();
+    registered_on(0, 0);
+    registered_on(1, 1);
+    forget_events();
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_PROTO, last_hello[0].u.hello.proto);
+    command(0, dc, sizeof(dc) - 1);
+    run_ms(3000);
+    const uint8_t *cc = event(&TERM[1], OC_SIG_EV_CALL_CAPS);
+    TEST_ASSERT_NOT_NULL(cc);
+    TEST_ASSERT_EQUAL_HEX8(0x21, cc[5]);
+    command(1, ans, sizeof(ans));
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_IN_CALL, state(0));
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1200, event(&TERM[0], OC_SIG_EV_CONNECTED)[5]);
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1200, event(&TERM[1], OC_SIG_EV_CONNECTED)[5]);
+    int found = 0;
+    for (unsigned i = 0; i < OC_CORE_CALLS; i++) found |= CORE.calls[i].used && CORE.calls[i].codec == OC_CODEC_OVX_1200;
+    TEST_ASSERT_TRUE(found);
+}
+
+/* §6.3 through a real cell: echo answers with the best of the caps. */
+static void test_echo_through_a_cell_answers_with_the_best_codec(void)
+{
+    static const uint8_t dc[] = "\x08\x24" "606-555-0100"; /* OVX-600 + OVX-1200 */
+    sim_world();
+    registered_on(0, 2);
+    forget_events();
+    command(0, dc, sizeof(dc) - 1);
+    run_ms(6000);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_IN_CALL, state(0));
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_OVX_1200, event(&TERM[0], OC_SIG_EV_CONNECTED)[5]);
+}
+
+/* §6.1, ruling R8: an old core refuses HELLO 3 (version); the cell's next
+ * HELLO says 2, and on that link a call is Codec2 1200 - or, with no
+ * Codec2 1200 in the caller's caps, ends at once with cause 7 (ruling R9).
+ * Once that link drops, the next HELLO tries 3 again. */
+static void test_a_cell_falls_back_to_protocol_2_for_an_old_core(void)
+{
+    static const uint8_t ovx_only[] = "\x08\x20" "606-555-0100";
+    static const uint8_t both[] = "\x08\x21" "606-555-0100";
+    sim_world();
+    registered_on(0, 0);
+    sim_disconnect(0);
+    sim_core_proto_max = OC_CORE_PROTO_MIN; /* the core is an old one now */
+    sim_connect(0);
+    run_ms(500);
+    TEST_ASSERT_FALSE(CELL[0].c.ready);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_PROTO_MIN, CELL[0].c.hello_proto);
+    sim_connect(0); /* the daemon dials again */
+    run_ms(500);
+    TEST_ASSERT_TRUE(CELL[0].c.ready);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_PROTO_MIN, last_hello[0].u.hello.proto);
+
+    forget_events();
+    unsigned routes = to_core[0][OC_CORE_CALL_ROUTE];
+    command(0, ovx_only, sizeof(ovx_only) - 1);
+    run_ms(3000);
+    TEST_ASSERT_EQUAL_INT(OC_SIG_CAUSE_NO_CODEC, ended(0));
+    TEST_ASSERT_EQUAL_UINT(routes, to_core[0][OC_CORE_CALL_ROUTE]); /* never sent to the core */
+
+    forget_events();
+    command(0, both, sizeof(both) - 1);
+    run_ms(6000);
+    TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_IN_CALL, state(0));
+    TEST_ASSERT_EQUAL_UINT8(OC_CODEC_C2_1200, event(&TERM[0], OC_SIG_EV_CONNECTED)[5]);
+    press(0, OC_SIG_CMD_HANGUP);
+    run_ms(3000);
+
+    sim_core_proto_max = 0; /* the core is upgraded */
+    sim_disconnect(0);
+    sim_connect(0);
+    run_ms(500);
+    TEST_ASSERT_TRUE(CELL[0].c.ready);
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_PROTO, last_hello[0].u.hello.proto);
+}
+
 /* T0 and T1 in a call across cells 1 and 2. */
 static void in_a_cross_cell_call(void)
 {
@@ -1123,6 +1207,9 @@ int main(void)
     RUN_TEST(test_reject_busy_unreachable_no_answer);
     RUN_TEST(test_both_dial_each_other_at_once);
     RUN_TEST(test_echo_service);
+    RUN_TEST(test_a_cross_cell_call_agrees_on_a_codec);
+    RUN_TEST(test_echo_through_a_cell_answers_with_the_best_codec);
+    RUN_TEST(test_a_cell_falls_back_to_protocol_2_for_an_old_core);
     RUN_TEST(test_early_media_is_refused_and_counted);
     RUN_TEST(test_a_new_mode_from_the_core_ends_calls);
     RUN_TEST(test_idle_move_between_cells);

@@ -11,7 +11,10 @@
  * Key material in frames: an AV_RES from the core carries each vector's CK
  * and IK. The transport must wipe every buffer it received, decoded or
  * queued an AV_RES frame in (oc_sig_wipe) once oc_cell_core_rx returns, not
- * merely free or reuse it; oc_sig_net keeps the only copy it needs. */
+ * merely free or reuse it; oc_sig_net keeps the only copy it needs.
+ *
+ * HELLO says protocol 3, or 2 after an old core refused it (codec negotiation
+ * spec §6.1); the call messages carry caps and the codec on a protocol-3 link. */
 #ifndef OC_CELL_H
 #define OC_CELL_H
 
@@ -71,6 +74,8 @@ typedef struct {
     oc_sig_net_t  net;
     int           linked; /* the transport is up */
     int           ready;  /* ...and the core accepted HELLO */
+    uint8_t       hello_proto; /* the version the next HELLO says: OC_CORE_PROTO, or OC_CORE_PROTO_MIN after an old core refused it (ruling R8) */
+    uint8_t       proto;       /* the link's, once HELLO_ACK came (0 before): the form of its call messages */
     uint64_t      now, last_rx, last_tx;
     uint16_t      req;
     uint8_t       echo_number[OC_SIG_NUMBER_LEN];

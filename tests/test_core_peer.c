@@ -202,7 +202,7 @@ static void cell_media(const char *s)
     pump();
 }
 
-static void dial(const uint8_t called[OC_SIG_NUMBER_LEN])
+static void dial_caps(const uint8_t called[OC_SIG_NUMBER_LEN], uint8_t caps)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
@@ -210,9 +210,12 @@ static void dial(const uint8_t called[OC_SIG_NUMBER_LEN])
     m.u.call_route.leg_ref = LEG;
     memcpy(m.u.call_route.caller, NA, OC_SIG_NUMBER_LEN);
     memcpy(m.u.call_route.called, called, OC_SIG_NUMBER_LEN);
+    m.u.call_route.caps = caps;
     oc_core_rx(&C1.k, CELL, &m, NOW);
     pump();
 }
+
+static void dial(const uint8_t called[OC_SIG_NUMBER_LEN]) { dial_caps(called, OC_CODEC_CAPS_DEFAULT); }
 
 static const oc_core_cdr_t *last_cdr(core_t *c)
 {
@@ -364,6 +367,7 @@ static uint8_t setup_cause(uint32_t ref, const uint8_t called[OC_SIG_NUMBER_LEN]
     memcpy(m.u.setup.caller, NA, OC_SIG_NUMBER_LEN);
     memcpy(m.u.setup.called, called, OC_SIG_NUMBER_LEN);
     m.u.setup.hop = hop;
+    m.u.setup.caps = OC_CODEC_CAPS_DEFAULT;
     int at = QT;
     oc_core_peer_rx(&C2.k, L2, &m, NOW);
     for (int i = at; i < QT; i++) {
@@ -410,6 +414,7 @@ static void test_both_cores_first_calls_at_once_do_not_collide(void)
     m.u.setup.call_ref = in_ref;
     memcpy(m.u.setup.caller, SUB2, OC_SIG_NUMBER_LEN); /* a subscriber in core 2's own block */
     memcpy(m.u.setup.called, NA, OC_SIG_NUMBER_LEN);   /* core 1's registered subscriber */
+    m.u.setup.caps = OC_CODEC_CAPS_DEFAULT;
     oc_core_peer_rx(&C1.k, L1, &m, NOW);
     const oc_core_msg_t *offer = cell_got(from, OC_CORE_CALL_OFFER);
     TEST_ASSERT_NOT_NULL(offer);
@@ -485,6 +490,7 @@ static void test_a_call_setup_whose_caller_is_not_the_peers_is_refused(void)
     m.u.setup.call_ref = OC_CORE_REF_CORE | 90u;
     memcpy(m.u.setup.caller, SUB2, OC_SIG_NUMBER_LEN); /* core 2's own subscriber */
     memcpy(m.u.setup.called, ECHO2, OC_SIG_NUMBER_LEN);
+    m.u.setup.caps = OC_CODEC_CAPS_DEFAULT;
     int at = QT;
     oc_core_peer_rx(&C2.k, L2, &m, NOW); /* but "sent" as if from peer 1 */
     uint8_t cause = 0xFF;
@@ -511,6 +517,49 @@ static void test_a_peer_flooding_call_setups_is_rate_limited(void)
     TEST_ASSERT_EQUAL_HEX8(OC_SIG_CAUSE_NET_FAILURE, setup_cause(OC_CORE_REF_CORE | (100u + OC_CORE_SETUP_BURST), NA, 0));
 }
 
+/* Codec negotiation §6.2, ruling R8: both cores at OCSS 2 carry the
+ * codec form. A dialler refused for its version (an OCSS-1 peer) dials
+ * again at 1 and stays at 1 on that link (calls still work); once that
+ * link drops, the next dial says 2 again. */
+static void test_ocss_versions_and_the_diallers_fallback(void)
+{
+    world();
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, oc_core_peer_form(&C1.k, 2));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_CODEC, oc_core_peer_form(&C2.k, 1));
+    oc_core_peer_down(&C1.k, L1, NOW);
+    oc_core_peer_down(&C2.k, L2, NOW);
+    QH = QT;
+    oc_core_peer_up(&C1.k, L1, 2, 1, NOW); /* core 1 dials again */
+    TEST_ASSERT_EQUAL_UINT8(OC_OCSS_HELLO, Q[(QT - 1) % 256].m.type);
+    TEST_ASSERT_EQUAL_UINT8(OC_OCSS_PROTO, Q[(QT - 1) % 256].m.u.peer_hello.proto);
+    QH = QT; /* an OCSS-1 core 2 refuses it: */
+    oc_core_msg_t nak;
+    memset(&nak, 0, sizeof(nak));
+    nak.type = OC_OCSS_HELLO_NAK;
+    nak.u.hello_nak.reason = OC_OCSS_NAK_VERSION;
+    oc_core_peer_rx(&C1.k, L1, &nak, NOW);
+    TEST_ASSERT_EQUAL_UINT32(L1, C1.closed[C1.nclosed - 1]);
+    oc_core_peer_up(&C1.k, L1, 2, 1, NOW); /* the transport dials again */
+    TEST_ASSERT_EQUAL_UINT8(OC_OCSS_PROTO_MIN, Q[(QT - 1) % 256].m.u.peer_hello.proto);
+    oc_core_peer_up(&C2.k, L2, 1, 0, NOW);
+    pump();
+    TEST_ASSERT_TRUE(oc_core_peer_linked(&C1.k, 2));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, oc_core_peer_form(&C1.k, 2));
+    TEST_ASSERT_EQUAL_UINT8(OC_CORE_FORM_OLD, oc_core_peer_form(&C2.k, 1));
+
+    int from = NCELL;
+    dial(ECHO2);
+    advance(OC_CORE_ECHO_US);
+    TEST_ASSERT_NOT_NULL(cell_got(from, OC_CORE_CALL_ANSWER)); /* calls work at OCSS 1 */
+    cell_msg(OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NORMAL);
+
+    oc_core_peer_down(&C1.k, L1, NOW); /* the old link goes: core 2 may be new now */
+    oc_core_peer_down(&C2.k, L2, NOW);
+    QH = QT;
+    oc_core_peer_up(&C1.k, L1, 2, 1, NOW);
+    TEST_ASSERT_EQUAL_UINT8(OC_OCSS_PROTO, Q[(QT - 1) % 256].m.u.peer_hello.proto);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -529,5 +578,6 @@ int main(void)
     RUN_TEST(test_a_peer_media_burst_into_the_cell_is_rate_limited);
     RUN_TEST(test_a_call_setup_whose_caller_is_not_the_peers_is_refused);
     RUN_TEST(test_a_peer_flooding_call_setups_is_rate_limited);
+    RUN_TEST(test_ocss_versions_and_the_diallers_fallback);
     return UNITY_END();
 }

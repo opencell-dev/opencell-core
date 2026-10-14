@@ -47,6 +47,35 @@ static oc_core_peer_t *peer_by_id(oc_core_t *k, uint16_t core_id)
     return NULL;
 }
 
+uint8_t oc_core_peer_form(const oc_core_t *k, uint16_t core_id)
+{
+    /* peer_by_id is the one lookup and is shared with writers; this reads only */
+    const oc_core_peer_t *p = peer_by_id((oc_core_t *)k, core_id);
+    return p != NULL && p->proto >= OC_OCSS_PROTO_CODEC ? OC_CORE_FORM_CODEC : OC_CORE_FORM_OLD;
+}
+
+/* Ruling R8: the peers this core dials at the old version. */
+static int ocss_is_old(const oc_core_t *k, uint16_t id)
+{
+    for (unsigned i = 0; i < OC_CORE_PEERS; i++) {
+        if (id != 0 && k->ocss_old[i] == id) return 1;
+    }
+    return 0;
+}
+
+static void ocss_old_set(oc_core_t *k, uint16_t id, int old)
+{
+    for (unsigned i = 0; i < OC_CORE_PEERS; i++) {
+        if (k->ocss_old[i] == id) k->ocss_old[i] = 0;
+    }
+    for (unsigned i = 0; old && i < OC_CORE_PEERS; i++) {
+        if (k->ocss_old[i] == 0) {
+            k->ocss_old[i] = id;
+            return;
+        }
+    }
+}
+
 int oc_core_peer_setup_allowed(oc_core_t *k, uint16_t core_id)
 {
     oc_core_peer_t *p = peer_by_id(k, core_id);
@@ -82,6 +111,9 @@ static void gone(oc_core_t *k, oc_core_peer_t *p, int close)
     uint32_t link = p->link;
     uint16_t id = p->core_id;
     int was_up = p->up;
+    /* a link at the old version dropped: the peer may be upgraded now, so
+     * the next dial says the newest again (ruling R8) */
+    if (was_up && p->dialer && p->proto < OC_OCSS_PROTO) ocss_old_set(k, id, 0);
     p->used = 0;
     if (was_up) {
         oc_core_logf(k, "peer %u: link down", (unsigned)id);
@@ -95,7 +127,10 @@ static void hello_out(oc_core_t *k, oc_core_peer_t *p, uint8_t type)
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = type;
-    m.u.peer_hello.proto = OC_OCSS_PROTO; /* HELLO only: HELLO_ACK does not carry it */
+    if (type == OC_OCSS_HELLO) { /* HELLO only: HELLO_ACK does not carry it */
+        p->proto = ocss_is_old(k, p->core_id) ? OC_OCSS_PROTO_MIN : OC_OCSS_PROTO;
+        m.u.peer_hello.proto = p->proto;
+    }
     m.u.peer_hello.core_id = k->cfg.core_id;
     m.u.peer_hello.table_ver = 0; /* the block table is the config's: no signed table yet */
     send_peer(k, p, &m);
@@ -139,8 +174,8 @@ static void up(oc_core_t *k, oc_core_peer_t *p)
         if (o != p && o->used && o->core_id == p->core_id) gone(k, o, 1);
     }
     p->up = 1;
-    oc_core_logf(k, "peer %u: up (link %u, %s)", (unsigned)p->core_id, (unsigned)p->link,
-                 p->dialer ? "dialled" : "accepted");
+    oc_core_logf(k, "peer %u: up (link %u, %s, OCSS %u)", (unsigned)p->core_id, (unsigned)p->link,
+                 p->dialer ? "dialled" : "accepted", (unsigned)p->proto);
 }
 
 static void refuse(oc_core_t *k, oc_core_peer_t *p, uint8_t reason, unsigned claimed)
@@ -166,11 +201,12 @@ void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64
     switch (m->type) {
     case OC_OCSS_HELLO:
         if (p->dialer || p->up) return; /* only the dialler says HELLO, once */
-        if (m->u.peer_hello.proto != OC_OCSS_PROTO) {
+        if (m->u.peer_hello.proto < OC_OCSS_PROTO_MIN || m->u.peer_hello.proto > OC_OCSS_PROTO) {
             refuse(k, p, OC_OCSS_NAK_VERSION, m->u.peer_hello.core_id);
         } else if (m->u.peer_hello.core_id != p->core_id) {
             refuse(k, p, OC_OCSS_NAK_WRONG_CORE, m->u.peer_hello.core_id);
         } else {
+            p->proto = m->u.peer_hello.proto;
             hello_out(k, p, OC_OCSS_HELLO_ACK);
             up(k, p);
         }
@@ -185,6 +221,11 @@ void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64
         return;
     case OC_OCSS_HELLO_NAK:
         oc_core_logf(k, "peer %u: refused our HELLO (%u)", (unsigned)p->core_id, (unsigned)m->u.hello_nak.reason);
+        /* refused for the version it said (an older or newer peer, codec
+         * negotiation spec §6.2): the next dial says the other one */
+        if (p->dialer && !p->up && m->u.hello_nak.reason == OC_OCSS_NAK_VERSION) {
+            ocss_old_set(k, p->core_id, p->proto == OC_OCSS_PROTO);
+        }
         gone(k, p, 1);
         return;
     case OC_OCSS_PING: {

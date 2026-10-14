@@ -115,6 +115,7 @@ typedef struct {
     uint16_t core_id;
     uint8_t  dialer; /* this core dialled: it says HELLO */
     uint8_t  up;
+    uint8_t  proto;  /* the OCSS version of this link: its HELLO's (the dialler's own; HELLO_ACK has none) */
     uint64_t since; /* link_up: a link not up 10 s later is dropped */
     uint64_t last_rx, last_tx;
     /* review M3: a per-peer CALL_SETUP budget (OC_CORE_SETUP_RATE_HZ,
@@ -159,6 +160,9 @@ typedef struct {
     uint64_t        prune_at; /* next pruning of issued vectors */
     oc_core_call_t  calls[OC_CORE_CALLS];
     oc_core_peer_t  peers[OC_CORE_PEERS];
+    /* peer cores that refused HELLO at OC_OCSS_PROTO (HELLO_NAK version):
+     * dialled at OC_OCSS_PROTO_MIN until a link at it drops (ruling R8); 0: free */
+    uint16_t        ocss_old[OC_CORE_PEERS];
     uint32_t        next_ref; /* wraps at 2^30 (bit 31 is OC_CORE_REF_CORE, bit 30 OC_CORE_REF_DIR for a peer leg's ref: review I1); safe since calls[] does not survive a core restart (§7.10) */
 } oc_core_t;
 
@@ -193,6 +197,9 @@ void oc_core_peer_down(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
 /* 1 if a link to core_id is up (HELLO done). */
 int  oc_core_peer_linked(const oc_core_t *k, uint16_t core_id);
+/* The form the call messages take on the up link to core_id (codec
+ * negotiation spec §6.2): CODEC at OCSS 2, OLD at 1 (or with no link). */
+uint8_t oc_core_peer_form(const oc_core_t *k, uint16_t core_id);
 
 /* The form the call messages take on cell_id's link (codec negotiation
  * spec §6.1): OC_CORE_FORM_CODEC on a protocol-3 link, OLD otherwise (or

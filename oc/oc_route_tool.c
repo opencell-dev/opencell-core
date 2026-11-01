@@ -6,7 +6,8 @@
  *   oc-route keygen KEY
  *   oc-route pub KEY
  *   oc-route make ROOT_KEY OUT --version N --npa CSV --core ID=NAME... --east ID --west ID
- *                 [--prev OLD.tbl --floor MAX] [--pin NPA=IDX]... [--delegate PUBHEX [--valid-days D]]...
+ *                 [--prev OLD.tbl --floor MAX] [--pin NPA=IDX]... [--home NPA=CORE_ID]...
+ *                 [--delegate PUBHEX [--valid-days D]]...
  *                 [--revoke PUBHEX]... [--now UNIX]
  *   oc-route add DELEGATE_KEY BASE.tbl OUT --seq N --npa NPA,STATE[,IDX]... [--now UNIX]
  *   oc-route show FILE [--root PUBHEX]    (a table: PUBHEX is the root key; an addition: its delegate's)
@@ -30,7 +31,8 @@ static int usage(void)
     fprintf(stderr,
             "usage: oc-route keygen KEY | pub KEY\n"
             "       oc-route make ROOT_KEY OUT --version N --npa CSV --core ID=NAME... --east ID --west ID\n"
-            "                     [--prev OLD.tbl --floor MAX] [--pin NPA=IDX]... [--delegate PUBHEX [--valid-days D]]...\n"
+            "                     [--prev OLD.tbl --floor MAX] [--pin NPA=IDX]... [--home NPA=CORE_ID]...\n"
+            "                     [--delegate PUBHEX [--valid-days D]]...\n"
             "                     [--revoke PUBHEX]... [--now UNIX]\n"
             "       oc-route add DELEGATE_KEY BASE.tbl OUT --seq N --npa NPA,STATE[,IDX]... [--now UNIX]\n"
             "       oc-route show FILE [--root PUBHEX]\n");
@@ -137,6 +139,8 @@ static int cmd_make(int argc, char **argv)
     unsigned ndeleg = 0;
     struct { unsigned npa; long idx; } pins[64];
     unsigned npin = 0;
+    struct { unsigned npa; long core; int used; } homes[64]; /* --home: an override of the state rule */
+    unsigned nhome = 0;
     memset(&T, 0, sizeof(T));
     for (int i = 4; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -179,6 +183,13 @@ static int cmd_make(int argc, char **argv)
             if (npin >= 64 || sscanf(v, "%3u=%ld", &npa, &idx) != 2 || idx < 1 || idx > 65535) return die("--pin NPA=IDX");
             pins[npin].npa = npa;
             pins[npin++].idx = idx;
+        } else if (strcmp(a, "--home") == 0) {
+            unsigned npa;
+            long core;
+            if (nhome >= 64 || sscanf(v, "%3u=%ld", &npa, &core) != 2 || core < 1 || core > 65535) return die("--home NPA=CORE_ID");
+            homes[nhome].npa = npa;
+            homes[nhome].core = core;
+            homes[nhome++].used = 0;
         } else if (strcmp(a, "--delegate") == 0) {
             if (ndeleg >= OC_RTBL_DELEGS || oc_rtbl_unhex(v, deleg[ndeleg], 32) != 0) return die("--delegate PUBHEX");
             ndeleg++;
@@ -265,6 +276,12 @@ static int cmd_make(int argc, char **argv)
         b->home = (uint16_t)(is_east ? east : west);
         b->nsec = 1;
         b->sec[0] = (uint16_t)(is_east ? west : east);
+        for (unsigned h = 0; h < nhome; h++) { /* the operator's override; the other side's core is the secondary */
+            if (homes[h].npa != rows[i].npa) continue;
+            b->home = (uint16_t)homes[h].core;
+            b->sec[0] = (uint16_t)(homes[h].core == east ? west : east);
+            homes[h].used = 1;
+        }
         b->tenant = 1;
         b->epoch = 1;
         snprintf(b->state, sizeof(b->state), "%s", rows[i].state);
@@ -282,6 +299,19 @@ static int cmd_make(int argc, char **argv)
             b->idx = ++hw;
         }
         T.nblocks++;
+    }
+    for (unsigned h = 0; h < nhome; h++) {
+        int known = 0;
+        for (unsigned c = 0; c < T.ncores; c++) known |= T.cores[c].id == homes[h].core;
+        if (!known) {
+            fprintf(stderr, "oc-route: --home %03u=%ld: core %ld is not in the directory\n", homes[h].npa, homes[h].core,
+                    homes[h].core);
+            return 1;
+        }
+        if (!homes[h].used) {
+            fprintf(stderr, "oc-route: --home: NPA %03u is not in the CSV\n", homes[h].npa);
+            return 1;
+        }
     }
     for (unsigned p = 0; prev != NULL && p < PREV.nblocks; p++) { /* never dropped silently */
         int found = 0;

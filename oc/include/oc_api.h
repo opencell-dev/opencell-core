@@ -24,7 +24,9 @@
  *   0x05 sub.status       number                         number, activated (1), disabled (1),
  *                                                        token expiry (4, 0 none), registered (1),
  *                                                        cell (4, 0 none), the TMID's top 16 bits (2),
- *                                                        last seen (4, unix s, 0 never)
+ *                                                        last seen (4, unix s, 0 never), serving core
+ *                                                        (2, v0.7.1: the core whose cell it is, this
+ *                                                        core's id for its own; 0 not registered)
  *   0x06 sub.release      number                         -  (ok, too, when the number is free already:
  *                                                        released by the 72 h job, or never taken)
  *   0x07 sub.disable      number                         -

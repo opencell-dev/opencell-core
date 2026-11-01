@@ -38,6 +38,21 @@ grep -q "^delegate $DEL scope 1 valid 1793500000-1825036000 east core 1 (53 stat
     fail "delegation"
 ! "$TOOL" show "$T/v1.tbl" --root "$DEL" >/dev/null || fail "verified with the wrong key"
 
+# --home: an override of the state rule, for an NPA in the CSV and a directory core
+"$TOOL" make "$T/root.key" "$T/h.tbl" --version 1 --npa "$T/npa.csv" --core 1=oc-core-1 --core 2=oc-core-2 \
+    --east 1 --west 2 --pin 606=1 --pin 503=2 --pin 865=3 --home 606=2 --home 907=1 >/dev/null
+"$TOOL" show "$T/h.tbl" --root "$ROOT" > "$T/showh"
+grep -q '^block 8831606 1 home 2 secondary 1 tenant 1 epoch 1 state US-KY$' "$T/showh" || fail "--home 606=2"
+grep -q '^block 8831907 7 home 1 secondary 2 ' "$T/showh" || fail "--home 907=1"
+grep -q '^block 8831865 3 home 1 secondary 2 ' "$T/showh" || fail "--home leaves the others to the state rule"
+! "$TOOL" make "$T/root.key" "$T/h2.tbl" --version 1 --npa "$T/npa.csv" --core 1=a --core 2=b --east 1 --west 2 \
+    --home 999=1 2>"$T/err" >/dev/null || fail "--home for an NPA not in the CSV"
+grep -q 'NPA 999 is not in the CSV' "$T/err" || fail "--home's reason"
+! "$TOOL" make "$T/root.key" "$T/h2.tbl" --version 1 --npa "$T/npa.csv" --core 1=a --core 2=b --east 1 --west 2 \
+    --home 606=3 2>"$T/err" >/dev/null || fail "--home to a core not in the directory"
+grep -q 'core 3 is not in the directory' "$T/err" || fail "--home's core reason"
+[ ! -e "$T/h2.tbl" ] || fail "a refused table was written"
+
 # v2: one NPA more, one less; indexes kept, the dropped block kept, the new one above max_idx
 grep -v '^201' "$T/npa.csv" > "$T/npa2.csv"
 echo '472,US-NC' >> "$T/npa2.csv"

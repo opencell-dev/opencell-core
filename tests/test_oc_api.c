@@ -284,7 +284,8 @@ static void test_a_number_is_created_seen_and_released(void)
 
     TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_STATUS, N, 42));
     const uint8_t *b = ANS[0].body;
-    TEST_ASSERT_EQUAL_UINT(8 + 1 + 1 + 4 + 1 + 4 + 2 + 4, ANS[0].n);
+    TEST_ASSERT_EQUAL_UINT(8 + 1 + 1 + 4 + 1 + 4 + 2 + 4 + 2, ANS[0].n);
+    TEST_ASSERT_EQUAL_UINT16(0, get16(b + 25)); /* serving core: 0, not registered */
     TEST_ASSERT_EQUAL_UINT8(0, b[8]);  /* not activated */
     TEST_ASSERT_EQUAL_UINT8(0, b[9]);  /* not disabled */
     TEST_ASSERT_EQUAL_UINT32(UNIX0 + OC_API_TOKEN_S, get32(b + 10));
@@ -1222,6 +1223,45 @@ static void test_ocss_status_and_core_blocks(void)
     done();
 }
 
+/* sub.status's serving core (OCSS spec 2026-11-01 §5.6): this core for its
+ * own cell, the visited core for a subscriber located on another core, 0
+ * when not registered or the location has expired. */
+static void test_sub_status_names_the_serving_core(void)
+{
+    world();
+    const char *N = "+883171746412345";
+    uint8_t n[OC_SIG_NUMBER_LEN];
+    TEST_ASSERT_EQUAL_INT(0, oc_sig_number_to_bcd(N, strlen(N), n));
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_CREATE, N, 42));
+    oc_core_store_t st = oc_sql_store(sql);
+    oc_core_loc_t l;
+    memset(&l, 0, sizeof(l));
+    memcpy(l.number, n, OC_SIG_NUMBER_LEN);
+    l.cell_id = 3;
+    l.tmid = 0x76ae1ae8u;
+    l.expires = UNIX0 + 3600u;
+
+    TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l)); /* on this core's cell 3 */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_STATUS, N, 42));
+    TEST_ASSERT_EQUAL_UINT8(1, ANS[0].body[14]);
+    TEST_ASSERT_EQUAL_UINT32(3, get32(ANS[0].body + 15));
+    TEST_ASSERT_EQUAL_UINT16(1, get16(ANS[0].body + 25));
+
+    l.core = 2; /* on core 2's cell 3: the id is that core's */
+    TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_STATUS, N, 42));
+    TEST_ASSERT_EQUAL_UINT8(1, ANS[0].body[14]);
+    TEST_ASSERT_EQUAL_UINT32(3, get32(ANS[0].body + 15));
+    TEST_ASSERT_EQUAL_UINT16(2, get16(ANS[0].body + 25));
+
+    wall = UNIX0 + 3600u; /* expired: not registered, whichever core it was */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, num_op(OC_API_SUB_STATUS, N, 42));
+    TEST_ASSERT_EQUAL_UINT8(0, ANS[0].body[14]);
+    TEST_ASSERT_EQUAL_UINT32(0, get32(ANS[0].body + 15));
+    TEST_ASSERT_EQUAL_UINT16(0, get16(ANS[0].body + 25));
+    done();
+}
+
 /* route.offer and route.status (OCSS spec 2026-11-01 §5.1-5.3) over the
  * request bytes, with a signed table of 1000 blocks; core.blocks lists
  * them all over several frames. */
@@ -1469,6 +1509,7 @@ int main(void)
     RUN_TEST(test_audit_list);
     RUN_TEST(test_ocss_status_and_core_blocks);
     RUN_TEST(test_route_offer_and_status);
+    RUN_TEST(test_sub_status_names_the_serving_core);
     RUN_TEST(test_cell_mode);
     RUN_TEST(test_reg_list_with_a_cursor_is_audited);
     return UNITY_END();

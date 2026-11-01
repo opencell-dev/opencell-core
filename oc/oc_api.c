@@ -464,12 +464,13 @@ static uint8_t op_sub_status(call_t *c)
     int g = sub_get(c->a, n, &s);
     if (g == OC_CORE_STORE_NONE) return fail(c, OC_API_NOT_FOUND, "not a subscriber");
     if (g != 0) return fail(c, OC_API_UNAVAILABLE, "store error");
-    long long expiry = 0, cell = 0, expires = 0;
+    long long expiry = 0, cell = 0, expires = 0, loc_core = 0;
     int ge = s.activated ? 1 : one_int(c->a, "SELECT expiry FROM token WHERE number = ?1 AND used_at = 0", n, &expiry);
-    int gc = one_int(c->a, "SELECT CASE WHEN core = 0 THEN cell_id ELSE 0 END FROM location WHERE number = ?1" /* on another core: cell 0 (OCSS spec §6) */, n, &cell);
+    int gc = one_int(c->a, "SELECT cell_id FROM location WHERE number = ?1", n, &cell);
     int gx = one_int(c->a, "SELECT expires FROM location WHERE number = ?1", n, &expires);
+    int gk = one_int(c->a, "SELECT core FROM location WHERE number = ?1", n, &loc_core);
     long long seen = last_seen(c->a, n);
-    if (ge < 0 || gc < 0 || gx < 0 || seen < 0) return fail(c, OC_API_UNAVAILABLE, "store error");
+    if (ge < 0 || gc < 0 || gx < 0 || gk < 0 || seen < 0) return fail(c, OC_API_UNAVAILABLE, "store error");
     int registered = gx == 0 && expires > (long long)c->a->unix_now();
     wr_bytes(&c->w, n, OC_SIG_NUMBER_LEN);
     wr_u8(&c->w, s.activated ? 1 : 0);
@@ -479,6 +480,8 @@ static uint8_t op_sub_status(call_t *c)
     wr_u32(&c->w, registered ? (uint32_t)cell : 0);
     wr_u16(&c->w, s.activated ? (uint16_t)(s.tmid >> 16) : 0);
     wr_u32(&c->w, (uint32_t)seen);
+    /* v0.7.1: whose cell that is (cell ids are per core; OCSS spec §5.6) */
+    wr_u16(&c->w, !registered ? 0 : loc_core != 0 ? (uint16_t)loc_core : c->a->cfg->core_id);
     return OC_API_OK;
 }
 

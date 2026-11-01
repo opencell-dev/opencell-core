@@ -55,7 +55,9 @@
 #define OC_CORE_AV_MAX    4u
 #define OC_CORE_REF_CORE  0x80000000u
 #define OC_CORE_REF_DIR   0x40000000u /* an OCSS call_ref: set by the calling core when self > peer (review I1) */
-#define OC_OCSS_PROTO       2u /* 2: OCSS CALL_SETUP carries caps, CALL_ANSWER the codec (§6.2) */
+#define OC_OCSS_PROTO       3u /* 3: + mobility and TMID_BOUND (OCSS spec 2026-11-01 §4.2) */
+#define OC_OCSS_PROTO_MOB   3u /* the first OCSS version with visiting subscribers */
+/* 2: OCSS CALL_SETUP carries caps, CALL_ANSWER the codec (§6.2) */
 #define OC_OCSS_PROTO_MIN   1u /* 1: the test-services slice: link and call control only */
 #define OC_OCSS_PROTO_CODEC 2u
 /* The two shapes of the call messages protocol 3 (OCSS 2) extended: OLD,
@@ -80,6 +82,12 @@ typedef enum {
     OC_CORE_CALL_RELEASE = 0x24, OC_CORE_MEDIA = 0x28,
     /* OCSS (core <-> core) */
     OC_OCSS_HELLO = 0x41, OC_OCSS_HELLO_ACK = 0x42, OC_OCSS_HELLO_NAK = 0x43, OC_OCSS_PING = 0x44, OC_OCSS_PONG = 0x45,
+    /* OCSS 3 (OCSS spec 2026-11-01 §4.2): routing and mobility */
+    OC_OCSS_TMID_BOUND = 0x48,
+    OC_OCSS_ACT_RELAY = 0x50, OC_OCSS_ACT_RES = 0x51, OC_OCSS_AV_RELAY = 0x52, OC_OCSS_AV_RES = 0x53,
+    OC_OCSS_RESYNC_RELAY = 0x54,
+    OC_OCSS_LOC_UPDATE = 0x58, OC_OCSS_LOC_PURGE = 0x59, OC_OCSS_LOC_CANCEL = 0x5A, OC_OCSS_LOC_ACK = 0x5B,
+    OC_OCSS_LOCATE = 0x5C, OC_OCSS_LOCATE_RES = 0x5D, OC_OCSS_CDR = 0x5E,
     OC_OCSS_CALL_SETUP = 0x60, OC_OCSS_CALL_ALERT = 0x62, OC_OCSS_CALL_ANSWER = 0x63, OC_OCSS_CALL_RELEASE = 0x64,
     OC_OCSS_MEDIA = 0x68
 } oc_core_type_t;
@@ -122,6 +130,9 @@ _Static_assert((int)OC_CORE_AV_OK == (int)OC_SIG_AV_OK &&
                    (int)OC_CORE_AV_UNAVAILABLE == (int)OC_SIG_AV_UNAVAILABLE &&
                    (int)OC_CORE_AV_AUTH_FAILED == (int)OC_SIG_AV_AUTH_FAILED,
                "AV_RES status values are oc_sig_net_av_done's");
+/* LOCATE_RES status (OCSS spec §4.2) */
+typedef enum { OC_OCSS_LOC_OK = 0, OC_OCSS_LOC_NOT_REACHABLE = 1, OC_OCSS_LOC_UNAVAILABLE = 2, OC_OCSS_LOC_NOT_HOME = 3 } oc_ocss_locate_status_t;
+
 typedef enum { OC_CORE_CANCEL_MOVED = 1, OC_CORE_CANCEL_REACTIVATED = 2, OC_CORE_CANCEL_DISABLED = 3 } oc_core_cancel_t;
 
 /* One radio (W12 board) of a cell, as CELL_STATUS carries it: 48 bytes on
@@ -195,7 +206,34 @@ typedef struct {
          * the block table it routes by (0: its config, no signed table yet) */
         struct { uint8_t proto; uint16_t core_id; uint32_t table_ver; } peer_hello; /* HELLO_ACK: no proto */
         struct { uint32_t call_ref; uint8_t caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN]; uint8_t hop, caps; } setup;
-        /* OCSS HELLO_NAK uses hello_nak; CALL_ALERT, _ANSWER, _RELEASE use call */
+        /* OCSS HELLO_NAK uses hello_nak; CALL_ALERT, _ANSWER, _RELEASE use call.
+         * OCSS 3 (OCSS spec §4.2): ACT_RES uses act_res, AV_RES av_res;
+         * cell is the serving core's cell id */
+        struct { uint32_t tmid; } tmid_bound;
+        struct { uint16_t req; uint32_t tmid; uint8_t token_id[8], pkt[32], tag[8]; uint32_t cell; } act_relay;
+        struct { uint16_t req; uint32_t tmid; uint8_t count; uint32_t cell; } av_relay;
+        struct { uint16_t req; uint32_t tmid; uint8_t rand[16], auts[14]; uint32_t cell; } resync_relay;
+        struct {
+            uint16_t req;
+            uint32_t tmid;
+            uint8_t  number[OC_SIG_NUMBER_LEN], rand[16], res[8];
+            uint32_t cell, life_s;
+        } peer_loc;
+        struct { uint32_t tmid; uint8_t number[OC_SIG_NUMBER_LEN]; uint32_t cell; } peer_purge;
+        struct { uint32_t tmid; uint8_t cause, rand[16], number[OC_SIG_NUMBER_LEN]; uint32_t cell; } peer_cancel;
+        struct { uint16_t req; uint32_t tmid; uint8_t number[OC_SIG_NUMBER_LEN], status; } loc_ack;
+        struct { uint16_t req; uint8_t number[OC_SIG_NUMBER_LEN]; } locate;
+        struct {
+            uint16_t req;
+            uint8_t  number[OC_SIG_NUMBER_LEN], status;
+            uint16_t core;
+            uint32_t cell, tmid;
+        } locate_res;
+        struct {
+            uint8_t  caller[OC_SIG_NUMBER_LEN], called[OC_SIG_NUMBER_LEN];
+            uint32_t setup, answer, end;
+            uint8_t  cause;
+        } cdr;
     } u;
 } oc_core_msg_t;
 

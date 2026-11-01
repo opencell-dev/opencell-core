@@ -208,6 +208,77 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         for (uint8_t i = 0; i < nt; i++) w_term(&w, &m->u.cell_status.term[i]);
         break;
     }
+    case OC_OCSS_TMID_BOUND:
+        w32(&w, m->u.tmid_bound.tmid);
+        break;
+    case OC_OCSS_ACT_RELAY:
+        w16(&w, m->u.act_relay.req);
+        w32(&w, m->u.act_relay.tmid);
+        wb(&w, m->u.act_relay.token_id, 8);
+        wb(&w, m->u.act_relay.pkt, 32);
+        wb(&w, m->u.act_relay.tag, 8);
+        w32(&w, m->u.act_relay.cell);
+        break;
+    case OC_OCSS_AV_RELAY:
+        w16(&w, m->u.av_relay.req);
+        w32(&w, m->u.av_relay.tmid);
+        w8(&w, m->u.av_relay.count);
+        w32(&w, m->u.av_relay.cell);
+        break;
+    case OC_OCSS_RESYNC_RELAY:
+        w16(&w, m->u.resync_relay.req);
+        w32(&w, m->u.resync_relay.tmid);
+        wb(&w, m->u.resync_relay.rand, 16);
+        wb(&w, m->u.resync_relay.auts, 14);
+        w32(&w, m->u.resync_relay.cell);
+        break;
+    case OC_OCSS_LOC_UPDATE:
+        w16(&w, m->u.peer_loc.req);
+        w32(&w, m->u.peer_loc.tmid);
+        wb(&w, m->u.peer_loc.number, OC_SIG_NUMBER_LEN);
+        wb(&w, m->u.peer_loc.rand, 16);
+        wb(&w, m->u.peer_loc.res, 8);
+        w32(&w, m->u.peer_loc.cell);
+        w32(&w, m->u.peer_loc.life_s);
+        break;
+    case OC_OCSS_LOC_PURGE:
+        w32(&w, m->u.peer_purge.tmid);
+        wb(&w, m->u.peer_purge.number, OC_SIG_NUMBER_LEN);
+        w32(&w, m->u.peer_purge.cell);
+        break;
+    case OC_OCSS_LOC_CANCEL:
+        w32(&w, m->u.peer_cancel.tmid);
+        w8(&w, m->u.peer_cancel.cause);
+        wb(&w, m->u.peer_cancel.rand, 16);
+        wb(&w, m->u.peer_cancel.number, OC_SIG_NUMBER_LEN);
+        w32(&w, m->u.peer_cancel.cell);
+        break;
+    case OC_OCSS_LOC_ACK:
+        w16(&w, m->u.loc_ack.req);
+        w32(&w, m->u.loc_ack.tmid);
+        wb(&w, m->u.loc_ack.number, OC_SIG_NUMBER_LEN);
+        w8(&w, m->u.loc_ack.status);
+        break;
+    case OC_OCSS_LOCATE:
+        w16(&w, m->u.locate.req);
+        wb(&w, m->u.locate.number, OC_SIG_NUMBER_LEN);
+        break;
+    case OC_OCSS_LOCATE_RES:
+        w16(&w, m->u.locate_res.req);
+        wb(&w, m->u.locate_res.number, OC_SIG_NUMBER_LEN);
+        w8(&w, m->u.locate_res.status);
+        w16(&w, m->u.locate_res.core);
+        w32(&w, m->u.locate_res.cell);
+        w32(&w, m->u.locate_res.tmid);
+        break;
+    case OC_OCSS_CDR:
+        wb(&w, m->u.cdr.caller, OC_SIG_NUMBER_LEN);
+        wb(&w, m->u.cdr.called, OC_SIG_NUMBER_LEN);
+        w32(&w, m->u.cdr.setup);
+        w32(&w, m->u.cdr.answer);
+        w32(&w, m->u.cdr.end);
+        w8(&w, m->u.cdr.cause);
+        break;
     case OC_CORE_ACT_FWD:
         w16(&w, m->u.act_fwd.req);
         w32(&w, m->u.act_fwd.tmid);
@@ -216,6 +287,7 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         wb(&w, m->u.act_fwd.tag, 8);
         break;
     case OC_CORE_ACT_RES:
+    case OC_OCSS_ACT_RES:
         if (m->u.act_res.msg.type != OC_SIG_ACT_ACK && m->u.act_res.msg.type != OC_SIG_ACT_NAK) return 0;
         sn = oc_sig_body_encode(&m->u.act_res.msg, sig, sizeof(sig));
         if (sn == 0) return 0;
@@ -230,6 +302,7 @@ size_t oc_core_encode(const oc_core_msg_t *m, uint8_t *out, size_t cap)
         w8(&w, m->u.av_req.count);
         break;
     case OC_CORE_AV_RES:
+    case OC_OCSS_AV_RES:
         if (m->u.av_res.count > OC_CORE_AV_MAX) return 0;
         w16(&w, m->u.av_res.req);
         w32(&w, m->u.av_res.tmid);
@@ -362,6 +435,77 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         if (m->u.cell_status.nterm > OC_CORE_STATUS_TERMS) return -1;
         for (uint8_t i = 0; i < m->u.cell_status.nterm; i++) r_term(&r, &m->u.cell_status.term[i]);
         break;
+    case OC_OCSS_TMID_BOUND:
+        m->u.tmid_bound.tmid = r32(&r);
+        break;
+    case OC_OCSS_ACT_RELAY:
+        m->u.act_relay.req = r16(&r);
+        m->u.act_relay.tmid = r32(&r);
+        rb(&r, m->u.act_relay.token_id, 8);
+        rb(&r, m->u.act_relay.pkt, 32);
+        rb(&r, m->u.act_relay.tag, 8);
+        m->u.act_relay.cell = r32(&r);
+        break;
+    case OC_OCSS_AV_RELAY:
+        m->u.av_relay.req = r16(&r);
+        m->u.av_relay.tmid = r32(&r);
+        m->u.av_relay.count = r8(&r);
+        m->u.av_relay.cell = r32(&r);
+        break;
+    case OC_OCSS_RESYNC_RELAY:
+        m->u.resync_relay.req = r16(&r);
+        m->u.resync_relay.tmid = r32(&r);
+        rb(&r, m->u.resync_relay.rand, 16);
+        rb(&r, m->u.resync_relay.auts, 14);
+        m->u.resync_relay.cell = r32(&r);
+        break;
+    case OC_OCSS_LOC_UPDATE:
+        m->u.peer_loc.req = r16(&r);
+        m->u.peer_loc.tmid = r32(&r);
+        rnum(&r, m->u.peer_loc.number);
+        rb(&r, m->u.peer_loc.rand, 16);
+        rb(&r, m->u.peer_loc.res, 8);
+        m->u.peer_loc.cell = r32(&r);
+        m->u.peer_loc.life_s = r32(&r);
+        break;
+    case OC_OCSS_LOC_PURGE:
+        m->u.peer_purge.tmid = r32(&r);
+        rnum(&r, m->u.peer_purge.number);
+        m->u.peer_purge.cell = r32(&r);
+        break;
+    case OC_OCSS_LOC_CANCEL:
+        m->u.peer_cancel.tmid = r32(&r);
+        m->u.peer_cancel.cause = r8(&r);
+        rb(&r, m->u.peer_cancel.rand, 16);
+        rnum(&r, m->u.peer_cancel.number);
+        m->u.peer_cancel.cell = r32(&r);
+        break;
+    case OC_OCSS_LOC_ACK:
+        m->u.loc_ack.req = r16(&r);
+        m->u.loc_ack.tmid = r32(&r);
+        rnum(&r, m->u.loc_ack.number);
+        m->u.loc_ack.status = r8(&r);
+        break;
+    case OC_OCSS_LOCATE:
+        m->u.locate.req = r16(&r);
+        rnum(&r, m->u.locate.number);
+        break;
+    case OC_OCSS_LOCATE_RES:
+        m->u.locate_res.req = r16(&r);
+        rnum(&r, m->u.locate_res.number);
+        m->u.locate_res.status = r8(&r);
+        m->u.locate_res.core = r16(&r);
+        m->u.locate_res.cell = r32(&r);
+        m->u.locate_res.tmid = r32(&r);
+        break;
+    case OC_OCSS_CDR:
+        rnum(&r, m->u.cdr.caller);
+        rnum(&r, m->u.cdr.called);
+        m->u.cdr.setup = r32(&r);
+        m->u.cdr.answer = r32(&r);
+        m->u.cdr.end = r32(&r);
+        m->u.cdr.cause = r8(&r);
+        break;
     case OC_CORE_ACT_FWD:
         m->u.act_fwd.req = r16(&r);
         m->u.act_fwd.tmid = r32(&r);
@@ -369,7 +513,8 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         rb(&r, m->u.act_fwd.pkt, 32);
         rb(&r, m->u.act_fwd.tag, 8);
         break;
-    case OC_CORE_ACT_RES: {
+    case OC_CORE_ACT_RES:
+    case OC_OCSS_ACT_RES: {
         m->u.act_res.req = r16(&r);
         m->u.act_res.tmid = r32(&r);
         uint8_t t = r8(&r);
@@ -386,6 +531,7 @@ int oc_core_decode(const uint8_t *in, size_t len, oc_core_msg_t *m)
         m->u.av_req.count = r8(&r);
         break;
     case OC_CORE_AV_RES:
+    case OC_OCSS_AV_RES:
         m->u.av_res.req = r16(&r);
         m->u.av_res.tmid = r32(&r);
         m->u.av_res.status = r8(&r);

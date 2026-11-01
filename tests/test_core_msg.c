@@ -343,7 +343,7 @@ static void test_ocss_golden_bytes(void)
     m.u.peer_hello.proto = OC_OCSS_PROTO;
     m.u.peer_hello.core_id = 0x0102;
     m.u.peer_hello.table_ver = 0x03040506u;
-    static const uint8_t hello[] = { 0x00, 0x08, 0x41, 0x02, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03 };
+    static const uint8_t hello[] = { 0x00, 0x08, 0x41, 0x03, 0x02, 0x01, 0x06, 0x05, 0x04, 0x03 };
     golden(&m, hello, sizeof(hello));
 
     memset(&m, 0, sizeof(m));
@@ -418,6 +418,140 @@ static void test_ocss_what_does_not_decode(void)
     TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(big, sizeof(big), &m));
     static const uint8_t free_type[] = { 0x00, 0x01, 0x46 }; /* kept for routing (plan 10): not this build's */
     TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(free_type, sizeof(free_type), &m));
+}
+
+/* OCSS 3 (OCSS spec 2026-11-01 §4.2): the bytes of LOCATE_RES and CDR
+ * pinned; every mobility type round-trips, and one byte less or more, or
+ * a number that is not valid, does not decode. */
+static void test_ocss_mobility(void)
+{
+    oc_core_msg_t m, all[13];
+    unsigned n = 0;
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_LOCATE_RES;
+    m.u.locate_res.req = 0x0102;
+    num("+883150355501234", m.u.locate_res.number);
+    m.u.locate_res.status = OC_OCSS_LOC_OK;
+    m.u.locate_res.core = 1;
+    m.u.locate_res.cell = 3;
+    m.u.locate_res.tmid = 0x76ae1ae8u;
+    static const uint8_t lres[] = { 0x00, 0x16, 0x5D, 0x02, 0x01, 0x88, 0x31, 0x50, 0x35, 0x55, 0x01, 0x23, 0x4F,
+                                    0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x1a, 0xae, 0x76 };
+    golden(&m, lres, sizeof(lres));
+    all[n++] = m;
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_CDR;
+    num("+883150355501234", m.u.cdr.caller);
+    num("+883160655500101", m.u.cdr.called);
+    m.u.cdr.setup = 1;
+    m.u.cdr.answer = 2;
+    m.u.cdr.end = 3;
+    m.u.cdr.cause = 1;
+    static const uint8_t cdr[] = { 0x00, 0x1E, 0x5E, 0x88, 0x31, 0x50, 0x35, 0x55, 0x01, 0x23, 0x4F, 0x88, 0x31,
+                                   0x60, 0x65, 0x55, 0x00, 0x10, 0x1F, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+                                   0x00, 0x03, 0x00, 0x00, 0x00, 0x01 };
+    golden(&m, cdr, sizeof(cdr));
+    all[n++] = m;
+
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_TMID_BOUND;
+    m.u.tmid_bound.tmid = 0x01020304u;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_ACT_RELAY;
+    m.u.act_relay.req = 7;
+    m.u.act_relay.tmid = 9;
+    memset(m.u.act_relay.token_id, 1, 8);
+    memset(m.u.act_relay.pkt, 2, 32);
+    memset(m.u.act_relay.tag, 3, 8);
+    m.u.act_relay.cell = 3;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_AV_RELAY;
+    m.u.av_relay.req = 8;
+    m.u.av_relay.tmid = 9;
+    m.u.av_relay.count = 1;
+    m.u.av_relay.cell = 3;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_AV_RES;
+    m.u.av_res.req = 8;
+    m.u.av_res.tmid = 9;
+    m.u.av_res.status = OC_CORE_AV_OK;
+    num("+883150355501234", m.u.av_res.number);
+    m.u.av_res.count = 1;
+    memset(&m.u.av_res.av[0], 0x44, sizeof(m.u.av_res.av[0]));
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_RESYNC_RELAY;
+    m.u.resync_relay.req = 1;
+    m.u.resync_relay.tmid = 2;
+    memset(m.u.resync_relay.rand, 5, 16);
+    memset(m.u.resync_relay.auts, 6, 14);
+    m.u.resync_relay.cell = 4;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_LOC_UPDATE;
+    m.u.peer_loc.req = 3;
+    m.u.peer_loc.tmid = 4;
+    num("+883150355501234", m.u.peer_loc.number);
+    memset(m.u.peer_loc.rand, 7, 16);
+    memset(m.u.peer_loc.res, 8, 8);
+    m.u.peer_loc.cell = 3;
+    m.u.peer_loc.life_s = 3600;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_LOC_PURGE;
+    m.u.peer_purge.tmid = 4;
+    num("+883150355501234", m.u.peer_purge.number);
+    m.u.peer_purge.cell = 3;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_LOC_CANCEL;
+    m.u.peer_cancel.tmid = 4;
+    m.u.peer_cancel.cause = OC_CORE_CANCEL_MOVED;
+    memset(m.u.peer_cancel.rand, 9, 16);
+    num("+883150355501234", m.u.peer_cancel.number);
+    m.u.peer_cancel.cell = 3;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_LOC_ACK;
+    m.u.loc_ack.req = 3;
+    m.u.loc_ack.tmid = 4;
+    num("+883150355501234", m.u.loc_ack.number);
+    m.u.loc_ack.status = 1;
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_LOCATE;
+    m.u.locate.req = 3;
+    num("+883150355501234", m.u.locate.number);
+    all[n++] = m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_ACT_RES;
+    m.u.act_res.req = 3;
+    m.u.act_res.tmid = 4;
+    m.u.act_res.msg.type = OC_SIG_ACT_NAK;
+    m.u.act_res.msg.u.act_nak.reason = 2;
+    all[n++] = m;
+
+    for (unsigned i = 0; i < n; i++) {
+        uint8_t buf[OC_CORE_FRAME_MAX + 1];
+        oc_core_msg_t back;
+        size_t len = oc_core_encode(&all[i], buf, sizeof(buf));
+        TEST_ASSERT_NOT_EQUAL_MESSAGE(0, len, "encode");
+        TEST_ASSERT_EQUAL_INT(0, oc_core_decode(buf, len, &back));
+        TEST_ASSERT_EQUAL_HEX8_ARRAY(&all[i], &back, sizeof(back));
+        if (all[i].type == OC_OCSS_ACT_RES) continue; /* its oc_sig body has its own length rules */
+        buf[1]--; /* one byte short */
+        TEST_ASSERT_EQUAL_INT_MESSAGE(-1, oc_core_decode(buf, len - 1u, &back), "short");
+        buf[1] += 2; /* one byte long */
+        buf[len] = 0;
+        TEST_ASSERT_EQUAL_INT_MESSAGE(-1, oc_core_decode(buf, len + 1u, &back), "long");
+    }
+    static const uint8_t bad_locate[] = { 0x00, 0x0B, 0x5C, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    TEST_ASSERT_EQUAL_INT(-1, oc_core_decode(bad_locate, sizeof(bad_locate), &m));
 }
 
 /* CELL_STATUS (NOC design §7.3): the bytes pinned, a full part fits a
@@ -607,6 +741,7 @@ int main(void)
     RUN_TEST(test_cell_cfg);
     RUN_TEST(test_ocss_golden_bytes);
     RUN_TEST(test_ocss_what_does_not_decode);
+    RUN_TEST(test_ocss_mobility);
     RUN_TEST(test_cell_status);
     RUN_TEST(test_codec_forms);
     RUN_TEST(test_codec_forms_other_lengths_do_not_decode);

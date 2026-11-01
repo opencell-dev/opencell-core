@@ -90,6 +90,9 @@ void oc_cell_init(oc_cell_t *c, const oc_cell_io_t *io, const oc_cell_cfg_t *cfg
 /* radio side: one UL payload, one RACH UPPER payload, a terminal's grant */
 void oc_cell_ul(oc_cell_t *c, uint32_t tmid, const uint8_t *p, uint8_t n, uint64_t now_us);
 void oc_cell_upper(oc_cell_t *c, uint32_t tmid, const uint8_t *p, uint8_t n, uint64_t now_us);
+/* A RACH CHECKIN's payload (sparse beacon spec 2026-11-01 §4.4): an idle
+ * terminal is still there; never answered. */
+void oc_cell_checkin(oc_cell_t *c, uint32_t tmid, const uint8_t *p, uint8_t n, uint64_t now_us);
 void oc_cell_radio_link(oc_cell_t *c, uint32_t tmid, int granted, uint64_t now_us);
 /* core side: the transport connected (HELLO goes out), dropped, or brought a frame */
 void oc_cell_core_up(oc_cell_t *c, uint64_t now_us);

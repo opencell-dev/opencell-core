@@ -293,6 +293,28 @@ static void n_unregistered(void *ctx, uint32_t tmid, const uint8_t number[OC_SIG
     if (c->ready) to_core(c, &m);
 }
 
+/* Sparse beacon spec 2026-11-01 §4.4: a registered terminal stopped checking
+ * in (off): the core forgets where it is, so calls to it fail at once; the
+ * registration stays, and when it checks in again its LOC_UPDATE (the same
+ * proof, kept for the registration) puts it back. */
+static void n_offline(void *ctx, uint32_t tmid, const uint8_t number[OC_SIG_NUMBER_LEN], int off)
+{
+    oc_cell_t *c = ctx;
+    logf_(c, "terminal %08x: %s", (unsigned)tmid, off ? "offline (no check-in): location purged" : "back online");
+    if (!c->ready) return; /* HELLO_ACK re-reports the online ones */
+    if (!off) {
+        oc_cell_reg_t *r = reg_of(c, tmid, 0);
+        if (r != NULL) loc_update(c, r);
+        return;
+    }
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_LOC_PURGE;
+    m.u.loc_purge.tmid = tmid;
+    memcpy(m.u.loc_purge.number, number, OC_SIG_NUMBER_LEN);
+    to_core(c, &m);
+}
+
 static int n_send(void *ctx, uint32_t tmid, const uint8_t *p, uint8_t n)
 {
     oc_cell_t *c = ctx;
@@ -381,7 +403,7 @@ void oc_cell_init(oc_cell_t *c, const oc_cell_io_t *io, const oc_cell_cfg_t *cfg
     c->cfg = *cfg;
     c->hello_proto = OC_CORE_PROTO;
     const oc_sig_net_io_t nio = { c,      n_act_req, n_av_req, n_resync_req, n_registered, n_unregistered,
-                                  n_send, n_channel, n_call,   n_log };
+                                  n_send, n_channel, n_call,   n_log,        n_offline };
     const oc_sig_net_cfg_t ncfg = { cfg->mode, cfg->period_s };
     oc_sig_net_init(&c->net, &nio, &ncfg);
 }
@@ -415,6 +437,12 @@ void oc_cell_ul(oc_cell_t *c, uint32_t tmid, const uint8_t *p, uint8_t n, uint64
     m.u.media.len = dn;
     memcpy(m.u.media.data, d, dn);
     to_core(c, &m);
+}
+
+void oc_cell_checkin(oc_cell_t *c, uint32_t tmid, const uint8_t *p, uint8_t n, uint64_t now_us)
+{
+    c->now = now_us;
+    oc_sig_net_checkin(&c->net, tmid, p, n, now_us);
 }
 
 void oc_cell_upper(oc_cell_t *c, uint32_t tmid, const uint8_t *p, uint8_t n, uint64_t now_us)
@@ -511,7 +539,10 @@ void oc_cell_core_rx(oc_cell_t *c, const oc_core_msg_t *m, uint64_t now_us)
         c->net.cfg.period_s = m->u.hello_ack.period_s;
         memcpy(c->echo_number, m->u.hello_ack.echo_number, OC_SIG_NUMBER_LEN);
         for (unsigned i = 0; i < OC_SIG_NET_TERMS; i++) { /* the core may have lost them (§7.10, §14.6) */
-            if (c->regs[i].used && oc_sig_net_registered(&c->net, c->regs[i].tmid)) loc_update(c, &c->regs[i]);
+            if (c->regs[i].used && oc_sig_net_registered(&c->net, c->regs[i].tmid) &&
+                !oc_sig_net_offline(&c->net, c->regs[i].tmid)) {
+                loc_update(c, &c->regs[i]); /* not an offline one (sparse beacon spec §4.4) */
+            }
         }
         /* registrations that waited for the core. A RESYNC the link drop
          * lost is asked again as a plain AV_REQ: its vector fails with

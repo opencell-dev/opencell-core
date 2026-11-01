@@ -330,7 +330,7 @@ int  oc_core_chan_list_set(oc_core_t *k, uint16_t list_id, const oc_sig_chan_lis
  * that last version can't be read either. */
 int  oc_core_chan_list_replace(oc_core_t *k, uint16_t list_id, const oc_sig_chan_list_t *list, uint64_t now_us);
 
-/* Subscribers (admin). number NULL: a random free number in the first NANP
+/* Subscribers (admin). number NULL: a random free number in the lowest-index NANP
  * block this core is home for (numbering-plan.md "Assignment Modes"). 0 with
  * the number in out, or -1: not a valid number, reserved, not in a block
  * this core is home for, already a subscriber, or the store failed. */

@@ -4,24 +4,33 @@
  * A block is a prefix of the full form (883 . CC . NPA, or 883 . CC . NPA .
  * NXX) with a block index that is never reused and a home core. The longest
  * prefix wins, so an exchange block can sit inside another tenant's area
- * code. For now one core runs with every block at home; plans 10-11 add the
- * signed table, secondaries, epochs and takeovers around the same lookups. */
+ * code. The table comes from the config's block lines or from the signed
+ * table (OCSS spec 2026-11-01 §3: oc/oc_rtbl.h builds it); takeovers and
+ * epochs come with plans 10-11.
+ *
+ * Up to OC_CORE_BLOCKS blocks (a block per geographic NANP NPA, portal spec
+ * §4.3), kept sorted by prefix: a number's longest prefix is one binary
+ * search per prefix length (OCSS spec §7), not a scan. */
 #ifndef OC_CORE_ROUTE_H
 #define OC_CORE_ROUTE_H
 
 #include "oc_sig.h"
 
-#define OC_CORE_BLOCKS 32u
+#define OC_CORE_BLOCKS 1024u
+#define OC_CORE_STATE_MAX 5u /* a state code: "US-KY", "CA-ON", "JM" (OCSS spec §3.3) */
 
 typedef struct {
     char     prefix[OC_SIG_NUMBER_DIGITS + 1]; /* digits only, e.g. "8831606" */
     uint16_t block_idx;                        /* 1-65535, never reused */
     uint16_t home_core;                        /* core_id */
+    uint16_t secondary;                        /* its first secondary's core_id; 0: none */
+    uint16_t tenant;                           /* 1: the default tenant (0 from block lines) */
+    char     state[OC_CORE_STATE_MAX + 1];     /* the NPA's state code; "": none */
 } oc_core_block_t;
 
 typedef struct {
     uint16_t        self; /* this core's core_id */
-    oc_core_block_t b[OC_CORE_BLOCKS];
+    oc_core_block_t b[OC_CORE_BLOCKS]; /* sorted by prefix (strcmp) */
     unsigned        n;
 } oc_core_route_t;
 
@@ -32,11 +41,19 @@ void oc_core_route_init(oc_core_route_t *r, uint16_t self);
  * the same rules oc_sig applies, numbering-plan.md v0.2), block index 0, a
  * prefix or index already in the table, or a full table. */
 int oc_core_route_add(oc_core_route_t *r, const char *prefix, uint16_t block_idx, uint16_t home_core);
+/* The same with the signed table's fields: secondary (0 none; not the
+ * home), tenant, state (NULL or "" none; at most OC_CORE_STATE_MAX). */
+int oc_core_route_add_ex(oc_core_route_t *r, const char *prefix, uint16_t block_idx, uint16_t home_core,
+                         uint16_t secondary, uint16_t tenant, const char *state);
+/* 1 if prefix is one oc_core_route_add would take (the rules above). */
+int oc_core_route_prefix_ok(const char *prefix);
 /* The block with the longest prefix of number, or NULL (no route). */
 const oc_core_block_t *oc_core_route_find(const oc_core_route_t *r, const uint8_t number[OC_SIG_NUMBER_LEN]);
 const oc_core_block_t *oc_core_route_block(const oc_core_route_t *r, uint16_t block_idx);
 /* 1 if b is a block this core is home for ("am I home?"); 0 for NULL. */
 int oc_core_route_home(const oc_core_route_t *r, const oc_core_block_t *b);
+/* 1 if this core is b's secondary; 0 for NULL. */
+int oc_core_route_secondary(const oc_core_route_t *r, const oc_core_block_t *b);
 
 /* Token ids carry their block (§14.3): the block index big-endian in bytes
  * 0-1, then 6 random bytes (the tag, keyed by the token secret, carries the

@@ -14,7 +14,7 @@ static int nanp_code_ok(const char *c) /* NPA or NXX: 2-9 first, not N11 (number
     return c[0] >= '2' && c[0] <= '9' && !(c[1] == '1' && c[2] == '1');
 }
 
-static int prefix_ok(const char *p)
+int oc_core_route_prefix_ok(const char *p)
 {
     size_t n = strlen(p);
     if (n < 4 || n > OC_SIG_NUMBER_DIGITS || strncmp(p, "883", 3) != 0) return 0;
@@ -27,30 +27,74 @@ static int prefix_ok(const char *p)
     return n != 10 || nanp_code_ok(p + 7); /* illegal NXX */
 }
 
-int oc_core_route_add(oc_core_route_t *r, const char *prefix, uint16_t block_idx, uint16_t home_core)
+int oc_core_route_add_ex(oc_core_route_t *r, const char *prefix, uint16_t block_idx, uint16_t home_core,
+                         uint16_t secondary, uint16_t tenant, const char *state)
 {
-    if (!prefix_ok(prefix) || block_idx == 0 || r->n >= OC_CORE_BLOCKS) return -1;
-    for (unsigned i = 0; i < r->n; i++) {
-        if (strcmp(r->b[i].prefix, prefix) == 0 || r->b[i].block_idx == block_idx) return -1;
+    if (!oc_core_route_prefix_ok(prefix) || block_idx == 0 || r->n >= OC_CORE_BLOCKS) return -1;
+    if (secondary != 0 && secondary == home_core) return -1;
+    if (state != NULL && strlen(state) > OC_CORE_STATE_MAX) return -1;
+    unsigned at = 0, lo = 0, hi = r->n;
+    while (lo < hi) { /* the first block whose prefix is not below this one */
+        unsigned mid = lo + (hi - lo) / 2u;
+        if (strcmp(r->b[mid].prefix, prefix) < 0) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
     }
-    oc_core_block_t *b = &r->b[r->n++];
+    at = lo;
+    if (at < r->n && strcmp(r->b[at].prefix, prefix) == 0) return -1;
+    for (unsigned i = 0; i < r->n; i++) {
+        if (r->b[i].block_idx == block_idx) return -1;
+    }
+    memmove(&r->b[at + 1u], &r->b[at], (r->n - at) * sizeof(r->b[0]));
+    r->n++;
+    oc_core_block_t *b = &r->b[at];
+    memset(b, 0, sizeof(*b));
     snprintf(b->prefix, sizeof(b->prefix), "%s", prefix);
     b->block_idx = block_idx;
     b->home_core = home_core;
+    b->secondary = secondary;
+    b->tenant = tenant;
+    if (state != NULL) snprintf(b->state, sizeof(b->state), "%s", state);
     return 0;
+}
+
+int oc_core_route_add(oc_core_route_t *r, const char *prefix, uint16_t block_idx, uint16_t home_core)
+{
+    return oc_core_route_add_ex(r, prefix, block_idx, home_core, 0, 0, NULL);
+}
+
+/* The block whose prefix is exactly the first n digits of d, or NULL. */
+static const oc_core_block_t *exact(const oc_core_route_t *r, const char *d, size_t n)
+{
+    unsigned lo = 0, hi = r->n;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2u;
+        const char *p = r->b[mid].prefix;
+        int c = strncmp(p, d, n);
+        if (c == 0 && p[n] != '\0') c = 1; /* longer than n: after the n-digit one */
+        if (c == 0) return &r->b[mid];
+        if (c < 0) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return NULL;
 }
 
 const oc_core_block_t *oc_core_route_find(const oc_core_route_t *r, const uint8_t number[OC_SIG_NUMBER_LEN])
 {
     char text[OC_SIG_NUMBER_TEXT];
-    const oc_core_block_t *best = NULL;
     if (!oc_sig_number_valid(number)) return NULL;
     oc_sig_number_to_text(number, text);
-    for (unsigned i = 0; i < r->n; i++) {
-        size_t n = strlen(r->b[i].prefix);
-        if (strncmp(text + 1, r->b[i].prefix, n) == 0 && (best == NULL || n > strlen(best->prefix))) best = &r->b[i];
+    size_t len = strlen(text + 1);
+    for (size_t n = len < OC_SIG_NUMBER_DIGITS ? len : OC_SIG_NUMBER_DIGITS; n >= 4; n--) {
+        const oc_core_block_t *b = exact(r, text + 1, n);
+        if (b != NULL) return b;
     }
-    return best;
+    return NULL;
 }
 
 const oc_core_block_t *oc_core_route_block(const oc_core_route_t *r, uint16_t block_idx)
@@ -64,6 +108,11 @@ const oc_core_block_t *oc_core_route_block(const oc_core_route_t *r, uint16_t bl
 int oc_core_route_home(const oc_core_route_t *r, const oc_core_block_t *b)
 {
     return b != NULL && b->home_core == r->self;
+}
+
+int oc_core_route_secondary(const oc_core_route_t *r, const oc_core_block_t *b)
+{
+    return b != NULL && b->secondary != 0 && b->secondary == r->self;
 }
 
 void oc_core_token_id(uint16_t block_idx, const uint8_t random6[6], uint8_t token_id[8])

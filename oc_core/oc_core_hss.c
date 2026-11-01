@@ -33,8 +33,9 @@ int oc_core_sub_add(oc_core_t *k, const uint8_t *number, uint8_t out[OC_SIG_NUMB
         memcpy(n, number, OC_SIG_NUMBER_LEN);
     } else {
         const oc_core_block_t *b = NULL;
-        for (unsigned i = 0; i < k->route.n && b == NULL; i++) {
-            if (oc_core_route_home(&k->route, &k->route.b[i]) && k->route.b[i].prefix[3] == '1') b = &k->route.b[i];
+        for (unsigned i = 0; i < k->route.n; i++) { /* the home NANP block with the lowest index (OCSS spec §7) */
+            const oc_core_block_t *x = &k->route.b[i];
+            if (oc_core_route_home(&k->route, x) && x->prefix[3] == '1' && (b == NULL || x->block_idx < b->block_idx)) b = x;
         }
         int found = 0;
         for (int tries = 0; b != NULL && tries < 64 && !found; tries++) {

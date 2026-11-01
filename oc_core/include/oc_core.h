@@ -201,6 +201,7 @@ typedef struct {
     uint16_t cell_req;    /* ...and its req */
     uint32_t tmid;
     uint8_t  nwait;       /* AV: answers still to come */
+    uint16_t asked[OC_CORE_PEERS]; /* AV: the peers still to answer (review M5); 0: none */
     uint8_t  best;        /* AV: the strongest non-ok status so far */
     uint8_t  number[OC_SIG_NUMBER_LEN]; /* LOC, LOCATE */
     uint8_t  rand[16];    /* LOC */
@@ -260,8 +261,10 @@ typedef struct {
     /* peer cores that refused HELLO at OC_OCSS_PROTO (HELLO_NAK version):
      * dialled at OC_OCSS_PROTO_MIN until a link at it drops (ruling R8); 0: free */
     uint16_t        ocss_old[OC_CORE_PEERS];
+    uint8_t         ocss_ver[OC_CORE_PEERS]; /* ...and the version each is dialled at (review I1: 3, 2, 1) */
     oc_core_relay_t relays[OC_CORE_RELAYS];
     uint16_t        next_relay;
+    uint64_t        relay_log_at; /* "no room" is logged at most once a second */
     oc_core_tmid_t  tmids[OC_CORE_TMIDS];
     uint32_t        table_ver; /* the root version of the signed table (0: config block lines): OCSS HELLO */
     uint32_t        next_ref; /* wraps at 2^30 (bit 31 is OC_CORE_REF_CORE, bit 30 OC_CORE_REF_DIR for a peer leg's ref: review I1); safe since calls[] does not survive a core restart (§7.10) */

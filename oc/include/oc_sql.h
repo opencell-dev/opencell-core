@@ -90,14 +90,15 @@ int oc_sql_cell_cert_get(oc_sql_t *s, uint32_t cell_id, char out[65]);
 /* The signed routing table's rows (OCSS spec §3.6): kind 1 a root table
  * (seq 0), kind 2 a delegate addition. put inserts (or, the same key,
  * replaces) one; 0 or -1. list calls fn for every row of kind (and, for
- * kind 2, of root version) in (version, seq) order, stopping when fn
- * returns non-zero; 0, or -1 (the store failed). */
+ * kind 2, of root version) in (version, seq) order, with the unix time
+ * each was received, stopping when fn returns non-zero; 0, or -1 (the
+ * store failed). */
 enum { OC_SQL_ROUTE_ROOT = 1, OC_SQL_ROUTE_ADD = 2 };
 int oc_sql_route_put(oc_sql_t *s, int kind, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
                      const uint8_t sig[64], uint32_t received);
 int oc_sql_route_list(oc_sql_t *s, int kind, uint32_t version,
                       int (*fn)(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
-                                const uint8_t *sig, size_t sig_len),
+                                const uint8_t *sig, size_t sig_len, uint32_t received),
                       void *ctx);
 int oc_sql_expired(oc_sql_t *s, uint32_t now, uint8_t (*out)[OC_SIG_NUMBER_LEN], int max);
 

@@ -557,7 +557,11 @@ static void test_ocss_versions_and_the_diallers_fallback(void)
     nak.u.hello_nak.reason = OC_OCSS_NAK_VERSION;
     oc_core_peer_rx(&C1.k, L1, &nak, NOW);
     TEST_ASSERT_EQUAL_UINT32(L1, C1.closed[C1.nclosed - 1]);
-    oc_core_peer_up(&C1.k, L1, 2, 1, NOW); /* the transport dials again */
+    oc_core_peer_up(&C1.k, L1, 2, 1, NOW); /* the transport dials again, one version down (OCSS 2) */
+    TEST_ASSERT_EQUAL_UINT8(OC_OCSS_PROTO - 1u, Q[(QT - 1) % 256].m.u.peer_hello.proto);
+    QH = QT; /* an OCSS-1 core 2 refuses that too (an OCSS-2 one would have taken it): */
+    oc_core_peer_rx(&C1.k, L1, &nak, NOW);
+    oc_core_peer_up(&C1.k, L1, 2, 1, NOW);
     TEST_ASSERT_EQUAL_UINT8(OC_OCSS_PROTO_MIN, Q[(QT - 1) % 256].m.u.peer_hello.proto);
     oc_core_peer_up(&C2.k, L2, 1, 0, NOW);
     pump();
@@ -615,7 +619,8 @@ static void test_caps_and_codec_cross_ocss(void)
     oc_core_peer_down(&C1.k, L1, NOW);
     oc_core_peer_down(&C2.k, L2, NOW);
     QH = QT;
-    C1.k.ocss_old[0] = 2; /* core 1 dials core 2 at OCSS 1, as after a version refusal (Task 12) */
+    C1.k.ocss_old[0] = 2; /* core 1 dials core 2 at OCSS 1, as after version refusals (Task 12) */
+    C1.k.ocss_ver[0] = OC_OCSS_PROTO_MIN;
     oc_core_peer_up(&C1.k, L1, 2, 1, NOW);
     oc_core_peer_up(&C2.k, L2, 1, 0, NOW);
     pump();

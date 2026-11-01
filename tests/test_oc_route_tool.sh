@@ -42,7 +42,7 @@ grep -q "^delegate $DEL scope 1 valid 1793500000-1825036000 east core 1 (53 stat
 grep -v '^201' "$T/npa.csv" > "$T/npa2.csv"
 echo '472,US-NC' >> "$T/npa2.csv"
 "$TOOL" make "$T/root.key" "$T/v2.tbl" --version 2 --npa "$T/npa2.csv" --core 1=oc-core-1 --core 2=oc-core-2 \
-    --east 1 --west 2 --prev "$T/v1.tbl" --revoke "$DEL" 2>"$T/err" >/dev/null
+    --east 1 --west 2 --prev "$T/v1.tbl" --floor 7 --revoke "$DEL" 2>"$T/err" >/dev/null
 grep -q 'kept 8831201' "$T/err" || fail "kept note"
 "$TOOL" show "$T/v2.tbl" --root "$ROOT" > "$T/show2"
 grep -q '^block 8831907 7 home 2' "$T/show2" || fail "index kept"
@@ -50,7 +50,9 @@ grep -q '^block 8831472 8 home 1' "$T/show2" || fail "new index above max_idx"
 grep -q '^block 8831201 4 ' "$T/show2" || fail "dropped block kept"
 grep -q "^revoked $DEL$" "$T/show2" || fail "revoked"
 ! "$TOOL" make "$T/root.key" "$T/v3.tbl" --version 2 --npa "$T/npa2.csv" --core 1=a --core 2=b --east 1 --west 2 \
-    --prev "$T/v2.tbl" 2>/dev/null || fail "a version not above --prev"
+    --prev "$T/v2.tbl" --floor 8 2>/dev/null || fail "a version not above --prev"
+! "$TOOL" make "$T/root.key" "$T/v3.tbl" --version 3 --npa "$T/npa2.csv" --core 1=a --core 2=b --east 1 --west 2 \
+    --prev "$T/v2.tbl" 2>/dev/null || fail "--prev without --floor"
 echo '999,ZZZZ' > "$T/bad.csv"
 ! "$TOOL" make "$T/root.key" "$T/bad.tbl" --version 1 --npa "$T/bad.csv" --core 1=a --core 2=b --east 1 --west 2 \
     2>/dev/null || fail "a bad CSV row"
@@ -62,4 +64,5 @@ grep -q '^addition 1.1, 2 block(s)$' "$T/add" || fail "add"
 grep -q '^npa 472 8 state US-NC$' "$T/showa" || fail "first new index is max_idx + 1"
 grep -q '^npa 945 9 state US-TX$' "$T/showa" || fail "second"
 grep -q '^signature ok$' "$T/showa" || fail "addition signature"
+! "$TOOL" show "$T/a1.bin" --root "$ROOT" >/dev/null || fail "an addition verified with a key that did not sign it"
 echo PASS

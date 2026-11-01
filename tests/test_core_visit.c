@@ -4,6 +4,8 @@
  * reverse; the home core keeps the keys, the location and the CDRs. */
 #include "net_sim2.h"
 
+void oc_core_tmid_learn(oc_core_t *k, uint32_t tmid, uint16_t home); /* oc_core_int.h */
+
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -187,6 +189,17 @@ static void test_refusals(void)
     s2_run_ms(1000);
     TEST_ASSERT_EQUAL_UINT8(OC_SIG_ST_REGISTERED, s2_state(0));
 
+    /* core 2 names one of its own numbers but core 1's subscriber's TMID: refused too (review I2) */
+    memset(&m, 0, sizeof(m));
+    m.type = OC_OCSS_LOC_CANCEL;
+    m.u.peer_cancel.tmid = TERM2[0].tmid;
+    m.u.peer_cancel.cause = OC_CORE_CANCEL_DISABLED;
+    memcpy(m.u.peer_cancel.number, TERM2[1].number, OC_SIG_NUMBER_LEN);
+    m.u.peer_cancel.cell = 2;
+    oc_core_peer_rx(&CORE2[0].k, S2_PEER_LINK(0), &m, now2);
+    s2_run_ms(1000);
+    TEST_ASSERT_TRUE(oc_sig_net_registered(&CELL2[1].c.net, TERM2[0].tmid));
+
     /* a peer's LOC_UPDATE with a RES no vector backs: refused */
     memset(&m, 0, sizeof(m));
     m.type = OC_OCSS_LOC_UPDATE;
@@ -247,6 +260,29 @@ static void test_an_unknown_tmid_and_a_lost_locate(void)
     CUT2 = 0;
 }
 
+/* Review M4: the cached home says not activated (the terminal moved on while
+ * the link was down, so TMID_BOUND never came): the entry goes, and the next
+ * ask reaches every peer. Review M5: an unasked peer's answer is ignored. */
+static void test_a_stale_cached_home_is_forgotten(void)
+{
+    s2_world();
+    uint32_t tmid = 0x7700ABCDu;
+    oc_core_tmid_learn(&CORE2[0].k, tmid, 2);
+    oc_core_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = OC_CORE_AV_REQ;
+    m.u.av_req.req = 5;
+    m.u.av_req.tmid = tmid;
+    m.u.av_req.count = 1;
+    unsigned before = ocss_sent[0][OC_OCSS_AV_RELAY];
+    oc_core_rx(&CORE2[0].k, CELL2[0].link, &m, now2);
+    TEST_ASSERT_EQUAL_UINT(before + 1u, ocss_sent[0][OC_OCSS_AV_RELAY]);
+    s2_run_ms(500); /* core 2 answers not activated */
+    int cached = 0;
+    for (unsigned i = 0; i < OC_CORE_TMIDS; i++) cached |= CORE2[0].k.tmids[i].tmid == tmid;
+    TEST_ASSERT_FALSE(cached);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -257,5 +293,6 @@ int main(void)
     RUN_TEST(test_refusals);
     RUN_TEST(test_a_terminal_moves_to_a_number_of_the_other_core);
     RUN_TEST(test_an_unknown_tmid_and_a_lost_locate);
+    RUN_TEST(test_a_stale_cached_home_is_forgotten);
     return UNITY_END();
 }

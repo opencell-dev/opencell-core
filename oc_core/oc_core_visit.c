@@ -71,13 +71,20 @@ static oc_core_relay_t *relay_new(oc_core_t *k, uint8_t kind, uint16_t peer)
         r->used = 1;
         r->kind = kind;
         r->peer = peer;
-        do {
-            r->id = ++k->next_relay;
-        } while (r->id == 0);
+        for (int busy = 1; busy;) { /* an id no other relay holds (review M6) */
+            do {
+                r->id = ++k->next_relay;
+            } while (r->id == 0);
+            busy = 0;
+            for (unsigned j = 0; j < OC_CORE_RELAYS; j++) busy |= j != i && k->relays[j].used && k->relays[j].id == r->id;
+        }
         r->due = k->now + OC_CORE_RELAY_US;
         return r;
     }
-    oc_core_logf(k, "relay: no room (%u outstanding)", OC_CORE_RELAYS);
+    if (k->now >= k->relay_log_at) {
+        oc_core_logf(k, "relay: no room (%u outstanding)", OC_CORE_RELAYS);
+        k->relay_log_at = k->now + 1000000ull;
+    }
     return NULL;
 }
 
@@ -87,9 +94,26 @@ static oc_core_relay_t *relay_of(oc_core_t *k, uint8_t kind, uint16_t peer, uint
 {
     for (unsigned i = 0; i < OC_CORE_RELAYS; i++) {
         oc_core_relay_t *r = &k->relays[i];
-        if (r->used && r->kind == kind && r->id == req && (r->peer == peer || r->peer == 0)) return r;
+        if (!r->used || r->kind != kind || r->id != req) continue;
+        if (kind != OC_CORE_RELAY_AV) {
+            if (r->peer == peer) return r;
+            continue;
+        }
+        for (unsigned j = 0; j < OC_CORE_PEERS; j++) { /* AV: a peer asked, once (review M5) */
+            if (r->asked[j] == peer && peer != 0) {
+                r->asked[j] = 0;
+                return r;
+            }
+        }
     }
     return NULL;
+}
+
+static void tmid_forget(oc_core_t *k, uint32_t tmid, uint16_t home)
+{
+    for (unsigned i = 0; i < OC_CORE_TMIDS; i++) {
+        if (k->tmids[i].tmid == tmid && k->tmids[i].home == home) memset(&k->tmids[i], 0, sizeof(k->tmids[i]));
+    }
 }
 
 static void relay_free(oc_core_relay_t *r)
@@ -185,7 +209,11 @@ static int relay_av(oc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, ui
         m.u.av_relay.cell = cell;
     }
     for (unsigned i = 0; i < n; i++) {
-        if (oc_core_peer_send(k, ask[i], &m) != 0) r->nwait--;
+        if (oc_core_peer_send(k, ask[i], &m) != 0) {
+            r->nwait--;
+        } else {
+            r->asked[i] = ask[i];
+        }
     }
     if (r->nwait == 0) {
         av_to_cell(k, r, NULL, OC_CORE_AV_UNAVAILABLE);
@@ -321,6 +349,9 @@ static void on_av_res(oc_core_t *k, uint16_t peer, const oc_core_msg_t *m)
         relay_free(r);
         return;
     }
+    if (m->u.av_res.status == OC_CORE_AV_NOT_ACTIVATED) {
+        tmid_forget(k, r->tmid, peer); /* review M4: a stale cached home; the next ask goes to every peer */
+    }
     if (rank(m->u.av_res.status) > rank(r->best)) r->best = m->u.av_res.status;
     if (r->nwait > 0) r->nwait--;
     if (r->nwait == 0) {
@@ -368,7 +399,31 @@ static void on_peer_cancel(oc_core_t *k, uint16_t peer, const oc_core_msg_t *m)
         oc_core_logf(k, "peer %u: %s", (unsigned)peer, d);
         return;
     }
-    oc_core_reg_purge(k, 0, m->u.peer_cancel.cell, m->u.peer_cancel.tmid, m->u.peer_cancel.number);
+    /* Review I2: the cell is told only about the home's own registration -
+     * the visitor row it names, or (the row already gone, or never made: a
+     * refused claim) a TMID that is not bound to one of this core's own
+     * subscribers - never to drop someone else's terminal. */
+    oc_core_loc_t l;
+    int got = k->st.loc_get(k->st.ctx, m->u.peer_cancel.number, &l);
+    int row = got == 0 && l.core == 0 && l.cell_id == m->u.peer_cancel.cell && l.tmid == m->u.peer_cancel.tmid;
+    if (!row) {
+        oc_core_sub_t s;
+        memset(&s, 0, sizeof(s));
+        int bound = k->st.sub_by_tmid(k->st.ctx, m->u.peer_cancel.tmid, &s);
+        int ours = bound == 0 && memcmp(s.number, m->u.peer_cancel.number, OC_SIG_NUMBER_LEN) != 0;
+        oc_sig_wipe(s.k, sizeof(s.k));
+        oc_sig_wipe(s.opc, sizeof(s.opc));
+        if (got == OC_CORE_STORE_FAILED || bound == OC_CORE_STORE_FAILED || ours) {
+            char d[48];
+            snprintf(d, sizeof(d), "core %u LOC_CANCEL for a TMID not its", (unsigned)peer);
+            oc_core_audit(k, OC_CORE_AUDIT_PEER_REJECT, m->u.peer_cancel.number, m->u.peer_cancel.tmid,
+                          m->u.peer_cancel.cell, d);
+            oc_core_logf(k, "peer %u: %s", (unsigned)peer, d);
+            return;
+        }
+    } else if (k->st.loc_del(k->st.ctx, m->u.peer_cancel.number) != 0) {
+        oc_core_logf(k, "visitor %08x: location delete failed", (unsigned)l.tmid);
+    }
     oc_core_msg_t out;
     memset(&out, 0, sizeof(out));
     out.type = OC_CORE_LOC_CANCEL;

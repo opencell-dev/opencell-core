@@ -842,8 +842,9 @@ static void test_v2_migrates_to_v3_and_rolls_back(void)
 }
 
 static int route_rows(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
-                      const uint8_t *sig, size_t sig_len)
+                      const uint8_t *sig, size_t sig_len, uint32_t received)
 {
+    TEST_ASSERT_EQUAL_UINT32(1, received);
     char *out = ctx;
     size_t n = strlen(out);
     snprintf(out + n, 64 - n, "%u.%u:%c%u%u ", (unsigned)version, (unsigned)seq, blob_len > 0 ? (char)blob[0] : '-',

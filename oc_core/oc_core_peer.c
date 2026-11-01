@@ -93,23 +93,27 @@ uint8_t oc_core_peer_form(const oc_core_t *k, uint16_t core_id)
     return p != NULL && p->proto >= OC_OCSS_PROTO_CODEC ? OC_CORE_FORM_CODEC : OC_CORE_FORM_OLD;
 }
 
-/* Ruling R8: the peers this core dials at the old version. */
-static int ocss_is_old(const oc_core_t *k, uint16_t id)
+/* Ruling R8, stepped (review I1 of ocss-p5): the version this core dials
+ * id at - OC_OCSS_PROTO unless a HELLO_NAK(version) has stepped it down,
+ * one version at a time (3, 2, 1). */
+static uint8_t dial_proto(const oc_core_t *k, uint16_t id)
 {
     for (unsigned i = 0; i < OC_CORE_PEERS; i++) {
-        if (id != 0 && k->ocss_old[i] == id) return 1;
+        if (id != 0 && k->ocss_old[i] == id) return k->ocss_ver[i];
     }
-    return 0;
+    return OC_OCSS_PROTO;
 }
 
-static void ocss_old_set(oc_core_t *k, uint16_t id, int old)
+/* ver 0 (or OC_OCSS_PROTO): dial id at the newest again. */
+static void ocss_old_set(oc_core_t *k, uint16_t id, uint8_t ver)
 {
     for (unsigned i = 0; i < OC_CORE_PEERS; i++) {
         if (k->ocss_old[i] == id) k->ocss_old[i] = 0;
     }
-    for (unsigned i = 0; old && i < OC_CORE_PEERS; i++) {
+    for (unsigned i = 0; ver != 0 && ver < OC_OCSS_PROTO && i < OC_CORE_PEERS; i++) {
         if (k->ocss_old[i] == 0) {
             k->ocss_old[i] = id;
+            k->ocss_ver[i] = ver;
             return;
         }
     }
@@ -167,7 +171,7 @@ static void hello_out(oc_core_t *k, oc_core_peer_t *p, uint8_t type)
     memset(&m, 0, sizeof(m));
     m.type = type;
     if (type == OC_OCSS_HELLO) { /* HELLO only: HELLO_ACK does not carry it */
-        p->proto = ocss_is_old(k, p->core_id) ? OC_OCSS_PROTO_MIN : OC_OCSS_PROTO;
+        p->proto = dial_proto(k, p->core_id);
         m.u.peer_hello.proto = p->proto;
     }
     m.u.peer_hello.core_id = k->cfg.core_id;
@@ -269,7 +273,7 @@ void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64
         /* refused for the version it said (an older or newer peer, codec
          * negotiation spec §6.2): the next dial says the other one */
         if (p->dialer && !p->up && m->u.hello_nak.reason == OC_OCSS_NAK_VERSION) {
-            ocss_old_set(k, p->core_id, p->proto == OC_OCSS_PROTO);
+            ocss_old_set(k, p->core_id, p->proto > OC_OCSS_PROTO_MIN ? (uint8_t)(p->proto - 1u) : 0);
         }
         gone(k, p, 1);
         return;

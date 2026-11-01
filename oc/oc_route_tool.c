@@ -6,10 +6,10 @@
  *   oc-route keygen KEY
  *   oc-route pub KEY
  *   oc-route make ROOT_KEY OUT --version N --npa CSV --core ID=NAME... --east ID --west ID
- *                 [--prev OLD.tbl] [--pin NPA=IDX]... [--delegate PUBHEX [--valid-days D]]...
+ *                 [--prev OLD.tbl --floor MAX] [--pin NPA=IDX]... [--delegate PUBHEX [--valid-days D]]...
  *                 [--revoke PUBHEX]... [--now UNIX]
  *   oc-route add DELEGATE_KEY BASE.tbl OUT --seq N --npa NPA,STATE[,IDX]... [--now UNIX]
- *   oc-route show FILE [--root PUBHEX]
+ *   oc-route show FILE [--root PUBHEX]    (a table: PUBHEX is the root key; an addition: its delegate's)
  *
  * Keys are PKCS#8 PEM files, written 0600 and never overwritten. */
 #include <errno.h>
@@ -30,7 +30,7 @@ static int usage(void)
     fprintf(stderr,
             "usage: oc-route keygen KEY | pub KEY\n"
             "       oc-route make ROOT_KEY OUT --version N --npa CSV --core ID=NAME... --east ID --west ID\n"
-            "                     [--prev OLD.tbl] [--pin NPA=IDX]... [--delegate PUBHEX [--valid-days D]]...\n"
+            "                     [--prev OLD.tbl --floor MAX] [--pin NPA=IDX]... [--delegate PUBHEX [--valid-days D]]...\n"
             "                     [--revoke PUBHEX]... [--now UNIX]\n"
             "       oc-route add DELEGATE_KEY BASE.tbl OUT --seq N --npa NPA,STATE[,IDX]... [--now UNIX]\n"
             "       oc-route show FILE [--root PUBHEX]\n");
@@ -132,7 +132,7 @@ static int cmd_make(int argc, char **argv)
 {
     if (argc < 4) return usage();
     const char *key = argv[2], *out = argv[3], *csv = NULL, *prev = NULL;
-    long version = -1, east = -1, west = -1, days = 365, now = (long)time(NULL);
+    long version = -1, east = -1, west = -1, days = 365, now = (long)time(NULL), floor_idx = -1;
     uint8_t deleg[OC_RTBL_DELEGS][32];
     unsigned ndeleg = 0;
     struct { unsigned npa; long idx; } pins[64];
@@ -148,6 +148,9 @@ static int cmd_make(int argc, char **argv)
             csv = v;
         } else if (strcmp(a, "--prev") == 0) {
             prev = v;
+        } else if (strcmp(a, "--floor") == 0) { /* the highest index additions on --prev have used (route.status) */
+            floor_idx = num(v, 0, 65535);
+            if (floor_idx < 0) return die("--floor MAX_INDEX");
         } else if (strcmp(a, "--east") == 0) {
             east = num(v, 1, 65535);
         } else if (strcmp(a, "--west") == 0) {
@@ -205,6 +208,12 @@ static int cmd_make(int argc, char **argv)
         if (PREV.version >= T.version) return die("--version must be above the previous table's");
     }
     uint16_t hw = prev != NULL ? PREV.max_idx : 0;
+    if (prev != NULL && floor_idx < 0) { /* review M9: an addition's index is not in the old root table */
+        return die("--prev needs --floor MAX: the max index route.status reports (additions on the old table used indexes "
+                   "above its own), so no index is ever reused; and list the additions' NPAs in the CSV with their "
+                   "indexes as --pin");
+    }
+    if (floor_idx > hw) hw = (uint16_t)floor_idx;
     for (unsigned i = 0; i < npin; i++) {
         if (pins[i].idx > hw) hw = (uint16_t)pins[i].idx;
     }
@@ -425,7 +434,16 @@ static int cmd_show(int argc, char **argv)
         oc_rtbl_hex(a.delegate, 32, h);
         printf("addition %u.%u issued %u by %s\n", (unsigned)a.root_version, (unsigned)a.seq, (unsigned)a.issued, h);
         for (unsigned i = 0; i < a.n; i++) printf("npa %s %u state %s\n", a.b[i].npa, a.b[i].idx, a.b[i].state);
-        if (verify) memcpy(root, a.delegate, 32); /* an addition is checked against its own key */
+        if (verify) {
+            /* review M9: --root names a delegate key for an addition, which
+             * must be the one it says signed it; that it is a valid delegate
+             * is for the core (or a root table) to say */
+            if (memcmp(root, a.delegate, 32) != 0) {
+                printf("signature BAD (not signed by that key)\n");
+                free(b);
+                return 1;
+            }
+        }
     }
     if (verify) {
         int ok = oc_rtbl_verify(root, b, bn, b + bn);

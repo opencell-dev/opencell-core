@@ -490,10 +490,11 @@ static int route_checks(void)
  * what RT has (newest valid wins, OCSS spec §3.6). */
 static uint32_t rt_best;
 static int rt_root_row(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t n, const uint8_t *sig,
-                       size_t sn)
+                       size_t sn, uint32_t received)
 {
     (void)ctx;
     (void)seq;
+    (void)received;
     static uint8_t f[OC_RTBL_ROOT_MAX];
     char err[200];
     if (version <= rt_best || sn != 64 || n + 64 > sizeof(f)) return 0;
@@ -511,12 +512,16 @@ static int rt_root_row(void *ctx, uint32_t version, uint16_t seq, const uint8_t 
 /* One stored addition on RT's root version, applied in seq order while
  * each passes (OCSS spec §3.6); the first that does not ends the chain. */
 static int rt_add_row(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t n, const uint8_t *sig,
-                      size_t sn)
+                      size_t sn, uint32_t received)
 {
     (void)ctx;
     char msg[96];
     int fresh = 0;
-    int r = sn == 64 ? oc_rtbl_offer(&RT, &RT_TMP, version, blob, n, sig, unix_now(), &fresh, msg, sizeof(msg))
+    /* review I3: checked at the time it was taken (its delegation was valid
+     * then), not at today's clock - an expired delegation, or a clock not
+     * yet set at boot, must not drop blocks already in use. A revoked key
+     * still drops it. */
+    int r = sn == 64 ? oc_rtbl_offer(&RT, &RT_TMP, version, blob, n, sig, received, &fresh, msg, sizeof(msg))
                      : OC_RTBL_INVALID;
     if (r != OC_RTBL_OK || !fresh) {
         oc_log(OC_LOG_WARNING, "route: stored addition %u.%u not applied: %s; the chain ends at %u.%u",
@@ -557,7 +562,26 @@ static int route_sync(void)
     D.route = RT.route;
     oc_log(OC_LOG_INFO, "route: signed table %u.%u, %u blocks", (unsigned)RT.root.version, (unsigned)RT.seq,
            (unsigned)RT.route.n);
-    return route_checks() != 0 || peers_cover_route() != 0 ? -1 : 0;
+    if (route_checks() != 0 || peers_cover_route() != 0) return -1;
+    /* review M7: what load_config checked against the file's table, again
+     * against the one in force (a newer stored root may differ) */
+    static const uint8_t none[OC_SIG_NUMBER_LEN];
+    if (service_ok("echo", D.cfg.echo_number) != 0) return -1;
+    if (memcmp(D.cfg.playback_number, none, OC_SIG_NUMBER_LEN) != 0 && service_ok("playback", D.cfg.playback_number) != 0) {
+        return -1;
+    }
+    for (unsigned i = 0; i < D.cfg.nstreams; i++) {
+        if (service_ok("stream", D.cfg.streams[i].number) != 0) return -1;
+    }
+    for (unsigned j = 0; j < D.ocss_cfg.npeer; j++) {
+        int listed = 0;
+        for (unsigned c = 0; c < RT.root.ncores; c++) listed |= RT.root.cores[c].id == D.ocss_cfg.peer[j].core_id;
+        if (!listed) {
+            oc_log(OC_LOG_ERR, "config: peer %u is not in the signed table's directory", D.ocss_cfg.peer[j].core_id);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int load_config(const char *path, const char *db)

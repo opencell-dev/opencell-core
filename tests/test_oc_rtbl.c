@@ -196,6 +196,8 @@ static void test_an_addition_is_taken_once(void)
     TEST_ASSERT_EQUAL_INT(OC_RTBL_OK, offer(blob, n, sig, NOW, &fresh, msg)); /* again: ok, nothing new */
     TEST_ASSERT_EQUAL_INT(0, fresh);
     TEST_ASSERT_EQUAL_UINT(4, NEXT.route.n);
+    TEST_ASSERT_EQUAL_INT(OC_RTBL_OK, offer(blob, n, sig, NOW + 400u * 86400u, &fresh, msg)); /* held: even after expiry (review M8) */
+    TEST_ASSERT_EQUAL_INT(0, fresh);
     n = addition(blob, sig, 1, "945", 5, "US-TX", D_SEED, D_PUB); /* another one at seq 1 */
     TEST_ASSERT_EQUAL_INT(OC_RTBL_TAKEN, offer(blob, n, sig, NOW, &fresh, msg));
     n = addition(blob, sig, 2, "945", 5, "US-TX", D_SEED, D_PUB);

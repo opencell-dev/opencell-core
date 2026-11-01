@@ -495,6 +495,19 @@ int oc_rtbl_offer(const oc_rtbl_t *cur, oc_rtbl_t *next, uint32_t table_version,
         errf(msg, cap, "root version %u expected", (unsigned)cur->root.version);
         return OC_RTBL_INVALID;
     }
+    sha256(blob, n, h);
+    if (a.seq <= cur->seq && a.seq <= OC_RTBL_SEQ_MAX && memcmp(cur->add_sha[a.seq - 1u], h, 32) == 0) {
+        /* rule 6's repeat, first (review M8): the very bytes taken before
+         * change nothing, even once their delegation has expired - but a
+         * signature that does not verify is still refused */
+        if (!oc_rtbl_verify(a.delegate, blob, n, sig)) {
+            errf(msg, cap, "bad signature");
+            return OC_RTBL_INVALID;
+        }
+        if (next != cur) memcpy(next, cur, sizeof(*next));
+        errf(msg, cap, "already held");
+        return OC_RTBL_OK;
+    }
     const oc_rtbl_deleg_t *d = deleg_valid(&cur->root, a.delegate, now); /* rule 4 */
     if (d == NULL) {
         errf(msg, cap, "no valid delegation for that key");
@@ -504,13 +517,7 @@ int oc_rtbl_offer(const oc_rtbl_t *cur, oc_rtbl_t *next, uint32_t table_version,
         errf(msg, cap, "bad signature");
         return OC_RTBL_INVALID;
     }
-    sha256(blob, n, h);
-    if (a.seq <= cur->seq) { /* rule 6 */
-        if (a.seq <= OC_RTBL_SEQ_MAX && memcmp(cur->add_sha[a.seq - 1u], h, 32) == 0) {
-            if (next != cur) memcpy(next, cur, sizeof(*next));
-            errf(msg, cap, "already held");
-            return OC_RTBL_OK;
-        }
+    if (a.seq <= cur->seq) { /* rule 6 (its repeat was taken above) */
         errf(msg, cap, "seq %u holds another addition", (unsigned)a.seq);
         return OC_RTBL_TAKEN;
     }

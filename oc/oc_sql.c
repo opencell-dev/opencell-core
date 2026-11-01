@@ -996,13 +996,13 @@ int oc_sql_route_put(oc_sql_t *s, int kind, uint32_t version, uint16_t seq, cons
 
 int oc_sql_route_list(oc_sql_t *s, int kind, uint32_t version,
                       int (*fn)(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
-                                const uint8_t *sig, size_t sig_len),
+                                const uint8_t *sig, size_t sig_len, uint32_t received),
                       void *ctx)
 {
     int rc = SQLITE_DONE;
     sqlite3_stmt *st = prep(s, kind == OC_SQL_ROUTE_ROOT
-                                   ? "SELECT version, seq, blob, sig FROM route WHERE kind = ?1 ORDER BY version, seq"
-                                   : "SELECT version, seq, blob, sig FROM route WHERE kind = ?1 AND version = ?2"
+                                   ? "SELECT version, seq, blob, sig, received FROM route WHERE kind = ?1 ORDER BY version, seq"
+                                   : "SELECT version, seq, blob, sig, received FROM route WHERE kind = ?1 AND version = ?2"
                                      " ORDER BY seq");
     if (st == NULL || sqlite3_bind_int(st, 1, kind) != SQLITE_OK ||
         (kind != OC_SQL_ROUTE_ROOT && sqlite3_bind_int64(st, 2, version) != SQLITE_OK)) {
@@ -1015,7 +1015,8 @@ int oc_sql_route_list(oc_sql_t *s, int kind, uint32_t version,
         const uint8_t *sig = sqlite3_column_blob(st, 3);
         int sn = sqlite3_column_bytes(st, 3);
         if (fn(ctx, (uint32_t)sqlite3_column_int64(st, 0), (uint16_t)sqlite3_column_int(st, 1), blob,
-               blob != NULL ? (size_t)bn : 0, sig, sig != NULL ? (size_t)sn : 0) != 0) {
+               blob != NULL ? (size_t)bn : 0, sig, sig != NULL ? (size_t)sn : 0,
+               (uint32_t)sqlite3_column_int64(st, 4)) != 0) {
             rc = SQLITE_DONE;
             break;
         }

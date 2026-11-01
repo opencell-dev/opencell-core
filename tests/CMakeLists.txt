@@ -29,6 +29,8 @@ oc_test(test_oc_seal oc_store)
 oc_test(test_oc_sql oc_store)
 oc_test(test_oc_admin oc_store)
 oc_test(test_oc_api oc_store)
+oc_test(test_oc_rtbl oc_store)
+add_test(NAME test_oc_route_tool COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_route_tool.sh $<TARGET_FILE:oc-route>)
 # The playback clip's WAV reader and encoders (playback clip spec 2026-10-12,
 # OpenVoxNB spec V7); tests/data holds c2enc's and oc-vox enc's output for a fixture.
 add_executable(test_oc_clip test_oc_clip.c)

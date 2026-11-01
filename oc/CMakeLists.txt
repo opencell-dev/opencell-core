@@ -13,7 +13,7 @@ target_link_libraries(oc_clip PUBLIC oc_core PRIVATE codec2 oc_vox)
 
 find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
-add_library(oc_store STATIC oc_seal.c oc_sql.c oc_admin.c oc_import.c oc_api.c)
+add_library(oc_store STATIC oc_seal.c oc_sql.c oc_admin.c oc_import.c oc_api.c oc_rtbl.c)
 target_include_directories(oc_store PUBLIC include)
 target_link_libraries(oc_store PUBLIC oc_core oc_util oc_phy SQLite::SQLite3 OpenSSL::Crypto)
 
@@ -33,6 +33,11 @@ target_link_libraries(oc-core PRIVATE oc_store oc_net oc_clip)
 if(PROJECT_IS_TOP_LEVEL)
   install(TARGETS oc-core RUNTIME DESTINATION bin)
 endif()
+
+# oc-route: the routing authority's laptop tool (OCSS spec 2026-11-01 §3.7);
+# built, never installed on a core.
+add_executable(oc-route oc_route_tool.c)
+target_link_libraries(oc-route PRIVATE oc_store)
 
 # The admin API's TLS (portal plan P4): oc_tls (OpenSSL 3, TLS 1.3, pinned
 # peer certificates) and oc_apisrv (its listener and connections); oc_ocss,

@@ -135,3 +135,53 @@ size_t oc_clip_encode(uint8_t codec, const int16_t *pcm, size_t n, uint8_t *out,
     int mode = oc_vox_mode_of_codec_id(codec);
     return mode == OC_VOX_MODE_NONE ? 0 : encode_ovx((oc_vox_mode_t)mode, pcm, n, out, out_max);
 }
+
+struct oc_clip_enc {
+    uint8_t        codec;
+    size_t         bytes; /* one block's */
+    struct CODEC2 *c2;  /* Codec2 1200 */
+    oc_vox_enc_t   vox; /* else */
+};
+
+oc_clip_enc_t *oc_clip_enc_new(uint8_t codec)
+{
+    oc_clip_enc_t *e = calloc(1, sizeof(*e));
+    if (e == NULL) return NULL;
+    e->codec = codec;
+    if (codec == OC_CODEC_C2_1200) {
+        e->c2 = codec2_create(CODEC2_MODE_1200);
+        e->bytes = OC_CORE_PLAY_BYTES;
+        if (e->c2 != NULL && codec2_samples_per_frame(e->c2) == 320 && codec2_bytes_per_frame(e->c2) == 6) return e;
+        if (e->c2 != NULL) codec2_destroy(e->c2);
+    } else {
+        int mode = oc_vox_mode_of_codec_id(codec);
+        if (mode != OC_VOX_MODE_NONE) e->bytes = oc_vox_block_bytes((oc_vox_mode_t)mode);
+        if (mode != OC_VOX_MODE_NONE && e->bytes != 0 && e->bytes <= OC_CORE_PLAY_BYTES &&
+            oc_vox_enc_init(&e->vox, (oc_vox_mode_t)mode) == 0) {
+            return e;
+        }
+    }
+    free(e);
+    return NULL;
+}
+
+size_t oc_clip_enc_block(oc_clip_enc_t *e, const int16_t pcm[OC_CLIP_BLOCK], uint8_t *out)
+{
+    if (e->c2 != NULL) {
+        short frame[320];
+        for (size_t i = 0; i < OC_CLIP_BLOCK; i += 320u) {
+            for (size_t j = 0; j < 320u; j++) frame[j] = pcm[i + j];
+            codec2_encode(e->c2, out + i / 320u * 6u, frame);
+        }
+        return OC_CORE_PLAY_BYTES;
+    }
+    oc_vox_encode(&e->vox, pcm, out);
+    return e->bytes;
+}
+
+void oc_clip_enc_free(oc_clip_enc_t *e)
+{
+    if (e == NULL) return;
+    if (e->c2 != NULL) codec2_destroy(e->c2);
+    free(e);
+}

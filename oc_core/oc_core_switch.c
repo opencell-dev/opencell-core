@@ -1,6 +1,7 @@
 /* The switch (network-core spec §7.4-7.6): routes a cell's CALL_ROUTE to
  * the callee's cell, to one of this core's services (the echo service, the
- * playback service: core test services spec §5), or over OCSS to the core
+ * playback service: core test services spec §5; a stream channel:
+ * streaming channel spec 2026-11-01), or over OCSS to the core
  * that is home for the callee's block (spec §6), and serves a peer core's
  * CALL_SETUP the same way; relays alert, answer, release and media between
  * the two legs, runs the setup timer and the playback service's clock, and
@@ -19,14 +20,96 @@ static int num_set(const uint8_t *a)
     return memcmp(a, none, OC_SIG_NUMBER_LEN) != 0;
 }
 
-static int is_service(const oc_core_leg_t *l) { return l->kind == OC_CORE_LEG_ECHO || l->kind == OC_CORE_LEG_PLAY; }
+static int is_service(const oc_core_leg_t *l)
+{
+    return l->kind == OC_CORE_LEG_ECHO || l->kind == OC_CORE_LEG_PLAY || l->kind == OC_CORE_LEG_STREAM;
+}
 
-/* OC_CORE_LEG_ECHO or _PLAY if called is one of this core's services, else 0. */
+/* The cfg.streams index of the stream channel numbered called, or -1. */
+static int stream_of(const oc_core_t *k, const uint8_t *called)
+{
+    for (unsigned i = 0; i < k->cfg.nstreams && i < OC_CORE_STREAMS; i++) {
+        if (num_eq(called, k->cfg.streams[i].number)) return (int)i;
+    }
+    return -1;
+}
+
+/* OC_CORE_LEG_ECHO, _PLAY or _STREAM if called is one of this core's services, else 0. */
 static uint8_t service(const oc_core_t *k, const uint8_t *called)
 {
     if (num_eq(called, k->cfg.echo_number)) return OC_CORE_LEG_ECHO;
     if (num_set(k->cfg.playback_number) && num_eq(called, k->cfg.playback_number)) return OC_CORE_LEG_PLAY;
+    if (stream_of(k, called) >= 0) return OC_CORE_LEG_STREAM;
     return 0;
+}
+
+int oc_core_number_service(const oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN])
+{
+    return service(k, number) != 0;
+}
+
+/* 1 if c is a listener of channel ch: a call to it not on the offline message. */
+static int listener(const oc_core_call_t *c, unsigned ch)
+{
+    return c->used && c->b.kind == OC_CORE_LEG_STREAM && c->stream == ch && !c->offline;
+}
+
+unsigned oc_core_stream_listeners(const oc_core_t *k, unsigned ch)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < OC_CORE_CALLS; i++) n += listener(&k->calls[i], ch);
+    return n;
+}
+
+uint8_t oc_core_stream_state(const oc_core_t *k, unsigned ch)
+{
+    return ch < OC_CORE_STREAMS ? k->streams[ch].state : OC_CORE_STREAM_IDLE;
+}
+
+uint32_t oc_core_stream_wanted(const oc_core_t *k, unsigned ch)
+{
+    if (ch >= k->cfg.nstreams || ch >= OC_CORE_STREAMS || k->streams[ch].state == OC_CORE_STREAM_IDLE) return 0;
+    return k->streams[ch].epoch;
+}
+
+static int stream_current(const oc_core_t *k, unsigned ch, uint32_t epoch)
+{
+    return ch < k->cfg.nstreams && ch < OC_CORE_STREAMS && k->streams[ch].state != OC_CORE_STREAM_IDLE &&
+           k->streams[ch].epoch == epoch;
+}
+
+void oc_core_stream_ready(oc_core_t *k, unsigned ch, uint32_t epoch, uint64_t now_us)
+{
+    k->now = now_us;
+    if (!stream_current(k, ch, epoch) || k->streams[ch].state != OC_CORE_STREAM_CONNECTING) return;
+    k->streams[ch].state = OC_CORE_STREAM_PLAYING;
+    k->streams[ch].next = now_us;
+    oc_core_logf(k, "stream %u: playing", ch);
+}
+
+/* Channel ch has failed: every listener goes to the offline message (from
+ * its start: at once if connected and started, else when it would have
+ * started), and the channel closes. */
+static void stream_fail(oc_core_t *k, unsigned ch, const char *why)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+        oc_core_call_t *c = &k->calls[i];
+        if (!listener(c, ch)) continue;
+        c->offline = 1;
+        c->play_at = 0;
+        if (c->state == OC_CORE_CALL_ACTIVE && c->play_next < k->now) c->play_next = k->now;
+        n++;
+    }
+    k->streams[ch].state = OC_CORE_STREAM_IDLE;
+    k->streams[ch].close_at = 0;
+    oc_core_logf(k, "stream %u: failed (%s): %u listener%s to the offline message", ch, why, n, n == 1 ? "" : "s");
+}
+
+void oc_core_stream_failed(oc_core_t *k, unsigned ch, uint32_t epoch, const char *why, uint64_t now_us)
+{
+    k->now = now_us;
+    if (stream_current(k, ch, epoch)) stream_fail(k, ch, why != NULL ? why : "?");
 }
 
 /* The message form a cell's or a peer's leg takes: its link's version
@@ -140,9 +223,10 @@ static void cdr(oc_core_t *k, const oc_core_call_t *c, uint8_t cause)
 
 static void end_call(oc_core_t *k, oc_core_call_t *c, uint8_t cause)
 {
-    if (c->b.kind == OC_CORE_LEG_PLAY && c->answer != 0) {
-        oc_core_logf(k, "call %08x: playback sent %u payloads, skipped %u", (unsigned)c->a.ref, (unsigned)c->play_sent,
-                     (unsigned)c->play_skipped);
+    if ((c->b.kind == OC_CORE_LEG_PLAY || c->b.kind == OC_CORE_LEG_STREAM) && c->answer != 0) {
+        oc_core_logf(k, "call %08x: %s sent %u payloads, skipped %u%s", (unsigned)c->a.ref,
+                     c->b.kind == OC_CORE_LEG_PLAY ? "playback" : "stream", (unsigned)c->play_sent,
+                     (unsigned)c->play_skipped, c->offline ? " (offline message)" : "");
     }
     if (c->relay_dropped != 0) { /* review I2: a peer's MEDIA this core would not pass to the cell at once */
         oc_core_logf(k, "call %08x: relay dropped %u MEDIA (peer -> cell budget)", (unsigned)c->a.ref,
@@ -279,16 +363,23 @@ static void refused(oc_core_t *k, oc_core_call_t *c, uint8_t why)
 
 /* The codec a service answers with (codec negotiation spec §6.3): echo
  * sends back whatever comes, so the best in the caps; playback the best it
- * has a copy of the clip in (OpenVoxNB spec V7), which it notes in c->clip.
- * OC_CODEC_NONE: none. */
+ * has a copy of the clip in (OpenVoxNB spec V7), which it notes in c->clip;
+ * a stream channel likewise from its offline message's copies (the live
+ * audio is encoded in the same codecs). OC_CODEC_NONE: none. */
 static uint8_t service_codec(const oc_core_t *k, oc_core_call_t *c)
 {
     if (c->b.kind == OC_CORE_LEG_ECHO) return oc_codec_best(c->caps);
+    const oc_core_clip_t *clips = k->cfg.clips;
+    unsigned n = k->cfg.nclips;
+    if (c->b.kind == OC_CORE_LEG_STREAM) {
+        clips = k->cfg.streams[c->stream].offline;
+        n = k->cfg.streams[c->stream].noffline;
+    }
     uint8_t have = 0;
-    for (unsigned i = 0; i < k->cfg.nclips; i++) have = (uint8_t)(have | OC_CODEC_BIT(k->cfg.clips[i].codec));
+    for (unsigned i = 0; i < n; i++) have = (uint8_t)(have | OC_CODEC_BIT(clips[i].codec));
     uint8_t codec = oc_codec_best((uint8_t)(c->caps & have));
-    for (unsigned i = 0; i < k->cfg.nclips; i++) {
-        if (k->cfg.clips[i].codec == codec) c->clip = (uint8_t)i;
+    for (unsigned i = 0; i < n; i++) {
+        if (clips[i].codec == codec) c->clip = (uint8_t)i;
     }
     return codec;
 }
@@ -300,6 +391,7 @@ static void start_b(oc_core_t *k, oc_core_call_t *c)
     oc_core_msg_t o;
     memset(&o, 0, sizeof(o));
     if (is_service(&c->b)) {
+        if (c->b.kind == OC_CORE_LEG_STREAM) c->stream = (uint8_t)stream_of(k, c->called);
         if ((c->codec = service_codec(k, c)) == OC_CODEC_NONE) {
             refused(k, c, OC_SIG_CAUSE_NO_CODEC); /* before it rings */
             return;
@@ -307,6 +399,16 @@ static void start_b(oc_core_t *k, oc_core_call_t *c)
         c->state = OC_CORE_CALL_ALERTING;
         c->due = k->now + OC_CORE_ECHO_US;
         to_leg(k, &c->a, OC_CORE_CALL_ALERT, 0);
+        if (c->b.kind == OC_CORE_LEG_STREAM) {
+            oc_core_stream_t *s = &k->streams[c->stream];
+            s->close_at = 0;
+            if (s->state == OC_CORE_STREAM_IDLE) { /* the first listener opens it (spec §4.4) */
+                s->state = OC_CORE_STREAM_CONNECTING;
+                s->epoch++;
+                s->give_up = k->now + OC_CORE_STREAM_START_US;
+                oc_core_logf(k, "stream %u: opening", (unsigned)c->stream);
+            }
+        }
         return;
     }
     /* A link of the old version carries no caps: its far end will answer
@@ -489,8 +591,8 @@ static void leg_rx(oc_core_t *k, oc_core_call_t *c, oc_core_leg_t *leg, oc_core_
         break;
     case OC_CORE_MEDIA: {
         if (c->state != OC_CORE_CALL_ACTIVE) break;
-        if (other->kind == OC_CORE_LEG_PLAY) {
-            /* the caller's terminal is connected: the clip may start now */
+        if (other->kind == OC_CORE_LEG_PLAY || other->kind == OC_CORE_LEG_STREAM) {
+            /* the caller's terminal is connected: the clip (or stream) may start now */
             if (c->play_sent == 0 && c->play_next > k->now) c->play_next = k->now;
             break;
         }
@@ -557,22 +659,146 @@ static void play_tick(oc_core_t *k, oc_core_call_t *c)
     }
 }
 
+/* A stream channel's offline message (streaming channel spec §4.5): its
+ * copy for the call's codec, once, on the call's clock as playback's clip
+ * is; then the service hangs up (cause 0). */
+static void offline_tick(oc_core_t *k, oc_core_call_t *c)
+{
+    const oc_core_clip_t *cl = &k->cfg.streams[c->stream].offline[c->clip];
+    uint32_t bytes = oc_codec_block_bytes(cl->codec), blocks = cl->len / bytes;
+    while (k->now >= c->play_next && c->play_at < blocks) {
+        uint64_t late = k->now - c->play_next;
+        if (late >= OC_CORE_PLAY_LATE_US) {
+            uint64_t n = late / OC_CORE_PLAY_US;
+            c->play_skipped += (uint32_t)n;
+            c->play_seq = (uint16_t)(c->play_seq + n);
+            c->play_at = (uint32_t)(c->play_at + n < blocks ? c->play_at + n : blocks);
+            c->play_next += n * OC_CORE_PLAY_US;
+            continue;
+        }
+        media_to(k, &c->a, c->play_seq++, cl->data + (size_t)c->play_at * bytes, (uint8_t)bytes);
+        c->play_sent++;
+        c->play_at++;
+        c->play_next += OC_CORE_PLAY_US;
+    }
+    if (c->play_at >= blocks && k->now >= c->play_next) { /* its last block has had its 120 ms */
+        to_leg(k, &c->a, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NORMAL);
+        end_call(k, c, OC_SIG_CAUSE_NORMAL);
+    }
+}
+
+/* 1 if c is a connected listener of ch whose audio has started. */
+static int hearing(const oc_core_t *k, const oc_core_call_t *c, unsigned ch)
+{
+    return listener(c, ch) && c->state == OC_CORE_CALL_ACTIVE && c->play_next <= k->now;
+}
+
+/* A playing channel's clock (spec §5.1): every block that is due is pulled
+ * from the daemon, encoded in the codecs its hearing listeners use, and
+ * sent to each of them; a block OC_CORE_PLAY_LATE_US late or more is
+ * dropped with every other missed one, as playback's are. The daemon
+ * reports a stream gone silent too long by failing the pull. */
+static void stream_tick(oc_core_t *k, unsigned ch)
+{
+    oc_core_stream_t *s = &k->streams[ch];
+    uint8_t out[OC_CORE_CLIPS][OC_CORE_PLAY_BYTES];
+    uint32_t skip = 0;
+    while (s->state == OC_CORE_STREAM_PLAYING && k->now >= s->next) {
+        uint64_t late = k->now - s->next;
+        if (late >= OC_CORE_PLAY_LATE_US) {
+            uint64_t n = late / OC_CORE_PLAY_US;
+            skip += (uint32_t)n;
+            s->next += n * OC_CORE_PLAY_US;
+            for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+                oc_core_call_t *c = &k->calls[i];
+                if (!hearing(k, c, ch)) continue;
+                c->play_skipped += (uint32_t)n;
+                c->play_seq = (uint16_t)(c->play_seq + n);
+            }
+            continue;
+        }
+        uint8_t want = 0;
+        for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+            const oc_core_call_t *c = &k->calls[i];
+            if (hearing(k, c, ch)) want = (uint8_t)(want | 1u << c->clip);
+        }
+        if (k->io.stream_pull(k->io.ctx, ch, skip, want, out) != 0) {
+            stream_fail(k, ch, "no audio for 5 s");
+            return;
+        }
+        skip = 0;
+        uint32_t bytes;
+        for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
+            oc_core_call_t *c = &k->calls[i];
+            if (!hearing(k, c, ch)) continue;
+            bytes = oc_codec_block_bytes(k->cfg.streams[ch].offline[c->clip].codec);
+            media_to(k, &c->a, c->play_seq++, out[c->clip], (uint8_t)bytes);
+            c->play_sent++;
+        }
+        s->next += OC_CORE_PLAY_US;
+    }
+}
+
+/* A channel's opening and closing (spec §4.4): one that never started gives
+ * up; one with no listener closes OC_CORE_STREAM_TAIL_US after the last. */
+static void stream_life(oc_core_t *k, unsigned ch)
+{
+    oc_core_stream_t *s = &k->streams[ch];
+    if (s->state == OC_CORE_STREAM_IDLE) return;
+    if (oc_core_stream_listeners(k, ch) != 0) {
+        s->close_at = 0;
+        if (s->state == OC_CORE_STREAM_CONNECTING && k->now >= s->give_up) stream_fail(k, ch, "no audio in 10 s");
+        return;
+    }
+    if (s->close_at == 0) s->close_at = k->now + OC_CORE_STREAM_TAIL_US;
+    if (k->now >= s->close_at) {
+        s->state = OC_CORE_STREAM_IDLE;
+        s->close_at = 0;
+        oc_core_logf(k, "stream %u: closed (no listener)", ch);
+    }
+}
+
 /* When oc_core_sw_tick next has something to do for c; UINT64_MAX: nothing. */
-static uint64_t call_due(const oc_core_call_t *c)
+static uint64_t call_due(const oc_core_t *k, const oc_core_call_t *c)
 {
     if (!c->used) return UINT64_MAX;
+    if (c->b.kind == OC_CORE_LEG_STREAM && !c->offline) {
+        /* ringing: answered once the channel plays (stream_fail turns it to
+         * the offline message otherwise); connected: the channel's clock
+         * sends its audio, the call has only its 1 h limit */
+        if (c->state == OC_CORE_CALL_ALERTING && k->streams[c->stream].state != OC_CORE_STREAM_PLAYING) {
+            return UINT64_MAX;
+        }
+        return c->due;
+    }
     if (c->state == OC_CORE_CALL_ROUTING || (c->state == OC_CORE_CALL_ALERTING && is_service(&c->b))) return c->due;
-    if (c->state == OC_CORE_CALL_ACTIVE && c->b.kind == OC_CORE_LEG_PLAY) {
+    if (c->state == OC_CORE_CALL_ACTIVE && (c->b.kind == OC_CORE_LEG_PLAY || c->b.kind == OC_CORE_LEG_STREAM)) {
         return c->play_next < c->due ? c->play_next : c->due;
     }
     return UINT64_MAX;
+}
+
+static uint64_t stream_due(const oc_core_t *k, unsigned ch)
+{
+    const oc_core_stream_t *s = &k->streams[ch];
+    uint64_t due = s->close_at != 0 ? s->close_at : UINT64_MAX;
+    if (s->state == OC_CORE_STREAM_CONNECTING && s->give_up < due) due = s->give_up;
+    if (s->state == OC_CORE_STREAM_PLAYING && s->next < due) due = s->next;
+    if (s->state != OC_CORE_STREAM_IDLE && s->close_at == 0 && oc_core_stream_listeners(k, ch) == 0) {
+        due = k->now; /* its tail starts now */
+    }
+    return due;
 }
 
 uint64_t oc_core_due(const oc_core_t *k)
 {
     uint64_t due = UINT64_MAX;
     for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
-        uint64_t d = call_due(&k->calls[i]);
+        uint64_t d = call_due(k, &k->calls[i]);
+        if (d < due) due = d;
+    }
+    for (unsigned ch = 0; ch < k->cfg.nstreams && ch < OC_CORE_STREAMS; ch++) {
+        uint64_t d = stream_due(k, ch);
         if (d < due) due = d;
     }
     return due;
@@ -580,9 +806,13 @@ uint64_t oc_core_due(const oc_core_t *k)
 
 void oc_core_sw_tick(oc_core_t *k)
 {
+    for (unsigned ch = 0; ch < k->cfg.nstreams && ch < OC_CORE_STREAMS; ch++) {
+        stream_life(k, ch);
+        stream_tick(k, ch);
+    }
     for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
         oc_core_call_t *c = &k->calls[i];
-        if (k->now < call_due(c)) continue; /* also: not used, or nothing to do */
+        if (k->now < call_due(k, c)) continue; /* also: not used, or nothing to do */
         if (c->state == OC_CORE_CALL_ROUTING) { /* no alert or release from the callee's side in 10 s */
             to_leg(k, &c->a, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NET_FAILURE);
             to_leg(k, &c->b, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NET_FAILURE);
@@ -594,10 +824,15 @@ void oc_core_sw_tick(oc_core_t *k)
             if (c->b.kind == OC_CORE_LEG_PLAY) {
                 c->play_next = k->now + OC_CORE_PLAY_LEAD_US;
                 c->due = k->now + OC_CORE_PLAY_MAX_US;
+            } else if (c->b.kind == OC_CORE_LEG_STREAM) { /* live, or the offline message (spec §4.2) */
+                c->play_next = k->now + OC_CORE_PLAY_LEAD_US;
+                c->due = k->now + OC_CORE_STREAM_MAX_US;
             }
-        } else if (k->now >= c->due) { /* the playback service has played long enough */
+        } else if (k->now >= c->due) { /* the playback service or stream channel has played long enough */
             to_leg(k, &c->a, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NORMAL);
             end_call(k, c, OC_SIG_CAUSE_NORMAL);
+        } else if (c->b.kind == OC_CORE_LEG_STREAM) {
+            if (c->offline) offline_tick(k, c);
         } else {
             play_tick(k, c);
         }

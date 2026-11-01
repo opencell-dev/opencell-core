@@ -240,7 +240,7 @@ static int check(oc_admin_t *a, imp_t *m, const char *path, int *key_there, oc_b
         char t[OC_SIG_NUMBER_TEXT];
         const uint8_t *n = m->sub[i].number;
         oc_sig_number_to_text(n, t);
-        if (!oc_sig_number_valid(n) || oc_core_number_reserved(n) ||
+        if (!oc_sig_number_valid(n) || oc_core_number_reserved(n) || (a->core != NULL && oc_core_number_service(a->core, n)) ||
             !oc_core_route_home(a->route, oc_core_route_find(a->route, n))) {
             oc_buf_printf(o, "%s: not a number of a block this core is home for, or reserved (nothing imported)\n", t);
             return 1;

@@ -9,6 +9,15 @@ echo = +883160655500100
 # tools/clip/oc-clip-gen). Both or neither.
 #playback = +883160655500101
 #playback_clip = /etc/opencell/playback.wav
+# Stream channels (streaming channel spec 2026-11-01): NUMBER URL OFFLINE_CLIP,
+# up to 4 lines. A call to NUMBER (a full number in this core's block, no
+# subscriber's) hears the live stream at URL, fetched by a confined ffmpeg
+# only while a call is on it (and 5 s after); 1 h at most. If the stream
+# doesn't start in 10 s, or fails, the caller hears OFFLINE_CLIP (a WAV as
+# playback_clip's, 30 s at most; oc-clip-gen say TEXT OUT.wav) and is hung
+# up. stream_ffmpeg: the ffmpeg to run (apt install ffmpeg).
+#stream = +883186540901021 https://s4.radio.co/sbd220eafd/listen /etc/opencell/stream-hamshack-offline.wav
+#stream_ffmpeg = /usr/bin/ffmpeg
 # PREFIX INDEX [HOME_CORE]: a numbering block (one line each). Without
 # HOME_CORE it is this core's; with another core's id, calls to its numbers
 # go to that core over OCSS, which needs a peer line for it.

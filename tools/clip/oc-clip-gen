@@ -2,6 +2,9 @@
 """oc-clip-gen: the playback service's clip (core test services spec §5.2).
 
     oc-clip-gen WORD OUT.wav        WORD: one, two, three or four (the core)
+    oc-clip-gen say TEXT OUT.wav    a stream channel's offline message
+                                    (streaming channel spec 2026-11-01 §4.6):
+                                    TEXT, then 0.5 s of silence
 
 Speaks "This is OpenCell core WORD. Playback test. Your call is
 connected." and then Harvard sentences list 1, sentences 1-5 (IEEE 1969),
@@ -56,19 +59,22 @@ def say(text: str) -> np.ndarray:
 
 
 def main() -> None:
-    if len(sys.argv) != 3 or sys.argv[1] not in WORDS:
-        raise SystemExit("usage: oc-clip-gen one|two|three|four OUT.wav")
-    text = f"This is OpenCell core {sys.argv[1]}. Playback test. Your call is connected. " + " ".join(HARVARD_1)
-    x = np.concatenate([say(text), np.zeros(RATE)])
+    if len(sys.argv) == 4 and sys.argv[1] == "say" and sys.argv[2].strip():
+        x, out = np.concatenate([say(sys.argv[2]), np.zeros(RATE // 2)]), sys.argv[3]
+    elif len(sys.argv) == 3 and sys.argv[1] in WORDS:
+        text = f"This is OpenCell core {sys.argv[1]}. Playback test. Your call is connected. " + " ".join(HARVARD_1)
+        x, out = np.concatenate([say(text), np.zeros(RATE)]), sys.argv[2]
+    else:
+        raise SystemExit("usage: oc-clip-gen one|two|three|four OUT.wav | oc-clip-gen say TEXT OUT.wav")
     x *= min(1.0, (10 ** (-1 / 20)) / max(1e-9, float(np.max(np.abs(x)))))
     x = np.concatenate([x, np.zeros((-len(x)) % BLOCK)])
     pcm = np.clip(np.round(x * 32767), -32768, 32767).astype("<i2")
-    with wave.open(sys.argv[2], "wb") as w:
+    with wave.open(out, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(RATE)
         w.writeframes(pcm.tobytes())
-    print(f"{sys.argv[2]}: {len(pcm) / RATE:.2f} s, {len(pcm) // BLOCK} blocks of 120 ms")
+    print(f"{out}: {len(pcm) / RATE:.2f} s, {len(pcm) // BLOCK} blocks of 120 ms")
 
 
 if __name__ == "__main__":

@@ -115,8 +115,8 @@ static void make_core(core_t *c, uint16_t id, const oc_core_io_t *io)
  * pinning core 2's certificate. */
 static void world(const char *core2_pins)
 {
-    static const oc_core_io_t IO1 = { NULL, send1, close1, rnd, unix_now, NULL };
-    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL };
+    static const oc_core_io_t IO1 = { NULL, send1, close1, rnd, unix_now, NULL, NULL };
+    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL, NULL };
     char err[300];
     memset(&C1, 0, sizeof(C1));
     memset(&C2, 0, sizeof(C2));
@@ -265,8 +265,8 @@ static void test_a_link_whose_peer_goes_is_reported_and_dialled_again(void)
  * come from core 2 dialling out, not core 1 dialling in. */
 static void test_a_peer_configured_to_be_dialled_refuses_an_inbound_link(void)
 {
-    static const oc_core_io_t IO1 = { NULL, send1, close1, rnd, unix_now, NULL };
-    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL };
+    static const oc_core_io_t IO1 = { NULL, send1, close1, rnd, unix_now, NULL, NULL };
+    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL, NULL };
     char err[300];
     memset(&C1, 0, sizeof(C1));
     memset(&C2, 0, sizeof(C2));
@@ -323,7 +323,7 @@ static void test_a_second_handshake_from_the_same_address_is_refused(void)
 static void test_an_ipv6_listen_address_binds_too(void)
 {
     char err[300];
-    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL };
+    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL, NULL };
     memset(&C2, 0, sizeof(C2));
     make_core(&C2, 2, &IO2);
     oc_ocss_cfg_t c2 = { "[::1]:0", f("core2.crt"), f("core2.key"), f("ca.crt"), { { 0 } }, 1, &C2.k, now_us, new_link,

@@ -49,6 +49,34 @@ typedef struct {
     const uint8_t *data;
     uint32_t       len;
 } oc_core_clip_t;
+/* Stream channels (streaming channel spec 2026-11-01): a service number
+ * that plays a live internet stream. The daemon fetches and decodes the
+ * stream only while oc_core_stream_wanted says so, and hands the library one
+ * 120 ms block per codec in use (io.stream_pull) on the library's clock. If
+ * the stream never starts, stops, or goes silent, every listener hears the
+ * channel's offline message once and is hung up (cause 0). */
+#define OC_CORE_STREAMS            4u
+#define OC_CORE_STREAM_START_US    10000000u     /* opened to first audio, else the offline message */
+#define OC_CORE_STREAM_TAIL_US     5000000u      /* kept open this long after its last listener */
+#define OC_CORE_STREAM_MAX_US      3600000000ull /* the service hangs up (cause 0) after 1 h connected */
+
+typedef struct {
+    uint8_t        number[OC_SIG_NUMBER_LEN];
+    /* the offline message, one copy per codec (as the playback clip's) */
+    oc_core_clip_t offline[OC_CORE_CLIPS];
+    uint8_t        noffline;
+} oc_core_stream_cfg_t;
+
+enum { OC_CORE_STREAM_IDLE = 0, OC_CORE_STREAM_CONNECTING = 1, OC_CORE_STREAM_PLAYING = 2 };
+
+typedef struct {
+    uint8_t  state;    /* OC_CORE_STREAM_* */
+    uint32_t epoch;    /* counts the openings; the daemon's fetch serves one */
+    uint64_t give_up;  /* CONNECTING: the offline message if no audio by then */
+    uint64_t next;     /* PLAYING: the next block is due */
+    uint64_t close_at; /* no listener left: closed then; 0: not set */
+} oc_core_stream_t;
+
 /* The relay budget from a peer leg into a cell leg (review I2): at most
  * this many MEDIA at once, refilled at OC_CORE_PLAY_US (the voice spec §3
  * frame), so a burst after a stalled OCSS link can't fill the cell's
@@ -66,6 +94,8 @@ typedef struct {
     uint8_t        playback_number[OC_SIG_NUMBER_LEN];
     oc_core_clip_t clips[OC_CORE_CLIPS];
     uint8_t        nclips;
+    oc_core_stream_cfg_t streams[OC_CORE_STREAMS]; /* the first nstreams; each number set, its offline copies agreeing */
+    uint8_t              nstreams;
 } oc_core_cfg_t;
 
 typedef struct {
@@ -77,6 +107,13 @@ typedef struct {
     void     (*random)(void *ctx, uint8_t *out, size_t n);
     uint32_t (*unix_now)(void *ctx);
     void     (*log)(void *ctx, const char *line);
+    /* Stream channel ch's next 120 ms block (streaming channel spec §5.1),
+     * after first dropping skip blocks (the loop stalled): out[i] is filled
+     * with the block encoded in cfg.streams[ch].offline[i].codec for each
+     * bit i of want (want 0: the block is only consumed). 0, or -1: the
+     * stream has given no audio for too long (failed). NULL with no streams. */
+    int      (*stream_pull)(void *ctx, unsigned ch, uint32_t skip, uint8_t want,
+                            uint8_t out[OC_CORE_CLIPS][OC_CORE_PLAY_BYTES]);
 } oc_core_io_t;
 
 /* A cell's latest CELL_STATUS (NOC design §7.3), whole: its parts are
@@ -109,7 +146,7 @@ typedef struct {
  * this core's services (no cell, no ref of its own that anyone sees), or a
  * peer core's leg over OCSS. cell is 0 for every kind but CELL (a cell id is
  * never 0), so a lookup by cell never finds another kind's leg. */
-enum { OC_CORE_LEG_CELL = 0, OC_CORE_LEG_ECHO = 1, OC_CORE_LEG_PLAY = 2, OC_CORE_LEG_PEER = 3 };
+enum { OC_CORE_LEG_CELL = 0, OC_CORE_LEG_ECHO = 1, OC_CORE_LEG_PLAY = 2, OC_CORE_LEG_PEER = 3, OC_CORE_LEG_STREAM = 4 };
 
 typedef struct {
     uint8_t  kind; /* OC_CORE_LEG_* */
@@ -155,6 +192,9 @@ typedef struct {
     uint32_t      play_at;       /* the clip block of the next payload */
     uint16_t      play_seq;      /* its MEDIA seq */
     uint32_t      play_sent, play_skipped;
+    /* b is a stream channel (play_* above count its payloads too): */
+    uint8_t       stream;        /* its cfg.streams index */
+    uint8_t       offline;       /* playing the offline message (clip: its copy), then hanging up */
     /* A leg is a peer, the other a cell: a token bucket (review I2) bounds
      * MEDIA relayed from the peer into the cell's DL queue, so a burst from
      * a stalled link (the peer's own pacing does not protect this core's
@@ -175,6 +215,7 @@ typedef struct {
     uint64_t        prune_at; /* next pruning of issued vectors */
     oc_core_call_t  calls[OC_CORE_CALLS];
     oc_core_peer_t  peers[OC_CORE_PEERS];
+    oc_core_stream_t streams[OC_CORE_STREAMS];
     /* peer cores that refused HELLO at OC_OCSS_PROTO (HELLO_NAK version):
      * dialled at OC_OCSS_PROTO_MIN until a link at it drops (ruling R8); 0: free */
     uint16_t        ocss_old[OC_CORE_PEERS];
@@ -193,8 +234,8 @@ int  oc_core_netkey_new(const oc_core_store_t *st, uint16_t key_id, uint16_t per
 int  oc_core_clip_ok(const oc_core_clip_t *c);
 
 /* 0, or -1 when cfg->key_id is not in the store (or can't be read), or the
- * playback service is configured without copies of its clip that agree
- * (see oc_core_cfg_t).
+ * playback service or a stream channel is configured without copies of its
+ * clip that agree (see oc_core_cfg_t).
  * Keeps nothing of a previous run but what the store holds (a restart). */
 int  oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st, const oc_core_route_t *route,
                   const oc_core_cfg_t *cfg);
@@ -237,6 +278,23 @@ void oc_core_tick(oc_core_t *k, uint64_t now_us);
  * The daemon's poll waits no longer than this, so a payload leaves on time
  * (core test services spec §5.3). */
 uint64_t oc_core_due(const oc_core_t *k);
+
+/* Stream channels (streaming channel spec §4-§5). wanted: the epoch of the
+ * opening the daemon's fetch should serve now, or 0: none (kill any fetch).
+ * An epoch it isn't serving yet means start a new fetch (killing an older
+ * one). ready: that fetch has its first second of audio. failed: it ended,
+ * erred or went silent (why is logged). Calls about an epoch that is not
+ * current are ignored. */
+uint32_t oc_core_stream_wanted(const oc_core_t *k, unsigned ch);
+void     oc_core_stream_ready(oc_core_t *k, unsigned ch, uint32_t epoch, uint64_t now_us);
+void     oc_core_stream_failed(oc_core_t *k, unsigned ch, uint32_t epoch, const char *why, uint64_t now_us);
+/* For status: the channel's state (OC_CORE_STREAM_*) and its listeners
+ * (calls to it, ringing or connected, not hearing the offline message). */
+uint8_t  oc_core_stream_state(const oc_core_t *k, unsigned ch);
+unsigned oc_core_stream_listeners(const oc_core_t *k, unsigned ch);
+/* 1 if number is one of this core's service numbers (echo, playback, a
+ * stream channel): no subscriber may have it (streaming channel spec §4.1). */
+int      oc_core_number_service(const oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN]);
 
 /* Admin (plan 8's CLI drives these). A new cell is enabled, in channel-list
  * group list_id (0: none); 0, -1 if it exists (or cell_id is 0), or -2 if the

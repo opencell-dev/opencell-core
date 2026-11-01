@@ -19,6 +19,7 @@ oc_test(test_core_hss oc_core)
 target_include_directories(test_core_hss PRIVATE ${CMAKE_SOURCE_DIR}/oc_core)
 oc_test(test_core_switch oc_core)
 oc_test(test_core_play oc_core)
+oc_test(test_core_stream oc_core)
 oc_test(test_core_peer oc_core)
 oc_test(test_core_reg oc_core)
 oc_test(test_net_sim oc_cell)
@@ -44,6 +45,9 @@ add_executable(tool_oc_call tool_oc_call.c)
 target_link_libraries(tool_oc_call PRIVATE oc_net)
 add_executable(tool_oc_drip tool_oc_drip.c)
 target_link_libraries(tool_oc_drip PRIVATE oc_util)
+add_test(NAME test_oc_stream_proc
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_stream_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_call>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/data)
 add_test(NAME test_oc_core_proc
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_core_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_hello>
                  $<TARGET_FILE:tool_oc_drip> $<TARGET_FILE:tool_oc_call>)

@@ -687,7 +687,7 @@ static uint64_t ask_one_vector(oc_sql_t *s, int first)
     static oc_core_t k;
     oc_core_route_t rt;
     oc_core_cfg_t cfg;
-    const oc_core_io_t io = { NULL, k_send, NULL, k_random, k_unix, NULL };
+    const oc_core_io_t io = { NULL, k_send, NULL, k_random, k_unix, NULL, NULL };
     oc_core_store_t st = oc_sql_store(s);
     oc_core_route_init(&rt, 1);
     TEST_ASSERT_EQUAL_INT(0, oc_core_route_add(&rt, "8831606", 1, 1));

@@ -260,6 +260,34 @@ static void test_every_served_codec_one_block_per_120_ms(void)
     TEST_ASSERT_EQUAL(0, oc_clip_encode(OC_CODEC_LPCNET_1733, pcm, OC_CLIP_BLOCK, out, sizeof(out)));
 }
 
+/* The live encoder (streaming channel spec §5.2), block after block, gives
+ * the bytes the whole-clip encoder gives for the same samples, per codec. */
+static void test_the_live_encoder_matches_the_clip_encoder(void)
+{
+    enum { BLOCKS = 6 };
+    static int16_t pcm[BLOCKS * OC_CLIP_BLOCK];
+    uint32_t x = 12345u;
+    for (unsigned i = 0; i < BLOCKS * OC_CLIP_BLOCK; i++) { /* a noisy tone */
+        x = x * 1103515245u + 12345u;
+        pcm[i] = (int16_t)((i % 40u < 20u ? 6000 : -6000) + (int)(x >> 20) - 2048);
+    }
+    for (unsigned c = 0; c < OC_CLIP_CODECS; c++) {
+        uint8_t codec = oc_clip_codecs[c], whole[BLOCKS * OC_CORE_PLAY_BYTES], live[BLOCKS * OC_CORE_PLAY_BYTES];
+        size_t n = oc_clip_encode(codec, pcm, BLOCKS * OC_CLIP_BLOCK, whole, sizeof(whole)), o = 0;
+        oc_clip_enc_t *e = oc_clip_enc_new(codec);
+        TEST_ASSERT_NOT_NULL(e);
+        for (unsigned b = 0; b < BLOCKS; b++) {
+            size_t got = oc_clip_enc_block(e, pcm + b * OC_CLIP_BLOCK, live + o);
+            TEST_ASSERT_EQUAL(oc_codec_block_bytes(codec), got);
+            o += got;
+        }
+        oc_clip_enc_free(e);
+        TEST_ASSERT_EQUAL(n, o);
+        TEST_ASSERT_EQUAL_MEMORY(whole, live, n);
+    }
+    TEST_ASSERT_NULL(oc_clip_enc_new(OC_CODEC_LPCNET_1733));
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -272,6 +300,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_encoding_gives_c2encs_bytes);
     RUN_TEST(test_ovx_encoding_gives_oc_vox_enc_bytes);
     RUN_TEST(test_every_served_codec_one_block_per_120_ms);
+    RUN_TEST(test_the_live_encoder_matches_the_clip_encoder);
     RUN_TEST(test_a_part_block_is_padded_to_a_whole_payload);
     RUN_TEST(test_a_short_output_buffer_gives_0);
     RUN_TEST(test_ten_minutes_fills_the_clip_exactly);

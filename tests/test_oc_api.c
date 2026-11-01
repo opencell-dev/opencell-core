@@ -75,7 +75,7 @@ static void world(void)
     uint8_t r[32];
     memset(r, 0x33, sizeof(r));
     TEST_ASSERT_EQUAL_INT(0, oc_core_netkey_new(&st, 1, 1800, r, UNIX0));
-    const oc_core_io_t io = { NULL, k_send, NULL, k_random, k_unix, NULL };
+    const oc_core_io_t io = { NULL, k_send, NULL, k_random, k_unix, NULL, NULL };
     TEST_ASSERT_EQUAL_INT(0, oc_core_init(&core, &io, &st, &route, &cfg));
     memset(&api, 0, sizeof(api));
     api.sql = sql;

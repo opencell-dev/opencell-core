@@ -37,7 +37,12 @@
  * start); peer lines name the other cores (their pinned certificates, and
  * the address of each this core dials), ocss_listen where they reach this
  * one; a block line's third field is its home core. The loop's poll waits
- * no longer than oc_core_due, so a playback payload leaves on time. */
+ * no longer than oc_core_due, so a playback payload leaves on time.
+ *
+ * Stream channels (streaming channel spec 2026-11-01): each stream line is
+ * a service number, the station's URL and its offline message (a WAV like
+ * playback_clip's). While oc_core wants a channel open, a confined ffmpeg
+ * child fetches it (oc_stream.h); its pipe is one more fd in the poll. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -69,6 +74,7 @@
 #include "oc_seal.h"
 #include "oc_sig_keys.h"
 #include "oc_sql.h"
+#include "oc_stream.h"
 #include "oc_tls.h"
 
 #ifndef OC_VERSION
@@ -86,6 +92,8 @@
  * read or write: a peer dripping a byte at a time can't stretch it. */
 #define ADMIN_IO_S     2
 #define CLIENT_WAIT_S  30 /* the client waits this long for the answer */
+#define STREAM_CLIP_BLOCKS 250u /* a stream's offline message: 30 s at most */
+#define STREAM_CLIP_MAX    (OC_CORE_PLAY_BYTES * STREAM_CLIP_BLOCKS)
 
 typedef struct {
     int       used;
@@ -120,6 +128,10 @@ static struct {
     oc_apisrv_t     apisrv;
     oc_tls_t       *tls;
     uint8_t         clip[OC_CLIP_CODECS][OC_CORE_CLIP_MAX]; /* the playback service's copies (OpenVoxNB spec V7), from playback_clip */
+    uint8_t         stream_clip[OC_CORE_STREAMS][OC_CLIP_CODECS][STREAM_CLIP_MAX]; /* each channel's offline message */
+    char            stream_url[OC_CORE_STREAMS][1024];
+    const char     *stream_ffmpeg;
+    oc_stream_t     stream[OC_CORE_STREAMS];
     oc_ocss_cfg_t   ocss_cfg;               /* npeer 0: no OCSS */
     oc_ocss_t       ocss;
     oc_cellsrv_t    cellsrv; /* must not move while open: its TLS ex_data points into it */
@@ -187,7 +199,7 @@ static const char *const KEYS[] = { "core_id",      "key_id",       "echo",     
                                     "api_listen",   "api_cert",     "api_key",       "api_ca",         "api_portal_fpr",
                                     "api_rate",     "playback",     "playback_clip", "peer",           "ocss_listen",
                                     "ocss_cert",    "ocss_key",     "ocss_ca",       "cell_listen",    "cell_cert",
-                                    "cell_key",     "cell_ca",      NULL };
+                                    "cell_key",     "cell_ca",      "stream",        "stream_ffmpeg",  NULL };
 
 /* playback_clip: an 8 kHz mono 16-bit WAV (playback clip spec 2026-10-12
  * §4), read whole, encoded with every codec the core serves (OpenVoxNB spec
@@ -204,7 +216,10 @@ static ssize_t read_all(int fd, uint8_t *b, size_t n)
     }
     return (ssize_t)got;
 }
-static int load_clip(const char *path)
+/* path's WAV encoded into copies[i] (store[i], room bytes each) with every
+ * codec the core serves; key names the setting in a refusal. */
+static int load_wav(const char *key, const char *path, oc_core_clip_t *copies, uint8_t *nout, uint8_t *store,
+                    size_t room)
 {
     char why[160] = "";
     uint8_t *buf = NULL;
@@ -227,24 +242,71 @@ static int load_clip(const char *path)
     } else if ((r = read_all(fd, buf, (size_t)st.st_size)) != (ssize_t)st.st_size) {
         snprintf(why, sizeof(why), "short read");
     } else if (oc_wav_read(buf, (size_t)r, &pcm, &n, why, sizeof(why)) == 0) {
+        if ((n + OC_CLIP_BLOCK - 1u) / OC_CLIP_BLOCK * OC_CORE_PLAY_BYTES > room) {
+            snprintf(why, sizeof(why), "%u.%02u s of audio; at most %u s here", (unsigned)(n / 8000u),
+                     (unsigned)(n % 8000u / 80u), (unsigned)(room / OC_CORE_PLAY_BYTES * 12u / 100u));
+        }
         for (unsigned i = 0; i < OC_CLIP_CODECS && why[0] == '\0'; i++) {
-            oc_core_clip_t *c = &D.cfg.clips[i];
+            oc_core_clip_t *c = &copies[i];
             c->codec = oc_clip_codecs[i];
-            c->data = D.clip[i];
-            c->len = (uint32_t)oc_clip_encode(c->codec, pcm, n, D.clip[i], sizeof(D.clip[i]));
+            c->data = store + i * room;
+            c->len = (uint32_t)oc_clip_encode(c->codec, pcm, n, store + i * room, room);
             if (c->len == 0 || !oc_core_clip_ok(c)) snprintf(why, sizeof(why), "%s encoding failed", oc_codec_name(c->codec));
         }
-        bytes = D.cfg.clips[0].len;
+        bytes = copies[0].len;
     }
     if (fd >= 0) close(fd);
     free(buf);
     free(pcm);
     if (bytes == 0 || why[0] != '\0') {
-        oc_log(OC_LOG_ERR, "config: playback_clip = '%s': %s (tools/clip/oc-clip-gen)", path, why);
-        D.cfg.nclips = 0;
+        oc_log(OC_LOG_ERR, "config: %s = '%s': %s (tools/clip/oc-clip-gen)", key, path, why);
+        *nout = 0;
         return -1;
     }
-    D.cfg.nclips = OC_CLIP_CODECS;
+    *nout = OC_CLIP_CODECS;
+    return 0;
+}
+
+static int load_clip(const char *path)
+{
+    return load_wav("playback_clip", path, D.cfg.clips, &D.cfg.nclips, &D.clip[0][0], sizeof(D.clip[0]));
+}
+
+static int service_ok(const char *key, const uint8_t n[OC_SIG_NUMBER_LEN]);
+
+/* stream = NUMBER URL OFFLINE_CLIP (streaming channel spec §5.3), up to
+ * OC_CORE_STREAMS: a full number in a home block, no other service's; an
+ * http(s) URL; the offline message's WAV. stream_ffmpeg: the fetcher. */
+static int load_streams(void)
+{
+    D.stream_ffmpeg = oc_kv_get(&D.kv, "stream_ffmpeg") ? oc_kv_get(&D.kv, "stream_ffmpeg") : "/usr/bin/ffmpeg";
+    for (unsigned i = 0; oc_kv_nth(&D.kv, "stream", i) != NULL; i++) {
+        const char *v = oc_kv_nth(&D.kv, "stream", i);
+        char num[32], clip[512], extra;
+        oc_core_stream_cfg_t *sc = &D.cfg.streams[i];
+        if (i >= OC_CORE_STREAMS ||
+            sscanf(v, "%31s %1023s %511s %c", num, D.stream_url[i], clip, &extra) != 3 ||
+            (strncmp(D.stream_url[i], "http://", 7) != 0 && strncmp(D.stream_url[i], "https://", 8) != 0) ||
+            oc_sig_number_normalize(num, strlen(num), NULL, sc->number) != 0) {
+            oc_log(OC_LOG_ERR,
+                   "config: stream = '%s': NUMBER URL OFFLINE_CLIP, e.g. stream = +883186540901021 "
+                   "https://example.org/listen /etc/opencell/stream-offline.wav (a full number, an http(s) URL; "
+                   "at most %u)", v, OC_CORE_STREAMS);
+            return -1;
+        }
+        int dup = memcmp(sc->number, D.cfg.echo_number, OC_SIG_NUMBER_LEN) == 0 ||
+                  memcmp(sc->number, D.cfg.playback_number, OC_SIG_NUMBER_LEN) == 0;
+        for (unsigned j = 0; j < i; j++) dup |= memcmp(sc->number, D.cfg.streams[j].number, OC_SIG_NUMBER_LEN) == 0;
+        if (dup) {
+            oc_log(OC_LOG_ERR, "config: stream = '%s': the number is another service's", v);
+            return -1;
+        }
+        if (service_ok("stream", sc->number) != 0 ||
+            load_wav("stream", clip, sc->offline, &sc->noffline, &D.stream_clip[i][0][0], sizeof(D.stream_clip[i][0])) != 0) {
+            return -1;
+        }
+        D.cfg.nstreams = (uint8_t)(i + 1u);
+    }
     return 0;
 }
 
@@ -252,8 +314,10 @@ static int load_clip(const char *path)
  * for: a number of another core's block would hide that core's subscriber. */
 static int service_ok(const char *key, const uint8_t n[OC_SIG_NUMBER_LEN])
 {
+    char t[OC_SIG_NUMBER_TEXT];
     if (oc_core_route_home(&D.route, oc_core_route_find(&D.route, n))) return 0;
-    oc_log(OC_LOG_ERR, "config: %s = %s: not in a block this core is home for", key, oc_kv_get(&D.kv, key));
+    oc_sig_number_to_text(n, t);
+    oc_log(OC_LOG_ERR, "config: %s = %s: not in a block this core is home for", key, t);
     return -1;
 }
 
@@ -381,6 +445,7 @@ static int load_config(const char *path, const char *db)
         }
         if (service_ok("playback", D.cfg.playback_number) != 0 || load_clip(clip) != 0) return -1;
     }
+    if (load_streams() != 0) return -1;
     if (load_peers() != 0) return -1;
     D.db = db != NULL ? db : oc_kv_get(&D.kv, "db") ? oc_kv_get(&D.kv, "db") : "/var/lib/opencell/core/core.db";
     D.cell_sock = oc_kv_get(&D.kv, "cell_socket") ? oc_kv_get(&D.kv, "cell_socket") : "/run/opencell/core.sock";
@@ -662,6 +727,41 @@ static void k_random(void *c, uint8_t *out, size_t n)
 {
     (void)c;
     urandom(out, n);
+}
+
+static int k_stream_pull(void *c, unsigned ch, uint32_t skip, uint8_t want,
+                         uint8_t out[OC_CORE_CLIPS][OC_CORE_PLAY_BYTES])
+{
+    (void)c;
+    if (ch >= D.cfg.nstreams) return -1;
+    return oc_stream_pull(&D.stream[ch], &D.cfg.streams[ch], skip, want, out);
+}
+
+/* Before the daemon serves calls: each channel's fetch can run, and no
+ * subscriber holds a channel's number (streaming channel spec §4.1, §5.2). */
+static int streams_start(const oc_core_store_t *st)
+{
+    for (unsigned i = 0; i < D.cfg.nstreams; i++) {
+        char why[160], t[OC_SIG_NUMBER_TEXT];
+        oc_core_sub_t s;
+        oc_sig_number_to_text(D.cfg.streams[i].number, t);
+        if (oc_stream_check(D.stream_ffmpeg, why, sizeof(why)) != 0) {
+            oc_log(OC_LOG_ERR, "config: stream %s: %s", t, why);
+            return -1;
+        }
+        memset(&s, 0, sizeof(s));
+        int got = st->sub_get(st->ctx, D.cfg.streams[i].number, &s);
+        oc_sig_wipe(&s, sizeof(s));
+        if (got != OC_CORE_STORE_NONE) {
+            oc_log(OC_LOG_ERR, "config: stream %s: %s", t,
+                   got == 0 ? "a subscriber has this number: release it or choose another"
+                            : "can't read whether a subscriber has this number");
+            return -1;
+        }
+        oc_stream_init(&D.stream[i], D.stream_url[i], D.stream_ffmpeg);
+        oc_log(OC_LOG_NOTICE, "stream %u: %s plays %s", i, t, D.stream_url[i]);
+    }
+    return 0;
 }
 
 static uint32_t k_unix(void *c)
@@ -1030,7 +1130,8 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     int rc = 1;
     if (load_config(config, db) != 0 || load_key(key_file) != 0 || open_db() != 0) goto out;
     oc_core_store_t st = oc_sql_store(D.sql);
-    const oc_core_io_t io = { NULL, k_send, k_close, k_random, k_unix, oc_log_line };
+    const oc_core_io_t io = { NULL, k_send, k_close, k_random, k_unix, oc_log_line, k_stream_pull };
+    if (streams_start(&st) != 0) goto out;
     if (oc_core_init(&D.core, &io, &st, &D.route, &D.cfg) != 0) {
         oc_log(OC_LOG_ERR,
                "network key %u can't be read from %s: if it was never made, run `oc-core admin --offline net init`",
@@ -1044,15 +1145,16 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     if (api_start() != 0 || cells_tls_start() != 0 || ocss_start() != 0) goto out;
     oc_log(OC_LOG_NOTICE,
            "oc-core %s: core %u (%s), key %u, %u blocks, db %s (v%d), cells on %s%s%s%s, admin on %s, API %s, "
-           "playback %s, OCSS %u peers%s%s",
+           "playback %s, %u stream channels, OCSS %u peers%s%s",
            OC_VERSION, D.cfg.core_id, D.name, D.cfg.key_id, D.route.n, D.db, oc_sql_version(D.sql), D.cell_sock,
            D.cell_listen != NULL ? " and " : "", D.cell_listen != NULL ? D.cell_listen : "",
            D.cell_listen != NULL ? " (TLS)" : "", D.admin_sock, D.api_listen != NULL ? D.api_listen : "off",
-           D.cfg.nclips != 0 ? "on" : "off",
+           D.cfg.nclips != 0 ? "on" : "off", (unsigned)D.cfg.nstreams,
            D.ocss_cfg.npeer, D.ocss_cfg.listen != NULL ? ", listening on " : "",
            D.ocss_cfg.listen != NULL ? D.ocss_cfg.listen : "");
     while (!g_stop) {
-        struct pollfd p[2 + OC_CORE_LINKS + 1 + OC_APISRV_CONNS + 1 + OC_CELLSRV_PENDING + 1 + OC_OCSS_CONNS];
+        struct pollfd p[2 + OC_CORE_LINKS + 1 + OC_APISRV_CONNS + 1 + OC_CELLSRV_PENDING + 1 + OC_OCSS_CONNS +
+                        OC_CORE_STREAMS];
         dlink_t *who[2 + OC_CORE_LINKS];
         nfds_t np = 0;
         p[np] = (struct pollfd){ D.cell_l, POLLIN, 0 };
@@ -1083,6 +1185,13 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
         nfds_t ocss_at = np;
         unsigned ocss_n = oc_ocss_fds(&D.ocss, p + np, &timeout);
         np += ocss_n;
+        nfds_t stream_at = np;
+        int stream_ch[OC_CORE_STREAMS];
+        for (unsigned i = 0; i < D.cfg.nstreams; i++) {
+            if (oc_stream_fd(&D.stream[i]) < 0) continue;
+            stream_ch[np - stream_at] = (int)i;
+            p[np++] = (struct pollfd){ oc_stream_fd(&D.stream[i]), POLLIN, 0 };
+        }
         int r = poll(p, np, timeout);
         if (r < 0 && errno != EINTR) {
             oc_log(OC_LOG_ERR, "poll: %s", strerror(errno));
@@ -1113,7 +1222,14 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
         if (D.cell_listen != NULL) /* deadlines too; never opened, it has no clock */
             oc_cellsrv_serve(&D.cellsrv, p + cellsrv_at, cellsrv_n, on_cell_tls, NULL);
         oc_ocss_serve(&D.ocss, p + ocss_at, ocss_n);   /* dials and deadlines too */
+        for (nfds_t i = stream_at; r > 0 && i < np; i++) {
+            if (p[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                oc_stream_read(&D.stream[stream_ch[i - stream_at]], (unsigned)stream_ch[i - stream_at], &D.core,
+                               mono_us());
+            }
+        }
         oc_core_tick(&D.core, mono_us());
+        for (unsigned i = 0; i < D.cfg.nstreams; i++) oc_stream_sync(&D.stream[i], i, &D.core, mono_us());
         oc_api_tick(&D.api);
         for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
             if (D.link[i].used && D.link[i].dead && !D.link[i].gated) link_lost(&D.link[i]);
@@ -1141,6 +1257,9 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
     links_down();
     rc = 0;
 out:
+    for (unsigned i = 0; i < D.cfg.nstreams; i++) { /* no fetch outlives oc-core */
+        if (D.stream[i].url != NULL) oc_stream_stop(&D.stream[i]);
+    }
     for (unsigned i = 0; i < OC_CORE_LINKS; i++) {
         if (D.link[i].used) oc_conn_close(&D.link[i].c);
     }

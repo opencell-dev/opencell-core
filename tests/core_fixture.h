@@ -52,7 +52,7 @@ static uint32_t f_unix(void *c)
     (void)c;
     return UNIX0 + (uint32_t)(NOW / 1000000u);
 }
-static const oc_core_io_t CORE_IO = { NULL, f_send, f_close, f_random, f_unix, NULL };
+static const oc_core_io_t CORE_IO = { NULL, f_send, f_close, f_random, f_unix, NULL, NULL };
 
 static inline void number(const char *text, uint8_t out[OC_SIG_NUMBER_LEN])
 {

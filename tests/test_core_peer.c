@@ -144,8 +144,8 @@ static void make_core(core_t *c, uint16_t id, const oc_core_io_t *io, const char
  * of core 1. */
 static void world(void)
 {
-    static const oc_core_io_t IO1 = { NULL, send1, close1, rnd, unix_now, NULL };
-    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL };
+    static const oc_core_io_t IO1 = { NULL, send1, close1, rnd, unix_now, NULL, NULL };
+    static const oc_core_io_t IO2 = { NULL, send2, close2, rnd, unix_now, NULL, NULL };
     for (unsigned i = 0; i < sizeof(CLIP); i++) CLIP[i] = (uint8_t)(0xC0 + i / OC_CORE_PLAY_BYTES);
     NOW = 1000000u;
     QH = QT = NCELL = CUT = 0;

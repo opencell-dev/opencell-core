@@ -36,4 +36,14 @@ extern const uint8_t oc_clip_codecs[OC_CLIP_CODECS];
  * encoder here, out_max too small, or an encoder that can't be made. */
 size_t oc_clip_encode(uint8_t codec, const int16_t *pcm, size_t n, uint8_t *out, size_t out_max);
 
+/* One live encoder (streaming channel spec §5.2): blocks of OC_CLIP_BLOCK
+ * samples in, one after another, each to one block of codec - the bytes
+ * oc_clip_encode gives for the same samples. new: NULL for a codec with no
+ * encoder here (or out of memory). block: the bytes written to out (at
+ * most OC_CORE_PLAY_BYTES). */
+typedef struct oc_clip_enc oc_clip_enc_t;
+oc_clip_enc_t *oc_clip_enc_new(uint8_t codec);
+size_t         oc_clip_enc_block(oc_clip_enc_t *e, const int16_t pcm[OC_CLIP_BLOCK], uint8_t *out);
+void           oc_clip_enc_free(oc_clip_enc_t *e);
+
 #endif

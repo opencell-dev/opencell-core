@@ -25,4 +25,6 @@ assert n % 960 == 0, f"{n} samples: not whole 120 ms blocks"
 assert 15 * 8000 <= n <= 30 * 8000, f"{n / 8000:.2f} s: not 15-30 s"
 EOF2
 cmp -s "$T/a.wav" "$T/c.wav" && fail "core one's clip is core two's"
+"$GEN" say "The stream is offline." "$T/s.wav" >/dev/null || fail "say" # a stream's offline message
+"$GEN" say "" "$T/e.wav" >/dev/null 2>&1 && fail "say with no text was taken"
 echo "all passed"

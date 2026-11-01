@@ -47,6 +47,9 @@ CapabilityBoundingSet=
 # (api_listen, portal plan P4; plan 9's cell links later).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
+# Landlock, for confining a stream channel's ffmpeg before it runs
+# (streaming channel spec 2026-11-01 §5.2; oc_stream.h).
+SystemCallFilter=@sandbox
 SystemCallArchitectures=native
 ProtectSystem=strict
 ProtectHome=yes

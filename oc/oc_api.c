@@ -364,7 +364,10 @@ static uint8_t op_num_free(call_t *c)
         for (int i = 0; pl == 5 && i < 5; i++) {
             if (pattern[i] != 'x') d[10 + i] = pattern[i];
         }
-        if (oc_sig_number_to_bcd(d, 15, num) != 0 || oc_core_number_reserved(num)) continue;
+        if (oc_sig_number_to_bcd(d, 15, num) != 0 || oc_core_number_reserved(num) ||
+            oc_core_number_service(c->a->core, num)) {
+            continue;
+        }
         if (oc_core_route_find(c->a->route, num) != b) continue; /* a longer block inside: not this one's */
         int dup = 0;
         for (unsigned i = 0; i < n && !dup; i++) dup = memcmp(got[i], num, OC_SIG_NUMBER_LEN) == 0;
@@ -387,7 +390,7 @@ static uint8_t op_num_check(call_t *c)
     memcpy(n, p, OC_SIG_NUMBER_LEN);
     if (oc_sig_number_valid(n)) {
         memcpy(c->a->audit_number, n, OC_SIG_NUMBER_LEN);
-        if (!oc_core_number_reserved(n) && home(c->a, n)) {
+        if (!oc_core_number_reserved(n) && !oc_core_number_service(c->a->core, n) && home(c->a, n)) {
             if (oc_api_release_expired(c->a, n) < 0) return fail(c, OC_API_UNAVAILABLE, "store error");
             oc_core_sub_t s;
             int g = sub_get(c->a, n, &s);

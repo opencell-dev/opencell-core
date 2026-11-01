@@ -25,7 +25,8 @@ int oc_core_sub_add(oc_core_t *k, const uint8_t *number, uint8_t out[OC_SIG_NUMB
     int ret = -1;
     memset(&s, 0, sizeof(s));
     if (number != NULL) {
-        if (!oc_sig_number_valid(number) || oc_core_number_reserved(number) || !home_number(k, number) ||
+        if (!oc_sig_number_valid(number) || oc_core_number_reserved(number) || oc_core_number_service(k, number) ||
+            !home_number(k, number) ||
             k->st.sub_get(k->st.ctx, number, &s) != OC_CORE_STORE_NONE) {
             goto done;
         }
@@ -42,6 +43,7 @@ int oc_core_sub_add(oc_core_t *k, const uint8_t *number, uint8_t out[OC_SIG_NUMB
             if (oc_core_number_pick(b, r, n) != 0) goto done;
             /* a pick can land in a longer block inside this one: not ours to assign */
             if (oc_core_route_find(&k->route, n) != b) continue;
+            if (oc_core_number_service(k, n)) continue; /* a stream channel's (streaming channel spec §4.1) */
             int got = k->st.sub_get(k->st.ctx, n, &s);
             if (got == OC_CORE_STORE_FAILED) goto done;
             found = got == OC_CORE_STORE_NONE;
@@ -185,7 +187,7 @@ int oc_core_sub_create(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], ui
         ret = OC_CORE_E_INVALID;
         goto done;
     }
-    if (oc_core_number_reserved(number) || !oc_core_route_home(&k->route, b)) {
+    if (oc_core_number_reserved(number) || oc_core_number_service(k, number) || !oc_core_route_home(&k->route, b)) {
         ret = OC_CORE_E_NOT_ASSIGNABLE;
         goto done;
     }

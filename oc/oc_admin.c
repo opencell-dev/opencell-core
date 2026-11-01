@@ -120,12 +120,21 @@ static int key_state(oc_admin_t *a)
     return got;
 }
 
+/* An offline core plays no stream: its channels are only known, so their
+ * numbers are never assigned (streaming channel spec §4.1). */
+static int o_stream_pull(void *ctx, unsigned ch, uint32_t skip, uint8_t want,
+                         uint8_t out[OC_CORE_CLIPS][OC_CORE_PLAY_BYTES])
+{
+    (void)ctx, (void)ch, (void)skip, (void)want, (void)out;
+    return -1;
+}
+
 /* The daemon's core, or (offline) one of our own over the same store. */
 static oc_core_t *core(oc_admin_t *a, oc_buf_t *out)
 {
     if (a->core != NULL) return a->core;
     if (!a->have_own) {
-        const oc_core_io_t io = { a, o_send, NULL, o_random, o_unix, oc_log_line };
+        const oc_core_io_t io = { a, o_send, NULL, o_random, o_unix, oc_log_line, o_stream_pull };
         oc_core_store_t st = store(a);
         int got = key_state(a);
         if (got == OC_CORE_STORE_NONE) {
@@ -335,6 +344,18 @@ static int cmd_status(oc_admin_t *a, oc_buf_t *o)
         for (unsigned i = 1; i < a->cfg->nclips; i++) oc_buf_printf(o, ", %s %u", oc_codec_name(a->cfg->clips[i].codec), n);
         oc_buf_printf(o, "\n");
     }
+    for (unsigned i = 0; i < a->cfg->nstreams; i++) { /* streaming channel spec §5.4 */
+        static const char *const state[] = { "idle", "connecting", "playing" };
+        char t[OC_SIG_NUMBER_TEXT];
+        oc_sig_number_to_text(a->cfg->streams[i].number, t);
+        if (a->core == NULL) {
+            oc_buf_printf(o, "stream %s: offline\n", t);
+            continue;
+        }
+        uint8_t st = oc_core_stream_state(a->core, i);
+        unsigned n = oc_core_stream_listeners(a->core, i);
+        oc_buf_printf(o, "stream %s: %s, %u listener%s\n", t, st <= 2 ? state[st] : "?", n, n == 1 ? "" : "s");
+    }
     for (unsigned i = 0; i < a->route->n; i++) { /* blocks reached over OCSS (spec §6) */
         const oc_core_block_t *b = &a->route->b[i];
         if (b->home_core == a->cfg->core_id) continue;
@@ -508,7 +529,7 @@ static int cmd_sub(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
         if (argc == 3) {
             if (number_arg(argv[2], n, o) != 0) return 1;
             memcpy(a->audit_number, n, OC_SIG_NUMBER_LEN);
-            if (!home(a, n) || oc_core_number_reserved(n)) {
+            if (!home(a, n) || oc_core_number_reserved(n) || (a->core != NULL && oc_core_number_service(a->core, n))) {
                 oc_buf_printf(o, "%s: not in a block this core is home for, or reserved\n", show(n, sh));
                 return 1;
             }

@@ -122,19 +122,20 @@ int oc_core_clip_ok(const oc_core_clip_t *c)
     return c->data != NULL && bytes != 0 && c->len > 0 && c->len % bytes == 0 && c->len / bytes <= OC_CORE_CLIP_BLOCKS;
 }
 
-/* The playback service's copies: at least one, each good, one length, no codec twice. */
-static int clips_ok(const oc_core_cfg_t *cfg)
+/* A clip's copies (the playback clip's, a stream's offline message): at
+ * least one, each good, one length, no codec twice. */
+static int clips_ok(const oc_core_clip_t *clips, unsigned nclips)
 {
-    if (cfg->nclips == 0 || cfg->nclips > OC_CORE_CLIPS) return 0;
+    if (nclips == 0 || nclips > OC_CORE_CLIPS) return 0;
     uint32_t blocks = 0;
-    for (unsigned i = 0; i < cfg->nclips; i++) {
-        const oc_core_clip_t *c = &cfg->clips[i];
+    for (unsigned i = 0; i < nclips; i++) {
+        const oc_core_clip_t *c = &clips[i];
         if (!oc_core_clip_ok(c)) return 0;
         uint32_t n = c->len / oc_codec_block_bytes(c->codec);
         if (i == 0) blocks = n;
         if (n != blocks) return 0;
         for (unsigned j = 0; j < i; j++) {
-            if (cfg->clips[j].codec == c->codec) return 0;
+            if (clips[j].codec == c->codec) return 0;
         }
     }
     return 1;
@@ -146,8 +147,13 @@ int oc_core_init(oc_core_t *k, const oc_core_io_t *io, const oc_core_store_t *st
     static const uint8_t none[OC_SIG_NUMBER_LEN];
     oc_core_netkey_t key;
     memset(k, 0, sizeof(*k));
-    if (memcmp(cfg->playback_number, none, OC_SIG_NUMBER_LEN) != 0 && !clips_ok(cfg)) {
+    if (memcmp(cfg->playback_number, none, OC_SIG_NUMBER_LEN) != 0 && !clips_ok(cfg->clips, cfg->nclips)) {
         return -1;
+    }
+    if (cfg->nstreams > OC_CORE_STREAMS || (cfg->nstreams != 0 && io->stream_pull == NULL)) return -1;
+    for (unsigned i = 0; i < cfg->nstreams; i++) {
+        const oc_core_stream_cfg_t *sc = &cfg->streams[i];
+        if (memcmp(sc->number, none, OC_SIG_NUMBER_LEN) == 0 || !clips_ok(sc->offline, sc->noffline)) return -1;
     }
     k->io = *io;
     k->st = *st;

@@ -160,7 +160,7 @@ static uint32_t k_unix(void *c)
     (void)c;
     return 1790000000u + (uint32_t)(now / 1000000u);
 }
-static const oc_core_io_t SIM_CORE_IO = { NULL, k_send, k_close, k_random, k_unix, NULL };
+static const oc_core_io_t SIM_CORE_IO = { NULL, k_send, k_close, k_random, k_unix, NULL, NULL };
 
 /* ---- a cell's transport and radio ---- */
 

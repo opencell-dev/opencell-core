@@ -313,7 +313,7 @@ static int av_drop_cell(void *c, uint32_t cell_id)
     oc_core_mem_data_t *d = D(c);
     unsigned k = 0;
     for (unsigned i = 0; i < d->nav; i++) {
-        if (!(d->av[i].cell_id == cell_id && !d->av[i].confirmed)) d->av[k++] = d->av[i];
+        if (!(d->av[i].core == 0 && d->av[i].cell_id == cell_id && !d->av[i].confirmed)) d->av[k++] = d->av[i];
     }
     d->nav = k;
     return 0;
@@ -332,14 +332,15 @@ static int av_del_number(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
     return 0;
 }
 
-static int av_newest_confirmed(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], uint32_t not_cell, uint64_t *sqn)
+static int av_newest_confirmed(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], uint16_t not_core, uint32_t not_cell,
+                               uint64_t *sqn)
 {
     const oc_core_mem_data_t *d = D(c);
     int found = 0;
     if (M(c)->fail_reads & OC_CORE_MEM_FAIL_AV_NEWEST) return OC_CORE_STORE_FAILED;
     for (unsigned i = 0; i < d->nav; i++) {
         const oc_core_av_issued_t *a = &d->av[i];
-        if (!num_eq(a->number, number) || !a->confirmed || a->cell_id == not_cell) continue;
+        if (!num_eq(a->number, number) || !a->confirmed || (a->core == not_core && a->cell_id == not_cell)) continue;
         if (!found || a->sqn > *sqn) *sqn = a->sqn;
         found = 1;
     }
@@ -410,7 +411,7 @@ static int loc_purge_cell(void *c, uint32_t cell_id)
     oc_core_mem_data_t *d = D(c);
     unsigned k = 0;
     for (unsigned i = 0; i < d->nloc; i++) {
-        if (d->loc[i].cell_id != cell_id) d->loc[k++] = d->loc[i];
+        if (!(d->loc[i].core == 0 && d->loc[i].cell_id == cell_id)) d->loc[k++] = d->loc[i];
     }
     d->nloc = k;
     return 0;

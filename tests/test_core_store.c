@@ -364,7 +364,7 @@ static void test_failed_lookups_are_told_from_none(void)
     TEST_ASSERT_EQUAL_INT(0, st.av_put(st.ctx, &a));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.sub_get(st.ctx, n2, &s));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.loc_get(st.ctx, n2, &l));
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.av_newest_confirmed(st.ctx, n2, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.av_newest_confirmed(st.ctx, n2, 0, 0, &top));
 
     mem.fail_reads = OC_CORE_MEM_FAIL_SUB_GET;
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.sub_get(st.ctx, n1, &s));
@@ -374,8 +374,8 @@ static void test_failed_lookups_are_told_from_none(void)
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, n1, &l));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, n2, &l));
     mem.fail_reads = OC_CORE_MEM_FAIL_AV_NEWEST;
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n1, 0, &top));
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n2, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n1, 0, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, n2, 0, 0, &top));
     mem.fail_reads = OC_CORE_MEM_FAIL_SUB_BY_TMID;
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.sub_by_tmid(st.ctx, 0x1234u, &s));
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, n1, &s)); /* only the chosen lookup fails */
@@ -413,7 +413,7 @@ static void test_failed_lookups_are_told_from_none(void)
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, n1, &s)); /* only the chosen lookup fails */
     mem.fail_reads = 0;
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, n1, &s));
-    TEST_ASSERT_EQUAL_INT(0, st.av_newest_confirmed(st.ctx, n1, 0, &top));
+    TEST_ASSERT_EQUAL_INT(0, st.av_newest_confirmed(st.ctx, n1, 0, 0, &top));
 }
 
 static void test_commit_without_begin_is_refused(void)

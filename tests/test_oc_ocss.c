@@ -202,7 +202,7 @@ static void test_a_call_from_core_1_reaches_core_2s_echo(void)
     s.activated = 1;
     s.tmid = 0xaaaa;
     TEST_ASSERT_EQUAL_INT(0, C1.st.sub_put(C1.st.ctx, &s));
-    oc_core_loc_t l = { { 0 }, 1, 0xaaaa, UNIX0 + 3600u, 0, { 0 } };
+    oc_core_loc_t l = { { 0 }, 1, 0xaaaa, UNIX0 + 3600u, 0, { 0 }, 0 };
     memcpy(l.number, na, OC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, C1.st.loc_put(C1.st.ctx, &l));
     memset(&m, 0, sizeof(m));

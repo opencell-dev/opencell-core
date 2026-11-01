@@ -172,7 +172,7 @@ static void world(void)
     s.activated = 1;
     s.tmid = TA;
     TEST_ASSERT_EQUAL_INT(0, C1.st.sub_put(C1.st.ctx, &s));
-    oc_core_loc_t l = { { 0 }, 1, TA, UNIX0 + 3600u, 0, { 0 } };
+    oc_core_loc_t l = { { 0 }, 1, TA, UNIX0 + 3600u, 0, { 0 }, 0 };
     memcpy(l.number, NA, OC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, C1.st.loc_put(C1.st.ctx, &l));
     /* the OCSS link: TLS showed each side the other's pinned certificate */

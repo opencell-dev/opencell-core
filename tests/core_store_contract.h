@@ -142,7 +142,7 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n2, a4.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1)); /* none left: still 0, unlike loc_del's -1 */
     uint64_t top = 0;
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_newest_confirmed(c, n1, 0, &top)); /* none at all */
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_newest_confirmed(c, n1, 0, 0, &top)); /* none at all */
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n2, a4.rand, &ag));
 
@@ -172,17 +172,41 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v3));
     TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v4));
     TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v5));
-    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 7, &top));
+    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 0, 7, &top));
     TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 9u, top);
-    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 8, &top));
+    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 0, 8, &top));
     TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 30u, top);
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_newest_confirmed(c, n2, 9, &top)); /* only cell 9's own */
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_newest_confirmed(c, n2, 0, 9, &top)); /* only cell 9's own */
+    /* OCSS spec §6: the pair (core, cell) is what is excluded - core 2's
+     * cell 7 is another cell than this core's cell 7 */
+    oc_core_av_issued_t v6 = v4;
+    memset(v6.rand, 0xb6, 16);
+    v6.core = 2;
+    v6.sqn = (1ull << 40) + 35u;
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v6));
+    TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, v6.rand, &ag));
+    TEST_ASSERT_EQUAL_UINT16(2, ag.core);
+    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 0, 7, &top));
+    TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 35u, top);
+    TEST_ASSERT_EQUAL_INT(0, st->av_newest_confirmed(c, n1, 2, 7, &top));
+    TEST_ASSERT_EQUAL_UINT64((1ull << 40) + 30u, top);
+    oc_core_av_issued_t v7 = v6; /* core 2's cell 7, unconfirmed: a drop of this core's cell 7 leaves it */
+    memset(v7.rand, 0xb7, 16);
+    v7.confirmed = 0;
+    oc_core_av_issued_t v8 = v7; /* this core's cell 7, unconfirmed: dropped */
+    memset(v8.rand, 0xb8, 16);
+    v8.core = 0;
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v7));
+    TEST_ASSERT_EQUAL_INT(0, st->av_put(c, &v8));
+    TEST_ASSERT_EQUAL_INT(0, st->av_drop_cell(c, 7));
+    TEST_ASSERT_EQUAL_INT(0, st->av_get(c, n1, v7.rand, &ag));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_get(c, n1, v8.rand, &ag));
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n1));
     TEST_ASSERT_EQUAL_INT(0, st->av_del_number(c, n2));
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_newest_confirmed(c, n1, 7, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->av_newest_confirmed(c, n1, 0, 7, &top));
 
     /* locations: one per number; delete; purge a cell's */
-    oc_core_loc_t l1 = { { 0 }, 7, 0x1234u, 5000, 0, { 0 } }, l2 = { { 0 }, 8, 0x5678u, 5000, 0, { 0 } }, lg;
+    oc_core_loc_t l1 = { { 0 }, 7, 0x1234u, 5000, 0, { 0 }, 0 }, l2 = { { 0 }, 8, 0x5678u, 5000, 0, { 0 }, 0 }, lg;
     memcpy(l1.number, n1, OC_SIG_NUMBER_LEN);
     memcpy(l2.number, n2, OC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l1));
@@ -203,6 +227,15 @@ static inline void store_contract(const oc_core_store_t *st)
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->loc_get(c, n1, &lg));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st->loc_get(c, n2, &lg));
     TEST_ASSERT_EQUAL_INT(0, st->loc_purge_cell(c, 8)); /* a bulk delete finding nothing: 0 */
+    /* a location on another core's cell 8 (OCSS spec §6) is not this core's cell 8's */
+    l2.core = 3;
+    TEST_ASSERT_EQUAL_INT(0, st->loc_put(c, &l2));
+    TEST_ASSERT_EQUAL_INT(0, st->loc_get(c, n2, &lg));
+    TEST_ASSERT_EQUAL_UINT16(3, lg.core);
+    TEST_ASSERT_EQUAL_INT(0, st->loc_purge_cell(c, 8));
+    TEST_ASSERT_EQUAL_INT(0, st->loc_get(c, n2, &lg));
+    TEST_ASSERT_EQUAL_INT(0, st->loc_del(c, n2));
+    l2.core = 0;
 
     /* the store contract (oc_core_store.h): a write that fails inside a
      * transaction dooms it, except a delete that finds nothing to delete,

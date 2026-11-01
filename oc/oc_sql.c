@@ -59,7 +59,17 @@ static const char SCHEMA_V2[] =
     "CREATE INDEX cdr_called ON cdr(called, setup);"
     "CREATE INDEX token_unused_expiry ON token(expiry) WHERE used_at = 0;";
 
-static const char *const MIGRATIONS[] = { SCHEMA_V1, SCHEMA_V2 };
+/* v3 (OCSS spec 2026-11-01 §6): a location or issued vector names the
+ * serving core it was relayed through (0: this core's own cell), and the
+ * signed routing table's root versions and delegate additions are kept
+ * (kind 1 root, seq 0; kind 2 an addition). */
+static const char SCHEMA_V3[] =
+    "ALTER TABLE location ADD COLUMN core INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE av_issued ADD COLUMN core INTEGER NOT NULL DEFAULT 0;"
+    "CREATE TABLE route(kind INTEGER NOT NULL, version INTEGER NOT NULL, seq INTEGER NOT NULL, blob BLOB NOT NULL,"
+    " sig BLOB NOT NULL, received INTEGER NOT NULL, PRIMARY KEY(kind, version, seq));";
+
+static const char *const MIGRATIONS[] = { SCHEMA_V1, SCHEMA_V2, SCHEMA_V3 };
 
 static const char KEY_CHECK[] = "OpenCell master key";
 
@@ -531,8 +541,8 @@ static int av_put(void *c, const oc_core_av_issued_t *a)
     int b = SQLITE_OK; /* the binds' codes, OR-ed */
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
-    sqlite3_stmt *st = prep(s, "INSERT OR REPLACE INTO av_issued(number, rand, xres, sqn, cell_id, issued, confirmed)"
-                               " VALUES(?,?,?,?,?,?,?)");
+    sqlite3_stmt *st = prep(s, "INSERT OR REPLACE INTO av_issued(number, rand, xres, sqn, cell_id, issued, confirmed,"
+                               " core) VALUES(?,?,?,?,?,?,?,?)");
     if (st != NULL) {
         num_text(a->number, t);
         b |= sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
@@ -542,6 +552,7 @@ static int av_put(void *c, const oc_core_av_issued_t *a)
         b |= sqlite3_bind_int64(st, 5, a->cell_id);
         b |= sqlite3_bind_int64(st, 6, a->issued);
         b |= sqlite3_bind_int(st, 7, a->confirmed);
+        b |= sqlite3_bind_int(st, 8, a->core);
     }
     return run(s, st, b);
 }
@@ -550,7 +561,7 @@ static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_
 {
     oc_sql_t *s = S(c);
     char t[OC_SIG_NUMBER_TEXT];
-    sqlite3_stmt *st = prep(s, "SELECT xres, sqn, cell_id, issued, confirmed FROM av_issued WHERE number = ? AND rand = ?");
+    sqlite3_stmt *st = prep(s, "SELECT xres, sqn, cell_id, issued, confirmed, core FROM av_issued WHERE number = ? AND rand = ?");
     num_text(number, t);
     int b = SQLITE_ERROR;
     if (st != NULL) {
@@ -567,6 +578,7 @@ static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_
         out->cell_id = (uint32_t)sqlite3_column_int64(st, 2);
         out->issued = (uint32_t)sqlite3_column_int64(st, 3);
         out->confirmed = (uint8_t)sqlite3_column_int(st, 4);
+        out->core = (uint16_t)sqlite3_column_int(st, 5);
     }
     sqlite3_finalize(st);
     return rc;
@@ -574,7 +586,7 @@ static int av_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_
 
 static int av_drop_cell(void *c, uint32_t cell_id)
 {
-    return by_int(S(c), "DELETE FROM av_issued WHERE cell_id = ? AND confirmed = 0", cell_id);
+    return by_int(S(c), "DELETE FROM av_issued WHERE core = 0 AND cell_id = ? AND confirmed = 0", cell_id);
 }
 
 static int av_del_number(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
@@ -582,17 +594,19 @@ static int av_del_number(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
     return by_number(S(c), "DELETE FROM av_issued WHERE number = ?", number);
 }
 
-static int av_newest_confirmed(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], uint32_t not_cell, uint64_t *sqn)
+static int av_newest_confirmed(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], uint16_t not_core, uint32_t not_cell,
+                               uint64_t *sqn)
 {
     oc_sql_t *s = S(c);
     char t[OC_SIG_NUMBER_TEXT];
     sqlite3_stmt *st =
-        prep(s, "SELECT MAX(sqn) FROM av_issued WHERE number = ? AND confirmed = 1 AND cell_id <> ?");
+        prep(s, "SELECT MAX(sqn) FROM av_issued WHERE number = ? AND confirmed = 1 AND NOT (core = ? AND cell_id = ?)");
     num_text(number, t);
     int b = SQLITE_ERROR;
     if (st != NULL) {
         b = sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
-        b |= sqlite3_bind_int64(st, 2, not_cell);
+        b |= sqlite3_bind_int(st, 2, not_core);
+        b |= sqlite3_bind_int64(st, 3, not_cell);
     }
     int rc = get_step(st, b); /* an aggregate: always one row, NULL when none */
     if (rc == 0) {
@@ -616,7 +630,7 @@ static int loc_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc
 {
     oc_sql_t *s = S(c);
     char t[OC_SIG_NUMBER_TEXT];
-    sqlite3_stmt *st = prep(s, "SELECT cell_id, tmid, expires, sqn, rand FROM location WHERE number = ?");
+    sqlite3_stmt *st = prep(s, "SELECT cell_id, tmid, expires, sqn, rand, core FROM location WHERE number = ?");
     num_text(number, t);
     int b = st != NULL ? sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT) : SQLITE_ERROR;
     int rc = get_step(st, b);
@@ -627,6 +641,7 @@ static int loc_get(void *c, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc
         out->tmid = (uint32_t)sqlite3_column_int64(st, 1);
         out->expires = (uint32_t)sqlite3_column_int64(st, 2);
         out->sqn = (uint64_t)sqlite3_column_int64(st, 3);
+        out->core = (uint16_t)sqlite3_column_int(st, 5);
         if (blob_col(st, 4, out->rand, sizeof(out->rand)) != 0) {
             memset(out, 0, sizeof(*out));
             rc = OC_CORE_STORE_FAILED;
@@ -643,7 +658,7 @@ static int loc_put(void *c, const oc_core_loc_t *l)
     char t[OC_SIG_NUMBER_TEXT];
     if (blocked(s)) return -1;
     sqlite3_stmt *st =
-        prep(s, "INSERT OR REPLACE INTO location(number, cell_id, tmid, expires, sqn, rand) VALUES(?,?,?,?,?,?)");
+        prep(s, "INSERT OR REPLACE INTO location(number, cell_id, tmid, expires, sqn, rand, core) VALUES(?,?,?,?,?,?,?)");
     if (st != NULL) {
         num_text(l->number, t);
         b |= sqlite3_bind_text(st, 1, t, -1, SQLITE_TRANSIENT);
@@ -652,6 +667,7 @@ static int loc_put(void *c, const oc_core_loc_t *l)
         b |= sqlite3_bind_int64(st, 4, l->expires);
         b |= sqlite3_bind_int64(st, 5, (sqlite3_int64)l->sqn);
         b |= sqlite3_bind_blob(st, 6, l->rand, sizeof(l->rand), SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int(st, 7, l->core);
     }
     return run(s, st, b);
 }
@@ -667,7 +683,7 @@ static int loc_del(void *c, const uint8_t number[OC_SIG_NUMBER_LEN])
 
 static int loc_purge_cell(void *c, uint32_t cell_id)
 {
-    return by_int(S(c), "DELETE FROM location WHERE cell_id = ?", cell_id);
+    return by_int(S(c), "DELETE FROM location WHERE core = 0 AND cell_id = ?", cell_id);
 }
 
 /* ---- records ---- */
@@ -961,6 +977,53 @@ int oc_sql_expired(oc_sql_t *s, uint32_t now, uint8_t (*out)[OC_SIG_NUMBER_LEN],
     sqlite3_finalize(st);
     return n;
 }
+int oc_sql_route_put(oc_sql_t *s, int kind, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
+                     const uint8_t sig[64], uint32_t received)
+{
+    int b = SQLITE_OK;
+    if (blocked(s)) return -1;
+    sqlite3_stmt *st = prep(s, "INSERT OR REPLACE INTO route(kind, version, seq, blob, sig, received) VALUES(?,?,?,?,?,?)");
+    if (st != NULL) {
+        b |= sqlite3_bind_int(st, 1, kind);
+        b |= sqlite3_bind_int64(st, 2, version);
+        b |= sqlite3_bind_int(st, 3, seq);
+        b |= sqlite3_bind_blob(st, 4, blob, (int)blob_len, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_blob(st, 5, sig, 64, SQLITE_TRANSIENT);
+        b |= sqlite3_bind_int64(st, 6, received);
+    }
+    return run(s, st, b);
+}
+
+int oc_sql_route_list(oc_sql_t *s, int kind, uint32_t version,
+                      int (*fn)(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
+                                const uint8_t *sig, size_t sig_len),
+                      void *ctx)
+{
+    int rc = SQLITE_DONE;
+    sqlite3_stmt *st = prep(s, kind == OC_SQL_ROUTE_ROOT
+                                   ? "SELECT version, seq, blob, sig FROM route WHERE kind = ?1 ORDER BY version, seq"
+                                   : "SELECT version, seq, blob, sig FROM route WHERE kind = ?1 AND version = ?2"
+                                     " ORDER BY seq");
+    if (st == NULL || sqlite3_bind_int(st, 1, kind) != SQLITE_OK ||
+        (kind != OC_SQL_ROUTE_ROOT && sqlite3_bind_int64(st, 2, version) != SQLITE_OK)) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const uint8_t *blob = sqlite3_column_blob(st, 2);
+        int bn = sqlite3_column_bytes(st, 2);
+        const uint8_t *sig = sqlite3_column_blob(st, 3);
+        int sn = sqlite3_column_bytes(st, 3);
+        if (fn(ctx, (uint32_t)sqlite3_column_int64(st, 0), (uint16_t)sqlite3_column_int(st, 1), blob,
+               blob != NULL ? (size_t)bn : 0, sig, sig != NULL ? (size_t)sn : 0) != 0) {
+            rc = SQLITE_DONE;
+            break;
+        }
+    }
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
 int oc_sql_version(oc_sql_t *s) { return user_version(s->db); }
 const char *oc_sql_backup(oc_sql_t *s) { return s->backup; }
 unsigned oc_sql_unseal_failures(oc_sql_t *s) { return s->unseal_failures; }

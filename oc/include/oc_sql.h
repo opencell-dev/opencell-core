@@ -33,7 +33,7 @@
 
 #include "oc_core_store.h"
 
-#define OC_SQL_VERSION 2 /* the schema this build writes */
+#define OC_SQL_VERSION 3 /* the schema this build writes */
 
 /* A rollback past v0.2.0 without restoring the backup: v2 is indexes only,
  * so with oc-core stopped, `sqlite3 core.db "<this>"` gives back the exact
@@ -41,6 +41,14 @@
 #define OC_SQL_V2_TO_V1                                                                                        \
     "DROP INDEX audit_number; DROP INDEX cdr_caller; DROP INDEX cdr_called; DROP INDEX token_unused_expiry;" \
     " PRAGMA user_version = 1;"
+
+/* Back from v0.7.0 (schema v3, OCSS spec 2026-11-01 §6) to v0.6.x without
+ * restoring the backup, oc-core stopped: the route rows go, and locations
+ * and vectors relayed through another core then read as this core's own
+ * cells' (the terminals register again). */
+#define OC_SQL_V3_TO_V2                                                                            \
+    "DROP TABLE route; ALTER TABLE location DROP COLUMN core; ALTER TABLE av_issued DROP COLUMN core;" \
+    " PRAGMA user_version = 2;"
 
 typedef struct oc_sql oc_sql_t;
 
@@ -79,6 +87,18 @@ int oc_sql_cell_cert_get(oc_sql_t *s, uint32_t cell_id, char out[65]);
 /* For the release job (network-core spec §18.3): up to max unactivated
  * subscribers whose unused token expired at or before now, oldest expiry
  * first. How many, or -1 (the store failed). */
+/* The signed routing table's rows (OCSS spec §3.6): kind 1 a root table
+ * (seq 0), kind 2 a delegate addition. put inserts (or, the same key,
+ * replaces) one; 0 or -1. list calls fn for every row of kind (and, for
+ * kind 2, of root version) in (version, seq) order, stopping when fn
+ * returns non-zero; 0, or -1 (the store failed). */
+enum { OC_SQL_ROUTE_ROOT = 1, OC_SQL_ROUTE_ADD = 2 };
+int oc_sql_route_put(oc_sql_t *s, int kind, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
+                     const uint8_t sig[64], uint32_t received);
+int oc_sql_route_list(oc_sql_t *s, int kind, uint32_t version,
+                      int (*fn)(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
+                                const uint8_t *sig, size_t sig_len),
+                      void *ctx);
 int oc_sql_expired(oc_sql_t *s, uint32_t now, uint8_t (*out)[OC_SIG_NUMBER_LEN], int max);
 
 #endif

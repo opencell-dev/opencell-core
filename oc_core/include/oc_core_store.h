@@ -99,17 +99,23 @@ typedef struct {
     uint8_t  number[OC_SIG_NUMBER_LEN];
     uint8_t  rand[16], xres[8]; /* (number, rand) is the key */
     uint64_t sqn;
-    uint32_t cell_id;           /* issued to */
+    uint32_t cell_id;           /* issued to: a cell of core (below) */
     uint32_t issued;
     uint8_t  confirmed;         /* a LOC_UPDATE proved it */
+    uint16_t core;              /* 0: one of this core's cells; else the serving core it was relayed through (OCSS spec §4.3) */
 } oc_core_av_issued_t;
 
+/* core 0: cell_id is one of this core's cells - for a number this core is
+ * home for, or a visitor row (OCSS spec §4.3: a number homed elsewhere that
+ * its home accepted here). Else, for a number this core is home for only,
+ * the serving core the terminal is on, and cell_id is that core's cell. */
 typedef struct {
     uint8_t  number[OC_SIG_NUMBER_LEN];
     uint32_t cell_id, tmid;
     uint32_t expires;
     uint64_t sqn;     /* the SQN of the vector that proved it (network-core spec §19.2) */
     uint8_t  rand[16]; /* ...and its RAND: LOC_CANCEL(moved) names the registration it cancels */
+    uint16_t core;     /* above */
 } oc_core_loc_t;
 
 typedef struct {
@@ -164,18 +170,18 @@ typedef struct {
     int (*av_put)(void *ctx, const oc_core_av_issued_t *a);
     int (*av_get)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_t rand[16],
                   oc_core_av_issued_t *out);
-    int (*av_drop_cell)(void *ctx, uint32_t cell_id);  /* the cell's unconfirmed vectors */
+    int (*av_drop_cell)(void *ctx, uint32_t cell_id);  /* the unconfirmed vectors of this core's cell (core 0) */
     int (*av_del_number)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN]); /* all of the number's (§19.3) */
     /* the highest SQN among the number's confirmed vectors issued to any
-     * cell but not_cell (§19.2's floor for a claim from not_cell): 0, NONE
-     * (no such vector) or FAILED */
-    int (*av_newest_confirmed)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], uint32_t not_cell,
-                               uint64_t *sqn);
+     * (core, cell) but (not_core, not_cell) (§19.2's floor for a claim from
+     * that cell): 0, NONE (no such vector) or FAILED */
+    int (*av_newest_confirmed)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], uint16_t not_core,
+                               uint32_t not_cell, uint64_t *sqn);
     int (*av_prune)(void *ctx, uint32_t issued_before);
     int (*loc_get)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN], oc_core_loc_t *out); /* 0, NONE or FAILED */
     int (*loc_put)(void *ctx, const oc_core_loc_t *l);
     int (*loc_del)(void *ctx, const uint8_t number[OC_SIG_NUMBER_LEN]); /* -1 if there was none */
-    int (*loc_purge_cell)(void *ctx, uint32_t cell_id);
+    int (*loc_purge_cell)(void *ctx, uint32_t cell_id); /* the locations on this core's cell (core 0) */
     int (*cdr_add)(void *ctx, const oc_core_cdr_t *c);
     int (*audit_add)(void *ctx, const oc_core_audit_t *a);
 } oc_core_store_t;

@@ -115,7 +115,7 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
          * stale replay the other floor alone might miss (e.g. no confirmed
          * row survives a purge) - do not "simplify" this away. */
         if (had) floor = old.sqn;
-        got = k->st.av_newest_confirmed(k->st.ctx, num, cell, &top);
+        got = k->st.av_newest_confirmed(k->st.ctx, num, 0, cell, &top);
         if (got == OC_CORE_STORE_FAILED) { /* no floor known: refused, not waved through */
             oc_core_logf(k, "cell %u: location claim for %08x: vector read FAILED", (unsigned)cell,
                          (unsigned)tmid);

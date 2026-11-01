@@ -67,7 +67,7 @@ static void registered(const char *num, uint8_t out[OC_SIG_NUMBER_LEN], uint32_t
     s.activated = 1;
     s.tmid = tmid;
     TEST_ASSERT_EQUAL_INT(0, ST.sub_put(ST.ctx, &s));
-    oc_core_loc_t l = { { 0 }, cell, tmid, UNIX0 + 7200u, 0, { 0 } };
+    oc_core_loc_t l = { { 0 }, cell, tmid, UNIX0 + 7200u, 0, { 0 }, 0 };
     memcpy(l.number, out, OC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, ST.loc_put(ST.ctx, &l));
 }

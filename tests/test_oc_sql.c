@@ -306,7 +306,7 @@ static void test_a_failed_put_fails_the_whole_transaction(void)
     memset(t1.token_id, 1, 8);
     t2 = t1;
     memset(t2.token_id, 2, 8);
-    oc_core_loc_t l = { { 0 }, 1, x.tmid, 5000, 0, { 0 } }, lg;
+    oc_core_loc_t l = { { 0 }, 1, x.tmid, 5000, 0, { 0 }, 0 }, lg;
     memcpy(l.number, x.number, OC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
     TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
@@ -343,7 +343,7 @@ static void test_a_transaction_sqlite_dropped_writes_nothing_more(void)
     TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
     oc_core_store_t st = oc_sql_store(s);
     oc_core_sub_t x = a_sub(), y;
-    oc_core_loc_t l = { { 0 }, 1, x.tmid, 5000, 0, { 0 } }, lg;
+    oc_core_loc_t l = { { 0 }, 1, x.tmid, 5000, 0, { 0 }, 0 }, lg;
     memcpy(l.number, x.number, OC_SIG_NUMBER_LEN);
     TEST_ASSERT_EQUAL_INT(0, st.begin(st.ctx));
     TEST_ASSERT_EQUAL_INT(0, st.sub_put(st.ctx, &x));
@@ -407,11 +407,11 @@ static void test_a_lookup_that_fails_is_not_none(void)
     TEST_ASSERT_EQUAL_UINT(2, oc_sql_unseal_failures(s));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.sub_by_tmid(st.ctx, x.tmid + 1, &y));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.loc_get(st.ctx, x.number, &lg));
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.av_newest_confirmed(st.ctx, x.number, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_NONE, st.av_newest_confirmed(st.ctx, x.number, 0, 0, &top));
     TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), "DROP TABLE location; DROP TABLE av_issued", NULL,
                                                   NULL, NULL));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, x.number, &lg));
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, x.number, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, x.number, 0, 0, &top));
 
     x = a_sub();
     contract_num("+883160655501235", x.number);
@@ -531,7 +531,7 @@ static void test_every_get_tells_failed_from_none(void)
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.sub_get(st.ctx, x.number, &y));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.loc_get(st.ctx, x.number, &lg));
     TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_get(st.ctx, a.number, a.rand, &ag));
-    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, x.number, 0, &top));
+    TEST_ASSERT_EQUAL_INT(OC_CORE_STORE_FAILED, st.av_newest_confirmed(st.ctx, x.number, 0, 0, &top));
     sqlite3_limit(d, SQLITE_LIMIT_LENGTH, 1000000);
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, x.number, &y));
 
@@ -561,7 +561,7 @@ static void test_a_wrong_sized_blob_is_a_failed_read(void)
     oc_core_netkey_t k = { 1, { 1 }, { 2 }, 1800, 100 }, kg;
     oc_core_sub_t x = a_sub();
     oc_core_av_issued_t a, ag;
-    oc_core_loc_t l = { { 0 }, 1, x.tmid, 5000, 7, { 9 } }, lg;
+    oc_core_loc_t l = { { 0 }, 1, x.tmid, 5000, 7, { 9 }, 0 }, lg;
     memset(&a, 0, sizeof(a));
     memcpy(a.number, x.number, OC_SIG_NUMBER_LEN);
     memcpy(l.number, x.number, OC_SIG_NUMBER_LEN);
@@ -743,7 +743,7 @@ static void test_a_v1_database_migrates_to_v2(void)
     oc_sql_close(s);
     s = open_db(db, KEY, NULL, 0, err);
     TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
-    TEST_ASSERT_EQUAL_INT(2, oc_sql_version(s));
+    TEST_ASSERT_EQUAL_INT(OC_SQL_VERSION, oc_sql_version(s));
     TEST_ASSERT_NOT_NULL(strstr(oc_sql_backup(s), "core.db.v1."));
     st = oc_sql_store(s);
     TEST_ASSERT_EQUAL_INT(0, st.sub_get(st.ctx, x.number, &y));
@@ -785,18 +785,90 @@ static void test_v2_rolls_back_to_v1_by_dropping_its_indexes(void)
 {
     static char want[16384], got[16384];
     char err[256];
-    const char *v1[] = { oc_sql_migration(0) };
+    const char *v1[] = { oc_sql_migration(0) }, *v2[] = { oc_sql_migration(0), oc_sql_migration(1) };
     oc_sql_t *s = open_db(":memory:", KEY, v1, 1, err);
     TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
     schema_of(oc_sql_db(s), want, sizeof(want));
     oc_sql_close(s);
-    s = open_db(":memory:", KEY, NULL, 0, err);
+    s = open_db(":memory:", KEY, v2, 2, err);
     TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
     TEST_ASSERT_EQUAL_INT(2, oc_sql_version(s));
     TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), OC_SQL_V2_TO_V1, NULL, NULL, NULL));
     TEST_ASSERT_EQUAL_INT(1, oc_sql_version(s));
     schema_of(oc_sql_db(s), got, sizeof(got));
     TEST_ASSERT_EQUAL_STRING(want, got);
+    oc_sql_close(s);
+}
+
+/* v3 (OCSS spec 2026-11-01 §6): a v2 database (v0.6.0's) opens at v3 with
+ * every row kept and core 0 on its locations and vectors; OC_SQL_V3_TO_V2
+ * gives back the v2 schema v0.6.x opens. */
+static void test_v2_migrates_to_v3_and_rolls_back(void)
+{
+    static char want[16384], got[16384];
+    char err[256];
+    const char *v2[] = { oc_sql_migration(0), oc_sql_migration(1) };
+    fresh_dir();
+    oc_sql_t *s = open_db(db, KEY, v2, 2, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    schema_of(oc_sql_db(s), want, sizeof(want));
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK,
+                          sqlite3_exec(oc_sql_db(s),
+                                       "INSERT INTO location(number, cell_id, tmid, expires, sqn, rand)"
+                                       " VALUES('+883160655501234', 3, 77, 5000, 9, x'00000000000000000000000000000000')",
+                                       NULL, NULL, NULL));
+    oc_sql_close(s);
+    s = open_db(db, KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    TEST_ASSERT_EQUAL_INT(3, oc_sql_version(s));
+    TEST_ASSERT_NOT_NULL(strstr(oc_sql_backup(s), "core.db.v2."));
+    oc_core_store_t st = oc_sql_store(s);
+    oc_core_loc_t l;
+    uint8_t n[OC_SIG_NUMBER_LEN];
+    TEST_ASSERT_EQUAL_INT(0, oc_sig_number_to_bcd("+883160655501234", 16, n));
+    TEST_ASSERT_EQUAL_INT(0, st.loc_get(st.ctx, n, &l));
+    TEST_ASSERT_EQUAL_UINT32(3, l.cell_id);
+    TEST_ASSERT_EQUAL_UINT16(0, l.core);
+    l.core = 2;
+    TEST_ASSERT_EQUAL_INT(0, st.loc_put(st.ctx, &l));
+    TEST_ASSERT_EQUAL_INT(0, st.loc_get(st.ctx, n, &l));
+    TEST_ASSERT_EQUAL_UINT16(2, l.core);
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(oc_sql_db(s), OC_SQL_V3_TO_V2, NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(2, oc_sql_version(s));
+    schema_of(oc_sql_db(s), got, sizeof(got));
+    TEST_ASSERT_EQUAL_STRING(want, got);
+    oc_sql_close(s);
+    rm_dir();
+}
+
+static int route_rows(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t blob_len,
+                      const uint8_t *sig, size_t sig_len)
+{
+    char *out = ctx;
+    size_t n = strlen(out);
+    snprintf(out + n, 64 - n, "%u.%u:%c%u%u ", (unsigned)version, (unsigned)seq, blob_len > 0 ? (char)blob[0] : '-',
+             (unsigned)blob_len, sig_len == 64 && sig[63] == 0x5a);
+    return 0;
+}
+
+/* The signed table's rows (OCSS spec §3.6). */
+static void test_route_rows(void)
+{
+    char err[256], out[64] = "";
+    uint8_t sig[64];
+    memset(sig, 0x5a, sizeof(sig));
+    oc_sql_t *s = open_db(":memory:", KEY, NULL, 0, err);
+    TEST_ASSERT_NOT_NULL_MESSAGE(s, err);
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_route_put(s, OC_SQL_ROUTE_ROOT, 2, 0, (const uint8_t *)"R2", 2, sig, 1));
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_route_put(s, OC_SQL_ROUTE_ROOT, 1, 0, (const uint8_t *)"R1", 2, sig, 1));
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_route_put(s, OC_SQL_ROUTE_ADD, 2, 2, (const uint8_t *)"A22", 3, sig, 1));
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_route_put(s, OC_SQL_ROUTE_ADD, 2, 1, (const uint8_t *)"A21", 3, sig, 1));
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_route_put(s, OC_SQL_ROUTE_ADD, 1, 1, (const uint8_t *)"A11", 3, sig, 1));
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_route_list(s, OC_SQL_ROUTE_ROOT, 0, route_rows, out));
+    TEST_ASSERT_EQUAL_STRING("1.0:R21 2.0:R21 ", out);
+    out[0] = '\0';
+    TEST_ASSERT_EQUAL_INT(0, oc_sql_route_list(s, OC_SQL_ROUTE_ADD, 2, route_rows, out));
+    TEST_ASSERT_EQUAL_STRING("2.1:A31 2.2:A31 ", out);
     oc_sql_close(s);
 }
 
@@ -921,6 +993,8 @@ int main(void)
     RUN_TEST(test_sqn_rises_across_a_core_restart);
     RUN_TEST(test_a_v1_database_migrates_to_v2);
     RUN_TEST(test_v2_rolls_back_to_v1_by_dropping_its_indexes);
+    RUN_TEST(test_v2_migrates_to_v3_and_rolls_back);
+    RUN_TEST(test_route_rows);
     RUN_TEST(test_cert_pins_and_the_expiry_scan);
     RUN_TEST(test_cell_cert_get);
     return UNITY_END();

@@ -45,7 +45,11 @@
  *   0x0E core.status      -                              core id (2), uptime (4, s), cells (4), cells
  *                                                        linked (4), activated subscribers (4), calls
  *                                                        (2), name (text), version (text)
- *   0x0F route.offer      (P5)                           always OC_API_UNSUPPORTED for now
+ *   0x0F route.offer      table_version (4: the root     root version (4), seq (2), blocks (2: in the
+ *                         version it extends), blob len  table now), new (1: 1 taken now, 0 held
+ *                         (2: 1-400), blob (a delegate   already) - OCSS spec 2026-11-01 §5.1;
+ *                         addition, OCSS spec §3.2), sig unsupported: no signed table (block lines);
+ *                         (64: Ed25519 over blob)        invalid / taken / unavailable: §3.5's rules
  *   0x10 cell.radio       cell id (4, 0: every cell)     rows, per radio of a linked cell that has
  *                                                        reported (CELL_STATUS, NOC design §7.3): cell
  *                                                        id (4), radio (1), role (1), band (1), fw (3),
@@ -84,6 +88,11 @@
  *                         part15, 2 part97)                 link dropped, the cell takes it at its next
  *                                                           HELLO and its calls end; a revoked cell:
  *                                                           invalid, nothing changed)
+ *   0x17 route.status     -                              signed (1: 0 block lines, 1 signed table), root
+ *                                                        version (4), seq (2), blocks (2), max index (2:
+ *                                                        a new block takes max + 1), delegation until
+ *                                                        (4: unix s, the latest valid one's end; 0 none)
+ *                                                        - OCSS spec §5.2
  *
  * The core never answers with K, OPc, SQN or a token secret; the QR text
  * of a token it has just issued is the one secret it gives (spec §7).
@@ -117,6 +126,7 @@
 
 #include "oc_admin.h" /* oc_buf_t */
 #include "oc_core.h"
+#include "oc_rtbl.h"
 #include "oc_sql.h"
 
 #define OC_API_FRAME_MAX 512u
@@ -131,7 +141,7 @@ enum {
     OC_API_SUB_RELEASE, OC_API_SUB_DISABLE, OC_API_SUB_ENABLE, OC_API_CDR_LIST, OC_API_CELL_ADD,
     OC_API_CELL_SET_CERT, OC_API_CELL_REVOKE, OC_API_CELL_STATUS, OC_API_CORE_STATUS, OC_API_ROUTE_OFFER,
     OC_API_CELL_RADIO, OC_API_REG_LIST, OC_API_CDR_RECENT, OC_API_AUDIT_LIST, OC_API_OCSS_STATUS,
-    OC_API_CORE_BLOCKS, OC_API_CELL_MODE,
+    OC_API_CORE_BLOCKS, OC_API_CELL_MODE, OC_API_ROUTE_STATUS,
     OC_API_OPS /* one past the last */
 };
 #define OC_API_ANSWER 0x80u /* | op */
@@ -171,7 +181,8 @@ typedef struct {
 
 typedef struct {
     oc_sql_t              *sql;
-    const oc_core_route_t *route;
+    const oc_core_route_t *route; /* the core's live table (&core->route once it runs) */
+    oc_rtbl_t             *rtbl;  /* the signed table, which route.offer extends; NULL: block lines */
     const oc_core_cfg_t   *cfg;
     oc_core_t             *core;
     uint64_t (*now_us)(void);   /* monotonic: rate limits, uptime, oc_core's clock */

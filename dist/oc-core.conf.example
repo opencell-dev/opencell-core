@@ -23,6 +23,12 @@ echo = +883160655500100
 # go to that core over OCSS, which needs a peer line for it.
 block = 8831606 1
 #block = 8831503 2 2
+# ...or, in place of every block line, the signed routing table (OCSS spec
+# 2026-11-01 §3.6): a root table file made by oc-route on the laptop and
+# the routing authority's Ed25519 public key it must verify with. The
+# portal adds new NPAs to it over the admin API (route.offer).
+#route_root = <64 hex digits>
+#route_table = /etc/opencell/route.tbl
 db = /var/lib/opencell/core/core.db
 cell_socket = /run/opencell/core.sock
 cell_group = oc-cell
@@ -61,6 +67,11 @@ admin_group = oc-admin
 # certificate (role core). The ocss_* files as the api_* ones; a pin change
 # takes effect at a restart.
 #peer = 2 10.99.0.2:7443 <64 hex digits>
+# With cell_listen: the issuers a cell certificate may come from - "root"
+# (the OpenCell root itself) and/or the SHA-256 of an intermediate such as
+# the portal's online CA (portal spec §8.3). Unset: anything that chains to
+# cell_ca. Dropping a fingerprint here (and a restart) removes it from trust.
+#cell_issuers = root, <64 hex digits>
 #ocss_listen = 10.99.0.2:7443
 #ocss_cert = /etc/opencell/tls/ocss.crt
 #ocss_key = ocss.key

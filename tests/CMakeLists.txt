@@ -101,6 +101,11 @@ add_test(NAME test_oc_api_proc
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_api_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:tool_oc_api>
                  $<TARGET_FILE:tool_oc_hello> ${CMAKE_BINARY_DIR}/pki)
 set_tests_properties(test_oc_api_proc PROPERTIES FIXTURES_REQUIRED pki)
+# The signed routing table in two oc-core processes (OCSS spec 2026-11-01 §3.6, §5).
+add_test(NAME test_oc_route_proc
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_route_proc.sh $<TARGET_FILE:oc-core> $<TARGET_FILE:oc-route>
+                 $<TARGET_FILE:tool_oc_api> ${CMAKE_BINARY_DIR}/pki)
+set_tests_properties(test_oc_route_proc PROPERTIES FIXTURES_REQUIRED pki)
 # oc-core's cell listener: cells over TLS behind the HELLO gate.
 add_test(NAME test_oc_cell_tls_proc
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_oc_cell_tls_proc.sh $<TARGET_FILE:oc-core>

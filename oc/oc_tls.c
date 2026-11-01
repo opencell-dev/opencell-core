@@ -94,6 +94,23 @@ static int verify_cb(int ok, X509_STORE_CTX *st)
             return 0;
         }
     }
+    if (!t->own && t->cfg.issuers_set) { /* the certificate's own issuer must be a listed one */
+        STACK_OF(X509) *chain = X509_STORE_CTX_get0_chain(st);
+        int n = chain != NULL ? sk_X509_num(chain) : 0, allowed = 0;
+        if (n == 2) {
+            allowed = t->cfg.issuer_root; /* issued by the root itself */
+        } else if (n > 2) {
+            uint8_t imd[32];
+            unsigned imn = 0;
+            if (X509_digest(sk_X509_value(chain, 1), EVP_sha256(), imd, &imn) == 1 && imn == 32) {
+                for (unsigned i = 0; i < t->cfg.nissuer; i++) allowed |= memcmp(imd, t->cfg.issuer[i], 32) == 0;
+            }
+        }
+        if (!allowed) {
+            snprintf(c->why, sizeof(c->why), "%s certificate %.16s... is from an issuer not in cell_issuers", who, hex);
+            return 0;
+        }
+    }
     const char *role = t->own ? t->role : t->cfg.role;
     if (!has_policy(x, role)) {
         snprintf(c->why, sizeof(c->why), "%s certificate %.16s... lacks the role %s", who, hex, role);

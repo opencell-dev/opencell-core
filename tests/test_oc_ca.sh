@@ -81,6 +81,23 @@ key_csr cell
 "$OC_CA" sign ca cell cell.csr cell.crt cell-7 >/dev/null
 check "a cell certificate carries the cell role" bash -c "openssl x509 -in cell.crt -noout -text | grep -q '$ARC.1.3'"
 "$OC_CA" fpr cell.crt > cell.fpr
+# Portal P3 C1 (OCSS spec 2026-11-01 §13): an intermediate like the portal's
+# online one (pathlen 0), a cell certificate from it, and a second one
+# the cores have not listed. oc-ca has no intermediate role yet: openssl.
+for i in inter inter2; do
+    key_csr "$i"
+    printf '[e]\nbasicConstraints = critical, CA:TRUE, pathlen:0\nkeyUsage = critical, keyCertSign, cRLSign\nextendedKeyUsage = clientAuth\ncertificatePolicies = %s.1.3\n' \
+        "$ARC" > "$i.ext"
+    check "intermediate $i" openssl x509 -req -in "$i.csr" -CA ca/ca.crt -CAkey ca/ca.key -sha256 -days 365 \
+        -extfile "$i.ext" -extensions e -out "$i.crt"
+    "$OC_CA" fpr "$i.crt" > "$i.fpr"
+    key_csr "i$i"
+    printf '[e]\nbasicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = clientAuth\ncertificatePolicies = %s.1.3\n' \
+        "$ARC" > "i$i.ext"
+    check "a cell certificate from $i" openssl x509 -req -in "i$i.csr" -CA "$i.crt" -CAkey "$i.key" -sha256 -days 365 \
+        -extfile "i$i.ext" -extensions e -out "i$i.crt"
+    cat "i$i.crt" "$i.crt" > "i$i-chain.crt"
+done
 "$OC_CA" fpr core.crt > core-client.fpr
 "$OC_CA" fpr core.crt > core.fpr
 key_csr core2

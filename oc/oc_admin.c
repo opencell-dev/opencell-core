@@ -356,13 +356,32 @@ static int cmd_status(oc_admin_t *a, oc_buf_t *o)
         unsigned n = oc_core_stream_listeners(a->core, i);
         oc_buf_printf(o, "stream %s: %s, %u listener%s\n", t, st <= 2 ? state[st] : "?", n, n == 1 ? "" : "s");
     }
-    for (unsigned i = 0; i < a->route->n; i++) { /* blocks reached over OCSS (spec §6) */
-        const oc_core_block_t *b = &a->route->b[i];
-        if (b->home_core == a->cfg->core_id) continue;
-        oc_buf_printf(o, "block %s: home core %u, %s\n", b->prefix, (unsigned)b->home_core,
-                      a->core == NULL                              ? "offline"
-                      : oc_core_peer_linked(a->core, b->home_core) ? "peer linked"
-                                                                   : "peer NOT linked (calls get cause 5)");
+    { /* blocks: a count per home core, not a line per block (OCSS spec 2026-11-01 §7: up to 1024) */
+        uint16_t homes[OC_CORE_PEERS + 1];
+        unsigned counts[OC_CORE_PEERS + 1], nh = 0, here = 0;
+        for (unsigned i = 0; i < a->route->n; i++) {
+            const oc_core_block_t *b = &a->route->b[i];
+            if (b->home_core == a->cfg->core_id) {
+                here++;
+                continue;
+            }
+            unsigned j = 0;
+            while (j < nh && homes[j] != b->home_core) j++;
+            if (j == nh && nh <= OC_CORE_PEERS) {
+                homes[nh] = b->home_core;
+                counts[nh++] = 0;
+            }
+            if (j < nh) counts[j]++;
+        }
+        oc_buf_printf(o, "blocks %u (%u homed here)", a->route->n, here);
+        if (a->core != NULL && a->core->table_ver != 0) oc_buf_printf(o, ", signed table %u", (unsigned)a->core->table_ver);
+        oc_buf_printf(o, "\n");
+        for (unsigned j = 0; j < nh; j++) {
+            oc_buf_printf(o, "blocks homed on core %u: %u, %s\n", (unsigned)homes[j], counts[j],
+                          a->core == NULL                             ? "offline"
+                          : oc_core_peer_linked(a->core, homes[j])    ? "peer linked"
+                                                                       : "peer NOT linked (calls get cause 5)");
+        }
     }
     if (oc_sql_unseal_failures(a->sql) != 0) {
         oc_buf_printf(o, "WARNING: %u sealed values did not open (damaged rows): their reads fail\n",
@@ -622,7 +641,7 @@ static int cmd_sub(oc_admin_t *a, int argc, char **argv, oc_buf_t *o)
 static int cmd_loc(oc_admin_t *a, oc_buf_t *o)
 {
     int rc;
-    sqlite3_stmt *s = q(a, "SELECT number, cell_id, tmid, expires FROM location ORDER BY number");
+    sqlite3_stmt *s = q(a, "SELECT number, cell_id, tmid, expires FROM location WHERE core = 0 ORDER BY number");
     long now = (long)time(NULL);
     while ((rc = step(s)) == SQLITE_ROW) {
         long left = (long)sqlite3_column_int64(s, 3) - now;

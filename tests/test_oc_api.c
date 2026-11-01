@@ -1222,6 +1222,137 @@ static void test_ocss_status_and_core_blocks(void)
     done();
 }
 
+/* route.offer and route.status (OCSS spec 2026-11-01 §5.1-5.3) over the
+ * request bytes, with a signed table of 1000 blocks; core.blocks lists
+ * them all over several frames. */
+static oc_rtbl_root_t RROOT;
+static oc_rtbl_t RTBL;
+static uint8_t RFILE[OC_RTBL_ROOT_MAX];
+
+static void test_route_offer_and_status(void)
+{
+    char err[160];
+    uint8_t root_seed[32], del_seed[32], root_pub[32], del_pub[32], sig[64];
+    world();
+    memset(root_seed, 0x41, 32);
+    memset(del_seed, 0x42, 32);
+    TEST_ASSERT_EQUAL_INT(0, oc_rtbl_sign_seed(root_seed, (const uint8_t *)"", 0, sig, root_pub));
+    TEST_ASSERT_EQUAL_INT(0, oc_rtbl_sign_seed(del_seed, (const uint8_t *)"", 0, sig, del_pub));
+    memset(&RROOT, 0, sizeof(RROOT));
+    RROOT.version = 3;
+    RROOT.ncores = 2;
+    RROOT.cores[0].id = 1;
+    strcpy(RROOT.cores[0].name, "a");
+    RROOT.cores[1].id = 2;
+    strcpy(RROOT.cores[1].name, "b");
+    for (unsigned i = 0; i < 1000; i++) {
+        oc_rtbl_block_t *b = &RROOT.blocks[RROOT.nblocks++];
+        unsigned nxx = 200u + i % 700u;
+        if (nxx % 100u == 11u) nxx = 900u + nxx / 100u;
+        snprintf(b->prefix, sizeof(b->prefix), "8831%03u%03u", 202u + i / 700u, nxx);
+        b->idx = (uint16_t)(i + 1u);
+        b->tenant = 1;
+        b->home = (uint16_t)(1u + i % 2u);
+        b->nsec = 1;
+        b->sec[0] = (uint16_t)(2u - i % 2u);
+        b->epoch = 1;
+    }
+    RROOT.max_idx = 1000;
+    oc_rtbl_deleg_t *d = &RROOT.deleg[RROOT.ndeleg++];
+    memcpy(d->pub, del_pub, 32);
+    d->scope = OC_RTBL_SCOPE_ADD_NPA;
+    d->not_before = UNIX0 - 1u;
+    d->not_after = UNIX0 + 86400u;
+    d->tenant = 1;
+    d->east = 1;
+    d->west = 2;
+    strcpy(d->east_st[d->neast++], "US-NC");
+    strcpy(d->west_st[d->nwest++], "US-TX");
+    size_t n = oc_rtbl_root_encode(&RROOT, RFILE, sizeof(RFILE) - 64u);
+    TEST_ASSERT_NOT_EQUAL(0, n);
+    TEST_ASSERT_EQUAL_INT(0, oc_rtbl_sign_seed(root_seed, RFILE, n, RFILE + n, NULL));
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, oc_rtbl_load(&RTBL, 1, root_pub, RFILE, n + 64u, err, sizeof(err)), err);
+    oc_core_route_set(&core, &RTBL.route, RTBL.root.version);
+    api.route = &core.route;
+    api.rtbl = &RTBL;
+    TEST_ASSERT_EQUAL_INT(0, oc_api_rate_set(&api, "route.offer 1000 100", err, sizeof(err)));
+
+    req_t r;
+    begin(&r, OC_API_ROUTE_STATUS, 1, 0);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+    TEST_ASSERT_EQUAL_UINT8(1, ANS[0].body[0]);
+    TEST_ASSERT_EQUAL_UINT32(3, get32(ANS[0].body + 1));
+    TEST_ASSERT_EQUAL_UINT16(0, get16(ANS[0].body + 5));
+    TEST_ASSERT_EQUAL_UINT16(1000, get16(ANS[0].body + 7));
+    TEST_ASSERT_EQUAL_UINT16(1000, get16(ANS[0].body + 9));
+    TEST_ASSERT_EQUAL_UINT32(UNIX0 + 86400u, get32(ANS[0].body + 11));
+
+    oc_rtbl_add_t a;
+    uint8_t blob[OC_RTBL_BLOB_MAX];
+    memset(&a, 0, sizeof(a));
+    a.root_version = 3;
+    a.seq = 1;
+    memcpy(a.delegate, del_pub, 32);
+    a.n = 2;
+    strcpy(a.b[0].npa, "472");
+    a.b[0].idx = 1001;
+    strcpy(a.b[0].state, "US-NC");
+    strcpy(a.b[1].npa, "945");
+    a.b[1].idx = 1002;
+    strcpy(a.b[1].state, "US-TX");
+    size_t bn = oc_rtbl_add_encode(&a, blob, sizeof(blob));
+    TEST_ASSERT_EQUAL_INT(0, oc_rtbl_sign_seed(del_seed, blob, bn, sig, NULL));
+    for (int round = 0; round < 2; round++) { /* the second: held already */
+        begin(&r, OC_API_ROUTE_OFFER, 1, 7);
+        put32(&r, 3);
+        put16(&r, (uint16_t)bn);
+        put(&r, blob, bn);
+        put(&r, sig, 64);
+        TEST_ASSERT_EQUAL_HEX8(OC_API_OK, call1(&r));
+        TEST_ASSERT_EQUAL_UINT32(3, get32(ANS[0].body));
+        TEST_ASSERT_EQUAL_UINT16(1, get16(ANS[0].body + 4));
+        TEST_ASSERT_EQUAL_UINT16(1002, get16(ANS[0].body + 6));
+        TEST_ASSERT_EQUAL_UINT8(round == 0 ? 1 : 0, ANS[0].body[8]);
+    }
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM route WHERE kind = 2 AND version = 3 AND seq = 1"));
+    TEST_ASSERT_EQUAL_INT(1, (int)count_rows("SELECT count(*) FROM audit WHERE detail = 'a7 route.offer ok 3.1'"));
+    uint8_t num[OC_SIG_NUMBER_LEN];
+    TEST_ASSERT_EQUAL_INT(0, oc_sig_number_to_bcd("+883194555501234", 16, num));
+    const oc_core_block_t *b = oc_core_route_find(&core.route, num); /* in force in the core at once */
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_EQUAL_UINT16(2, b->home_core);
+    TEST_ASSERT_EQUAL_UINT16(1002, b->block_idx);
+
+    sig[0] ^= 1; /* refused: invalid, with the reason */
+    begin(&r, OC_API_ROUTE_OFFER, 1, 7);
+    put32(&r, 3);
+    put16(&r, (uint16_t)bn);
+    put(&r, blob, bn);
+    put(&r, sig, 64);
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+    begin(&r, OC_API_ROUTE_OFFER, 1, 7);
+    put32(&r, 3);
+    put16(&r, (uint16_t)bn); /* no blob: malformed */
+    TEST_ASSERT_EQUAL_HEX8(OC_API_INVALID, call1(&r));
+
+    begin(&r, OC_API_CORE_BLOCKS, 1, 0);
+    TEST_ASSERT_EQUAL_INT(0, call(&r));
+    unsigned rows = 0, homes2 = 0;
+    for (int i = 0; i < NANS; i++) {
+        TEST_ASSERT_EQUAL_HEX8(i + 1 < NANS ? OC_API_MORE : OC_API_OK, ANS[i].status);
+        const uint8_t *row = ANS[i].body + 1;
+        for (unsigned k = 0; k < ANS[i].body[0]; k++) {
+            homes2 += get16(row + 2) == 2;
+            TEST_ASSERT_EQUAL_UINT8(get16(row + 2) == 1 ? 1 : 2, row[4]); /* home, or secondary */
+            row += 5 + 1 + row[5];
+            rows++;
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT(1002, rows);
+    TEST_ASSERT_EQUAL_UINT(501, homes2);
+    done();
+}
+
 /* cell.mode (NOC design §7.1): the mode switch, audited with the account;
  * the cell's link drops and its next HELLO takes the mode. */
 static void test_cell_mode(void)
@@ -1337,6 +1468,7 @@ int main(void)
     RUN_TEST(test_cdr_recent);
     RUN_TEST(test_audit_list);
     RUN_TEST(test_ocss_status_and_core_blocks);
+    RUN_TEST(test_route_offer_and_status);
     RUN_TEST(test_cell_mode);
     RUN_TEST(test_reg_list_with_a_cursor_is_audited);
     return UNITY_END();

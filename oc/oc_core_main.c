@@ -71,6 +71,7 @@
 #include "oc_kv.h"
 #include "oc_log.h"
 #include "oc_ocss.h"
+#include "oc_rtbl.h"
 #include "oc_seal.h"
 #include "oc_sig_keys.h"
 #include "oc_sql.h"
@@ -199,7 +200,18 @@ static const char *const KEYS[] = { "core_id",      "key_id",       "echo",     
                                     "api_listen",   "api_cert",     "api_key",       "api_ca",         "api_portal_fpr",
                                     "api_rate",     "playback",     "playback_clip", "peer",           "ocss_listen",
                                     "ocss_cert",    "ocss_key",     "ocss_ca",       "cell_listen",    "cell_cert",
-                                    "cell_key",     "cell_ca",      "stream",        "stream_ffmpeg",  NULL };
+                                    "cell_key",     "cell_ca",      "stream",        "stream_ffmpeg",  "route_root",
+                                    "route_table",  "cell_issuers", NULL };
+
+/* The signed routing table (OCSS spec 2026-11-01 §3.6), with route_table:
+ * the effective table route.offer extends. ~100 KB each, so not on the
+ * stack: RT is the one in force, RT_TMP a scratch copy for loading. */
+static uint32_t unix_now(void);
+static oc_rtbl_t RT, RT_TMP;
+static int       RT_ON;
+static uint8_t   RT_ROOT[32];
+static uint8_t   RT_FILE[OC_RTBL_ROOT_MAX];
+static size_t    RT_FILE_N;
 
 /* playback_clip: an 8 kHz mono 16-bit WAV (playback clip spec 2026-10-12
  * §4), read whole, encoded with every codec the core serves (OpenVoxNB spec
@@ -321,6 +333,23 @@ static int service_ok(const char *key, const uint8_t n[OC_SIG_NUMBER_LEN])
     return -1;
 }
 
+/* Every block homed elsewhere needs its home as a peer. */
+static int peers_cover_route(void)
+{
+    const oc_ocss_cfg_t *o = &D.ocss_cfg;
+    for (unsigned i = 0; i < D.route.n; i++) {
+        const oc_core_block_t *b = &D.route.b[i];
+        int known = b->home_core == D.cfg.core_id;
+        for (unsigned j = 0; j < o->npeer; j++) known |= o->peer[j].core_id == b->home_core;
+        if (!known) {
+            oc_log(OC_LOG_ERR, "config: block %s is homed on core %u: add a peer = %u ... line", b->prefix,
+                   b->home_core, b->home_core);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* peer = CORE_ID ADDRESS|- SHA256: another core (core test services spec
  * §7.1); "-" when that core dials this one (it has the lower core_id). */
 static int load_peers(void)
@@ -362,13 +391,12 @@ static int load_peers(void)
         if (has_addr) snprintf(o->peer[i].addr, sizeof(o->peer[i].addr), "%s", addr);
         o->npeer = i + 1u;
     }
-    for (unsigned i = 0; i < D.route.n; i++) { /* every block homed elsewhere needs its home as a peer */
-        const oc_core_block_t *b = &D.route.b[i];
-        int known = b->home_core == D.cfg.core_id;
-        for (unsigned j = 0; j < o->npeer; j++) known |= o->peer[j].core_id == b->home_core;
-        if (!known) {
-            oc_log(OC_LOG_ERR, "config: block %s is homed on core %u: add a peer = %u ... line", b->prefix,
-                   b->home_core, b->home_core);
+    if (peers_cover_route() != 0) return -1;
+    for (unsigned j = 0; RT_ON && j < o->npeer; j++) { /* OCSS spec §3.6: peers are directory cores */
+        int listed = 0;
+        for (unsigned c = 0; c < RT.root.ncores; c++) listed |= RT.root.cores[c].id == o->peer[j].core_id;
+        if (!listed) {
+            oc_log(OC_LOG_ERR, "config: peer %u is not in the signed table's directory", o->peer[j].core_id);
             return -1;
         }
     }
@@ -393,6 +421,145 @@ static int load_peers(void)
     return 0;
 }
 
+/* The block table: the signed root table of route_table (verified with
+ * route_root), or the config's block lines - never both (OCSS spec
+ * 2026-11-01 §3.6). 0 or -1 (logged). */
+static int load_route(void)
+{
+    const char *tbl = oc_kv_get(&D.kv, "route_table"), *root = oc_kv_get(&D.kv, "route_root");
+    oc_core_route_init(&D.route, D.cfg.core_id);
+    RT_ON = 0;
+    if ((tbl == NULL) != (root == NULL)) {
+        oc_log(OC_LOG_ERR, "config: route_table and route_root go together (the table and the key that signed it)");
+        return -1;
+    }
+    if (tbl != NULL) {
+        char err[200];
+        if (oc_kv_nth(&D.kv, "block", 0) != NULL) {
+            oc_log(OC_LOG_ERR, "config: block lines and route_table: one or the other");
+            return -1;
+        }
+        if (oc_rtbl_unhex(root, RT_ROOT, 32) != 0) {
+            oc_log(OC_LOG_ERR, "config: route_root = '%s': 64 hex digits (an Ed25519 public key)", root);
+            return -1;
+        }
+        int fd = open(tbl, O_RDONLY | O_CLOEXEC);
+        ssize_t n = fd >= 0 ? read_all(fd, RT_FILE, sizeof(RT_FILE)) : -1;
+        if (fd >= 0) close(fd);
+        if (n <= 0 || (size_t)n >= sizeof(RT_FILE)) {
+            oc_log(OC_LOG_ERR, "config: route_table = %s: can't be read (or too big)", tbl);
+            return -1;
+        }
+        RT_FILE_N = (size_t)n;
+        if (oc_rtbl_load(&RT, D.cfg.core_id, RT_ROOT, RT_FILE, RT_FILE_N, err, sizeof(err)) != 0) {
+            oc_log(OC_LOG_ERR, "config: route_table = %s: %s", tbl, err);
+            return -1;
+        }
+        RT_ON = 1;
+        D.route = RT.route;
+        return 0;
+    }
+    for (unsigned i = 0; oc_kv_nth(&D.kv, "block", i) != NULL; i++) {
+        char prefix[32], extra;
+        unsigned idx, home = D.cfg.core_id;
+        const char *b = oc_kv_nth(&D.kv, "block", i);
+        int got = sscanf(b, "%31s %u %u %c", prefix, &idx, &home, &extra);
+        if ((got != 2 && got != 3) || idx > 65535 || home == 0 || home > 65535 ||
+            oc_core_route_add(&D.route, prefix, (uint16_t)idx, (uint16_t)home) != 0) {
+            oc_log(OC_LOG_ERR,
+                   "config: block = '%s': PREFIX INDEX [HOME_CORE], e.g. 8831606 1 (a new prefix and index; "
+                   "HOME_CORE: another core's block, reached over OCSS)", b);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int route_checks(void)
+{
+    int home_blocks = 0;
+    for (unsigned i = 0; i < D.route.n; i++) home_blocks += D.route.b[i].home_core == D.cfg.core_id;
+    if (home_blocks == 0) {
+        oc_log(OC_LOG_ERR, "config: no block this core is home for: add e.g. block = 8831606 1");
+        return -1;
+    }
+    return 0;
+}
+
+/* One stored root table: kept in RT_TMP if it verifies and is newer than
+ * what RT has (newest valid wins, OCSS spec §3.6). */
+static uint32_t rt_best;
+static int rt_root_row(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t n, const uint8_t *sig,
+                       size_t sn)
+{
+    (void)ctx;
+    (void)seq;
+    static uint8_t f[OC_RTBL_ROOT_MAX];
+    char err[200];
+    if (version <= rt_best || sn != 64 || n + 64 > sizeof(f)) return 0;
+    memcpy(f, blob, n);
+    memcpy(f + n, sig, 64);
+    if (oc_rtbl_load(&RT_TMP, D.cfg.core_id, RT_ROOT, f, n + 64, err, sizeof(err)) != 0) {
+        oc_log(OC_LOG_WARNING, "route: stored root table %u refused: %s", (unsigned)version, err);
+        return 0;
+    }
+    memcpy(&RT, &RT_TMP, sizeof(RT));
+    rt_best = version;
+    return 0;
+}
+
+/* One stored addition on RT's root version, applied in seq order while
+ * each passes (OCSS spec §3.6); the first that does not ends the chain. */
+static int rt_add_row(void *ctx, uint32_t version, uint16_t seq, const uint8_t *blob, size_t n, const uint8_t *sig,
+                      size_t sn)
+{
+    (void)ctx;
+    char msg[96];
+    int fresh = 0;
+    int r = sn == 64 ? oc_rtbl_offer(&RT, &RT_TMP, version, blob, n, sig, unix_now(), &fresh, msg, sizeof(msg))
+                     : OC_RTBL_INVALID;
+    if (r != OC_RTBL_OK || !fresh) {
+        oc_log(OC_LOG_WARNING, "route: stored addition %u.%u not applied: %s; the chain ends at %u.%u",
+               (unsigned)version, (unsigned)seq, r == OC_RTBL_OK ? "a repeat" : msg, (unsigned)RT.root.version,
+               (unsigned)RT.seq);
+        return 1;
+    }
+    memcpy(&RT, &RT_TMP, sizeof(RT));
+    return 0;
+}
+
+/* With a signed table, once the database is open: the newest valid root
+ * version (the file's is stored if it is newer), then its additions. 0 or
+ * -1 (logged). */
+static int route_sync(void)
+{
+    if (!RT_ON) return 0;
+    uint32_t file_ver = RT.root.version;
+    rt_best = file_ver;
+    if (oc_sql_route_list(D.sql, OC_SQL_ROUTE_ROOT, 0, rt_root_row, NULL) != 0) {
+        oc_log(OC_LOG_ERR, "route: the stored tables can't be read");
+        return -1;
+    }
+    if (rt_best == file_ver) { /* the file's is the newest: on record (a repeat just replaces the row) */
+        size_t bn = RT_FILE_N - 64u;
+        if (oc_sql_route_put(D.sql, OC_SQL_ROUTE_ROOT, file_ver, 0, RT_FILE, bn, RT_FILE + bn, unix_now()) != 0) {
+            oc_log(OC_LOG_ERR, "route: the root table can't be stored");
+            return -1;
+        }
+    } else {
+        oc_log(OC_LOG_WARNING, "route: the stored root table %u is newer than route_table's %u: kept",
+               (unsigned)rt_best, (unsigned)file_ver);
+    }
+    if (oc_sql_route_list(D.sql, OC_SQL_ROUTE_ADD, RT.root.version, rt_add_row, NULL) != 0) {
+        oc_log(OC_LOG_ERR, "route: the stored additions can't be read");
+        return -1;
+    }
+    D.route = RT.route;
+    oc_log(OC_LOG_INFO, "route: signed table %u.%u, %u blocks", (unsigned)RT.root.version, (unsigned)RT.seq,
+           (unsigned)RT.route.n);
+    return route_checks() != 0 || peers_cover_route() != 0 ? -1 : 0;
+}
+
 static int load_config(const char *path, const char *db)
 {
     long long v;
@@ -411,26 +578,7 @@ static int load_config(const char *path, const char *db)
         oc_log(OC_LOG_ERR, "config: echo = '%s': a full OpenCell number", echo);
         return -1;
     }
-    oc_core_route_init(&D.route, D.cfg.core_id);
-    for (unsigned i = 0; oc_kv_nth(&D.kv, "block", i) != NULL; i++) {
-        char prefix[32], extra;
-        unsigned idx, home = D.cfg.core_id;
-        const char *b = oc_kv_nth(&D.kv, "block", i);
-        int got = sscanf(b, "%31s %u %u %c", prefix, &idx, &home, &extra);
-        if ((got != 2 && got != 3) || idx > 65535 || home == 0 || home > 65535 ||
-            oc_core_route_add(&D.route, prefix, (uint16_t)idx, (uint16_t)home) != 0) {
-            oc_log(OC_LOG_ERR,
-                   "config: block = '%s': PREFIX INDEX [HOME_CORE], e.g. 8831606 1 (a new prefix and index; "
-                   "HOME_CORE: another core's block, reached over OCSS)", b);
-            return -1;
-        }
-    }
-    int home_blocks = 0;
-    for (unsigned i = 0; i < D.route.n; i++) home_blocks += D.route.b[i].home_core == D.cfg.core_id;
-    if (home_blocks == 0) {
-        oc_log(OC_LOG_ERR, "config: no block this core is home for: add e.g. block = 8831606 1");
-        return -1;
-    }
+    if (load_route() != 0 || route_checks() != 0) return -1;
     if (service_ok("echo", D.cfg.echo_number) != 0) return -1;
     const char *play = oc_kv_get(&D.kv, "playback"), *clip = oc_kv_get(&D.kv, "playback_clip");
     if ((play == NULL) != (clip == NULL)) {
@@ -598,7 +746,8 @@ static int api_start(void)
     char err[400], cert[512], key[512], ca[512];
     memset(&D.api, 0, sizeof(D.api));
     D.api.sql = D.sql;
-    D.api.route = &D.route;
+    D.api.route = &D.core.route; /* the live table: route.offer changes it */
+    D.api.rtbl = RT_ON ? &RT : NULL;
     D.api.cfg = &D.cfg;
     D.api.core = &D.core;
     D.api.now_us = mono_us;
@@ -645,6 +794,27 @@ static int cells_tls_start(void)
     c.alpn = "oc-cell/1";
     c.role = OC_TLS_ROLE_CELL;
     c.pin_by_caller = 1;
+    const char *iss = oc_kv_get(&D.kv, "cell_issuers"); /* portal P3 C1: "root" and/or SHA-256s, comma-separated */
+    if (iss != NULL) {
+        char list[512], *save = NULL;
+        snprintf(list, sizeof(list), "%s", iss);
+        c.issuers_set = 1;
+        for (char *w = strtok_r(list, ", ", &save); w != NULL; w = strtok_r(NULL, ", ", &save)) {
+            if (strcmp(w, "root") == 0) {
+                c.issuer_root = 1;
+            } else if (c.nissuer >= OC_TLS_PINS || oc_tls_fpr_parse(w, c.issuer[c.nissuer]) != 0) {
+                oc_log(OC_LOG_ERR, "config: cell_issuers = '%s': root and/or up to %u SHA-256 fingerprints", iss,
+                       OC_TLS_PINS);
+                return -1;
+            } else {
+                c.nissuer++;
+            }
+        }
+        if (!c.issuer_root && c.nissuer == 0) {
+            oc_log(OC_LOG_ERR, "config: cell_issuers is empty");
+            return -1;
+        }
+    }
     D.cell_tls = oc_tls_new(&c, err, sizeof(err));
     if (D.cell_tls == NULL) {
         oc_log(OC_LOG_ERR, "cell TLS: %s", err);
@@ -1078,7 +1248,7 @@ static void serve_admin(void)
         oc_admin_t a;
         memset(&a, 0, sizeof(a));
         a.sql = D.sql;
-        a.route = &D.route;
+        a.route = &D.core.route;
         a.cfg = &D.cfg;
         a.core = &D.core;
         a.random = urandom;
@@ -1128,7 +1298,7 @@ static int listen_on(const char *path, const char *group)
 static int run_daemon(const char *config, const char *key_file, const char *db)
 {
     int rc = 1;
-    if (load_config(config, db) != 0 || load_key(key_file) != 0 || open_db() != 0) goto out;
+    if (load_config(config, db) != 0 || load_key(key_file) != 0 || open_db() != 0 || route_sync() != 0) goto out;
     oc_core_store_t st = oc_sql_store(D.sql);
     const oc_core_io_t io = { NULL, k_send, k_close, k_random, k_unix, oc_log_line, k_stream_pull };
     if (streams_start(&st) != 0) goto out;
@@ -1138,6 +1308,7 @@ static int run_daemon(const char *config, const char *key_file, const char *db)
                D.cfg.key_id, D.db);
         goto out;
     }
+    if (RT_ON) oc_core_route_set(&D.core, &D.route, RT.root.version); /* said in OCSS HELLO */
     D.cell_l = listen_on(D.cell_sock, oc_kv_get(&D.kv, "cell_group"));
     if (D.cell_l < 0) goto out;
     D.admin_l = listen_on(D.admin_sock, oc_kv_get(&D.kv, "admin_group"));
@@ -1407,7 +1578,7 @@ static int admin_offline(const char *config, const char *key_file, const char *d
         oc_sig_wipe(D.key, sizeof(D.key));
         return 1;
     }
-    if (make_db_dir() != 0 || drop_to_db_owner() != 0 || open_db() != 0) {
+    if (make_db_dir() != 0 || drop_to_db_owner() != 0 || open_db() != 0 || route_sync() != 0) {
         oc_sig_wipe(D.key, sizeof(D.key));
         return 1;
     }

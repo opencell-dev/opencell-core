@@ -118,7 +118,7 @@ start 2
 start 1
 linked 1
 out=$("$OC" admin --socket "$T/admin1.sock" status 2>&1) || fail "status: $out"
-expect "$out" "block 8831503: home core 2, peer linked"
+expect "$out" "blocks homed on core 2: 1, peer linked"
 expect "$out" "playback +883160655500101: clip of 1.20 s (8 kHz WAV), Codec2 1200 10 payloads, OVX-1200 10, OVX-1000 10, OVX-800 10, OVX-600 10"
 grep -q 'ocss: 127.0.0.1:[0-9]*: core 1, certificate .*, accepted' "$T/log2" || fail "core 2 did not log core 1's certificate"
 
@@ -183,7 +183,7 @@ grep -q 'peer 2: link down' "$T/log1" || fail "core 1 did not see core 2 go"
 "$CALL" "$T/core1.sock" 1 7 +883150355500100 2 >"$T/call"
 expect "$(cat "$T/call")" "released cause 5"
 out=$("$OC" admin --socket "$T/admin1.sock" status 2>&1) || fail "status: $out"
-expect "$out" "block 8831503: home core 2, peer NOT linked"
+expect "$out" "blocks homed on core 2: 1, peer NOT linked"
 start 2
 linked 2
 echo "all passed"

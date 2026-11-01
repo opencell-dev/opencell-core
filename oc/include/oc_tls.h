@@ -40,6 +40,15 @@ typedef struct {
     int         client; /* 0: a server (accepts); 1: a client (dials) */
     int         pin_by_caller; /* 1 (a server only): npin must be 0, any certificate with the chain,
                                 * purpose and role is let in, and the caller checks c->peer. */
+    /* The issuers a client certificate may come from (portal P3 C1, OCSS
+     * spec 2026-11-01 §13; network-core §18.4): with issuers_set, the
+     * certificate's own issuer must be an intermediate whose SHA-256 is in
+     * issuer[] - or, with issuer_root, the root itself. Unset: any chain to
+     * ca. So the portal's online intermediate can be dropped from trust
+     * without a new root. */
+    int         issuers_set, issuer_root;
+    uint8_t     issuer[OC_TLS_PINS][32];
+    unsigned    nissuer;
 } oc_tls_cfg_t;
 
 typedef struct {

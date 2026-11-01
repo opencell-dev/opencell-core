@@ -2,10 +2,10 @@
 /* An admin API client for the process tests (portal spec §7): TLS 1.3 with
  * a certificate from the test PKI, one request, its answer printed.
  *
- *   tool_oc_api PORT PKI CERT [--alpn P|none] [--actor N] OP [ARG]
+ *   tool_oc_api PORT PKI CERT [--alpn P|none] [--actor N] [--host IP --name DNS] OP [ARG]
  *
- * Connects to 127.0.0.1:PORT, checks the core against PKI/ca.crt as
- * "localhost", shows PKI/CERT.crt (key PKI/CERT.key; "none": no
+ * Connects to 127.0.0.1:PORT (or --host), checks the core against
+ * PKI/ca.crt as "localhost" (or --name), shows PKI/CERT.crt (key PKI/CERT.key; "none": no
  * certificate). OP:
  *   core.status                 prints "ok NAME VERSION"
  *   num.check|sub.create|sub.status|sub.release NUMBER
@@ -14,6 +14,9 @@
  *   hold S                      sends nothing; "closed after N s" when the
  *                               core closes it, or "open" after S s
  *   drip S                      sends a request's first byte only; as hold
+ *   route.status                prints "ok R.S BLOCKS MAX" (OCSS spec 2026-11-01 §5.2)
+ *   route.offer FILE            an addition file (blob | sig, oc-route add):
+ *                               "ok R.S BLOCKS NEW", or the status and message
  *   pipe N                      N sub.status calls for +883171746412345 in
  *                               one write (req 1..N), then their answers:
  *                               "answered N in M ms", or "stalled after K
@@ -120,10 +123,13 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN); /* a core that closes on us: "refused", not a dead tool */
     const char *pki = argv[2], *cert = argv[3], *alpn = "oc-admin/1";
     uint32_t actor = 42;
+    const char *host = "127.0.0.1", *name = "localhost";
     int i = 4;
     for (; i + 1 < argc && strncmp(argv[i], "--", 2) == 0; i += 2) {
         if (strcmp(argv[i], "--alpn") == 0) alpn = argv[i + 1];
         else if (strcmp(argv[i], "--actor") == 0) actor = (uint32_t)strtoul(argv[i + 1], NULL, 10);
+        else if (strcmp(argv[i], "--host") == 0) host = argv[i + 1];
+        else if (strcmp(argv[i], "--name") == 0) name = argv[i + 1];
     }
     if (i >= argc) return 2;
     const char *op = argv[i], *arg = i + 1 < argc ? argv[i + 1] : "";
@@ -151,7 +157,7 @@ int main(int argc, char **argv)
     }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(argv[1])) };
-    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    inet_pton(AF_INET, host, &sa.sin_addr);
     struct timeval tv = { 10, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
@@ -160,7 +166,7 @@ int main(int argc, char **argv)
     }
     S = SSL_new(cx);
     SSL_set_fd(S, fd);
-    SSL_set1_host(S, "localhost");
+    SSL_set1_host(S, name);
     if (SSL_connect(S) != 1) {
         printf("refused\n");
         return 0;
@@ -176,11 +182,26 @@ int main(int argc, char **argv)
     else if (strcmp(op, "sub.status") == 0) code = OC_API_SUB_STATUS;
     else if (strcmp(op, "sub.release") == 0) code = OC_API_SUB_RELEASE;
     else if (strcmp(op, "drip") == 0) code = OC_API_CORE_STATUS;
+    else if (strcmp(op, "route.status") == 0) code = OC_API_ROUTE_STATUS;
+    else if (strcmp(op, "route.offer") == 0) code = OC_API_ROUTE_OFFER;
     else return 2;
     f[2] = code;
     for (int k = 0; k < 4; k++) f[n++] = (uint8_t)(7u >> (8 * k)); /* req 7 */
     for (int k = 0; k < 4; k++) f[n++] = (uint8_t)(actor >> (8 * k));
-    if (code != OC_API_CORE_STATUS) {
+    if (code == OC_API_ROUTE_OFFER) { /* table_version | blob len | blob | sig, from the file */
+        uint8_t file[OC_RTBL_BLOB_MAX + 64];
+        FILE *in = fopen(arg, "rb");
+        size_t fn = in != NULL ? fread(file, 1, sizeof(file), in) : 0;
+        if (in != NULL) fclose(in);
+        if (fn < 64 + 11) return 2;
+        size_t bn = fn - 64;
+        memcpy(f + n, file + 5, 4); /* the blob's root_version */
+        n += 4;
+        f[n++] = (uint8_t)bn;
+        f[n++] = (uint8_t)(bn >> 8);
+        memcpy(f + n, file, fn); /* blob, then sig */
+        n += fn;
+    } else if (code != OC_API_CORE_STATUS && code != OC_API_ROUTE_STATUS) {
         if (oc_sig_number_to_bcd(arg, strlen(arg), f + n) != 0) return 2;
         n += OC_SIG_NUMBER_LEN;
     }
@@ -203,6 +224,17 @@ int main(int argc, char **argv)
         printf(" %.*s", b[0], (const char *)b + 1);
     }
     if (status == OC_API_OK && code == OC_API_SUB_CREATE) printf("\n%.*s", f[8 + 12], (const char *)f + 8 + 13);
+    if (status == OC_API_OK && code == OC_API_ROUTE_STATUS) {
+        const uint8_t *b = f + 8;
+        printf(" %u.%u %u %u", (unsigned)(b[1] | b[2] << 8 | b[3] << 16 | (uint32_t)b[4] << 24), (unsigned)(b[5] | b[6] << 8),
+               (unsigned)(b[7] | b[8] << 8), (unsigned)(b[9] | b[10] << 8));
+    }
+    if (status == OC_API_OK && code == OC_API_ROUTE_OFFER) {
+        const uint8_t *b = f + 8;
+        printf(" %u.%u %u %u", (unsigned)(b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24), (unsigned)(b[4] | b[5] << 8),
+               (unsigned)(b[6] | b[7] << 8), (unsigned)b[8]);
+    }
+    if (status != OC_API_OK && (code == OC_API_ROUTE_OFFER || code == OC_API_ROUTE_STATUS)) printf(" %.*s", f[8], (const char *)f + 9);
     printf("\n");
     SSL_shutdown(S);
     SSL_free(S);

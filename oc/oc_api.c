@@ -30,7 +30,7 @@ static const struct {
     [OC_API_CELL_RADIO] = { "cell.radio", 1200, 60 },    [OC_API_REG_LIST] = { "reg.list", 600, 30 },
     [OC_API_CDR_RECENT] = { "cdr.recent", 600, 30 },     [OC_API_AUDIT_LIST] = { "audit.list", 600, 30 },
     [OC_API_OCSS_STATUS] = { "ocss.status", 1200, 60 },  [OC_API_CORE_BLOCKS] = { "core.blocks", 120, 10 },
-    [OC_API_CELL_MODE] = { "cell.mode", 20, 5 },
+    [OC_API_CELL_MODE] = { "cell.mode", 20, 5 },        [OC_API_ROUTE_STATUS] = { "route.status", 120, 10 },
 };
 
 const char *oc_api_op_name(unsigned op)
@@ -466,7 +466,7 @@ static uint8_t op_sub_status(call_t *c)
     if (g != 0) return fail(c, OC_API_UNAVAILABLE, "store error");
     long long expiry = 0, cell = 0, expires = 0;
     int ge = s.activated ? 1 : one_int(c->a, "SELECT expiry FROM token WHERE number = ?1 AND used_at = 0", n, &expiry);
-    int gc = one_int(c->a, "SELECT cell_id FROM location WHERE number = ?1", n, &cell);
+    int gc = one_int(c->a, "SELECT CASE WHEN core = 0 THEN cell_id ELSE 0 END FROM location WHERE number = ?1" /* on another core: cell 0 (OCSS spec §6) */, n, &cell);
     int gx = one_int(c->a, "SELECT expires FROM location WHERE number = ?1", n, &expires);
     long long seen = last_seen(c->a, n);
     if (ge < 0 || gc < 0 || gx < 0 || seen < 0) return fail(c, OC_API_UNAVAILABLE, "store error");
@@ -622,7 +622,7 @@ static uint8_t op_cell_status(call_t *c)
     if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
     c->a->audit_cell = id;
     sqlite3_stmt *st = q(c->a, "SELECT cell_id, enabled, mode, list_id, cert_fpr, last_seen, name,"
-                               " (SELECT count(*) FROM location l WHERE l.cell_id = cell.cell_id AND l.expires > ?2)"
+                               " (SELECT count(*) FROM location l WHERE l.core = 0 AND l.cell_id = cell.cell_id AND l.expires > ?2)"
                                " FROM cell WHERE ?1 = 0 OR cell_id = ?1 ORDER BY cell_id LIMIT 1000");
     int rc = st != NULL ? sqlite3_bind_int64(st, 1, id) : SQLITE_ERROR;
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, c->a->unix_now());
@@ -766,7 +766,7 @@ static uint8_t op_reg_list(call_t *c)
     snprintf(sql, sizeof(sql),
              "SELECT l.number, l.tmid, l.cell_id, l.expires,"
              " (SELECT max(a.ts) FROM audit a WHERE a.number = l.number AND a.event = %d)"
-             " FROM location l WHERE l.expires > ?1 AND (?2 = 0 OR l.cell_id = ?2) AND l.number > ?3"
+             " FROM location l WHERE l.core = 0 AND l.expires > ?1 AND (?2 = 0 OR l.cell_id = ?2) AND l.number > ?3"
              " ORDER BY l.number LIMIT %u",
              OC_CORE_AUDIT_REGISTER, OC_API_REG_MAX);
     sqlite3_stmt *st = q(c->a, sql);
@@ -939,10 +939,66 @@ static uint8_t op_core_blocks(call_t *c)
         wr_t row = { .n = 0 };
         wr_u16(&row, b->block_idx);
         wr_u16(&row, b->home_core);
-        wr_u8(&row, oc_core_route_home(c->a->route, b) ? 1 : 0); /* secondaries come with plan 11 */
+        wr_u8(&row, oc_core_route_home(c->a->route, b) ? 1 : oc_core_route_secondary(c->a->route, b) ? 2 : 0);
         wr_text(&row, b->prefix);
         list_row(&c->w, row.b, row.n);
     }
+    return OC_API_OK;
+}
+
+/* OCSS spec 2026-11-01 §5.1: a delegate's addition, checked (§3.5), stored,
+ * then in effect at once. */
+static uint8_t op_route_offer(call_t *c)
+{
+    static oc_rtbl_t next; /* ~100 KB: not on the stack */
+    if (c->a->rtbl == NULL) return fail(c, OC_API_UNSUPPORTED, "no signed table here (block lines)"); /* rule 1 */
+    uint32_t tv = rd_u32(&c->r);
+    uint16_t bl = rd_u16(&c->r);
+    const uint8_t *blob = rd_bytes(&c->r, bl);
+    const uint8_t *sig = rd_bytes(&c->r, OC_RTBL_SIG);
+    if (!rd_done(&c->r) || blob == NULL || sig == NULL) return fail(c, OC_API_INVALID, "malformed request");
+    static char msg[96];
+    int fresh = 0;
+    int r = oc_rtbl_offer(c->a->rtbl, &next, tv, blob, bl, sig, c->a->unix_now(), &fresh, msg, sizeof(msg));
+    snprintf(c->a->audit_what, sizeof(c->a->audit_what), "%u.%u", (unsigned)tv,
+             bl >= 11 ? (unsigned)(blob[9] | blob[10] << 8) : 0u);
+    if (r == OC_RTBL_INVALID) return fail(c, OC_API_INVALID, msg);
+    if (r == OC_RTBL_TAKEN) return fail(c, OC_API_TAKEN, msg);
+    if (r != OC_RTBL_OK) return fail(c, OC_API_UNAVAILABLE, msg);
+    if (fresh) {
+        if (oc_sql_route_put(c->a->sql, OC_SQL_ROUTE_ADD, next.root.version, next.seq, blob, bl, sig,
+                             c->a->unix_now()) != 0) {
+            return fail(c, OC_API_UNAVAILABLE, "store failed: not taken");
+        }
+        memcpy(c->a->rtbl, &next, sizeof(next));
+        oc_core_route_set(c->a->core, &c->a->rtbl->route, c->a->rtbl->root.version);
+        oc_log(OC_LOG_NOTICE, "route: addition %u.%u taken, %u blocks", (unsigned)next.root.version,
+               (unsigned)next.seq, (unsigned)next.route.n);
+    }
+    wr_u32(&c->w, c->a->rtbl->root.version);
+    wr_u16(&c->w, c->a->rtbl->seq);
+    wr_u16(&c->w, (uint16_t)c->a->rtbl->route.n);
+    wr_u8(&c->w, (uint8_t)fresh);
+    if (!fresh) snprintf(c->a->audit_what, sizeof(c->a->audit_what), "%u.%u held", (unsigned)tv,
+                         bl >= 11 ? (unsigned)(blob[9] | blob[10] << 8) : 0u);
+    return OC_API_OK;
+}
+
+static uint8_t op_route_status(call_t *c)
+{
+    if (!rd_done(&c->r)) return fail(c, OC_API_INVALID, "malformed request");
+    const oc_rtbl_t *t = c->a->rtbl;
+    uint16_t max = 0;
+    for (unsigned i = 0; i < c->a->route->n; i++) {
+        if (c->a->route->b[i].block_idx > max) max = c->a->route->b[i].block_idx;
+    }
+    if (t != NULL && t->max_idx > max) max = t->max_idx;
+    wr_u8(&c->w, t != NULL);
+    wr_u32(&c->w, t != NULL ? t->root.version : 0);
+    wr_u16(&c->w, t != NULL ? t->seq : 0);
+    wr_u16(&c->w, (uint16_t)c->a->route->n);
+    wr_u16(&c->w, max);
+    wr_u32(&c->w, t != NULL ? oc_rtbl_deleg_until(t, c->a->unix_now()) : 0);
     return OC_API_OK;
 }
 
@@ -1085,7 +1141,8 @@ static void audit_refusals(oc_api_t *a, unsigned op, uint64_t now)
 static int quiet_op(unsigned op)
 {
     return op == OC_API_CELL_STATUS || op == OC_API_CORE_STATUS || op == OC_API_CELL_RADIO || op == OC_API_REG_LIST ||
-           op == OC_API_CDR_RECENT || op == OC_API_AUDIT_LIST || op == OC_API_OCSS_STATUS || op == OC_API_CORE_BLOCKS;
+           op == OC_API_CDR_RECENT || op == OC_API_AUDIT_LIST || op == OC_API_OCSS_STATUS || op == OC_API_CORE_BLOCKS ||
+           op == OC_API_ROUTE_STATUS;
 }
 
 /* The minute's count of op's quiet calls, as one record; the minute closed.
@@ -1191,8 +1248,8 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         wr_text(&c.w, "rate limited");
         wr_end(&c.w);
         return 0;
-    } else if (op == 0 || op >= OC_API_OPS || op == OC_API_ROUTE_OFFER) {
-        status = fail(&c, OC_API_UNSUPPORTED, op == OC_API_ROUTE_OFFER ? "route.offer comes with plan P5" : "no such operation");
+    } else if (op == 0 || op >= OC_API_OPS) {
+        status = fail(&c, OC_API_UNSUPPORTED, "no such operation");
     } else {
         wr_start(&c.w, OC_API_OK);
         switch (op) {
@@ -1214,6 +1271,8 @@ int oc_api_handle(oc_api_t *a, const uint8_t *frame, size_t n, oc_buf_t *out)
         case OC_API_OCSS_STATUS: status = op_ocss_status(&c); break;
         case OC_API_CORE_BLOCKS: status = op_core_blocks(&c); break;
         case OC_API_CELL_MODE: status = op_cell_mode(&c); break;
+        case OC_API_ROUTE_OFFER: status = op_route_offer(&c); break;
+        case OC_API_ROUTE_STATUS: status = op_route_status(&c); break;
         default: status = op_sub_change(&c, op, actor); break;
         }
         if (status == OC_API_OK && c.w.err) status = fail(&c, OC_API_UNAVAILABLE, "answer too long");

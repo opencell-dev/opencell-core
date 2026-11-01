@@ -104,7 +104,7 @@ static int handshake(const oc_tls_cfg_t *cfg, const client_t *cl, char *why, siz
     TEST_ASSERT_EQUAL_INT(1, SSL_CTX_load_verify_locations(cx, f("ca.crt"), NULL));
     SSL_CTX_set_verify(cx, SSL_VERIFY_PEER, NULL);
     if (cl->cert != NULL) {
-        TEST_ASSERT_EQUAL_INT(1, SSL_CTX_use_certificate_file(cx, f(cl->cert), SSL_FILETYPE_PEM));
+        TEST_ASSERT_EQUAL_INT(1, SSL_CTX_use_certificate_chain_file(cx, f(cl->cert)));
         TEST_ASSERT_EQUAL_INT(1, SSL_CTX_use_PrivateKey_file(cx, f(cl->key), SSL_FILETYPE_PEM));
     }
     if (cl->alpn != NULL) {
@@ -415,6 +415,28 @@ static void test_the_cell_server_still_wants_the_cell_role(void)
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "lacks the role"), why);
 }
 
+/* cell_issuers (portal P3 C1): the issuer must be listed; "root" lets the
+ * root's own cells in. */
+static void test_cell_issuers(void)
+{
+    oc_tls_cfg_t cfg = cell_server_cfg();
+    char why[160];
+    static const client_t ICELL = { "iinter-chain.crt", "iinter.key", "oc-cell/1", TLS1_3_VERSION };
+    static const client_t ICELL2 = { "iinter2-chain.crt", "iinter2.key", "oc-cell/1", TLS1_3_VERSION };
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, handshake(&cfg, &ICELL, why, sizeof(why)), why); /* unset: any chain */
+    cfg.issuers_set = 1;
+    read_fpr("inter.fpr", cfg.issuer[0]);
+    cfg.nissuer = 1;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, handshake(&cfg, &ICELL, why, sizeof(why)), why);
+    TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &ICELL2, why, sizeof(why))); /* not listed */
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(why, "cell_issuers"), why);
+    TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &CELL, why, sizeof(why))); /* the root's own, root not listed */
+    cfg.issuer_root = 1;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, handshake(&cfg, &CELL, why, sizeof(why)), why);
+    cfg.nissuer = 0; /* root only: the intermediate's cells are out */
+    TEST_ASSERT_EQUAL_INT(-1, handshake(&cfg, &ICELL, why, sizeof(why)));
+}
+
 static void test_pin_by_caller_with_pins_is_refused(void)
 {
     char err[256];
@@ -562,6 +584,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_a_cell_gets_in_unpinned_and_its_fingerprint_is_kept);
     RUN_TEST(test_the_cell_server_still_wants_the_cell_role);
     RUN_TEST(test_pin_by_caller_with_pins_is_refused);
+    RUN_TEST(test_cell_issuers);
     RUN_TEST(test_pin_by_caller_on_a_client_is_refused);
     RUN_TEST(test_the_oc_tls_client_talks_to_the_cell_server);
     RUN_TEST(test_the_client_refuses_the_wrong_host);

@@ -362,6 +362,41 @@ const oc_core_tel_t *oc_core_cell_tel(const oc_core_t *k, uint32_t cell_id)
     return l != NULL && l->tel.at != 0 ? &l->tel : NULL;
 }
 
+/* A cell's HSS and registry requests served here. */
+static void local_rx(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
+{
+    oc_core_src_t src = { 0, cell, 0 };
+    switch (m->type) {
+    case OC_CORE_ACT_FWD:
+        src.req = m->u.act_fwd.req;
+        oc_core_hss_act(k, &src, m->u.act_fwd.tmid, m->u.act_fwd.token_id, m->u.act_fwd.pkt, m->u.act_fwd.tag);
+        break;
+    case OC_CORE_AV_REQ:
+        src.req = m->u.av_req.req;
+        oc_core_hss_av(k, &src, m->u.av_req.tmid, m->u.av_req.count, NULL, NULL);
+        break;
+    case OC_CORE_RESYNC:
+        src.req = m->u.resync.req;
+        oc_core_hss_av(k, &src, m->u.resync.tmid, 1, m->u.resync.rand, m->u.resync.auts);
+        break;
+    case OC_CORE_LOC_UPDATE:
+        oc_core_reg_update(k, 0, cell, m->u.loc_update.tmid, m->u.loc_update.number, m->u.loc_update.rand,
+                           m->u.loc_update.res, 0);
+        break;
+    case OC_CORE_LOC_PURGE:
+        oc_core_reg_purge(k, 0, cell, m->u.loc_purge.tmid, m->u.loc_purge.number);
+        break;
+    default:
+        break;
+    }
+}
+
+void oc_core_route_set(oc_core_t *k, const oc_core_route_t *r, uint32_t table_ver)
+{
+    k->route = *r;
+    k->table_ver = table_ver;
+}
+
 void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us)
 {
     k->now = now_us;
@@ -384,11 +419,10 @@ void oc_core_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t no
     case OC_CORE_ACT_FWD:
     case OC_CORE_AV_REQ:
     case OC_CORE_RESYNC:
-        oc_core_hss_rx(k, l->cell_id, m);
-        break;
     case OC_CORE_LOC_UPDATE:
     case OC_CORE_LOC_PURGE:
-        oc_core_reg_rx(k, l->cell_id, m);
+        /* for a number or TMID homed on another core: relayed (OCSS spec §4) */
+        if (!oc_core_visit_cell_rx(k, l->cell_id, m)) local_rx(k, l->cell_id, m);
         break;
     case OC_CORE_CALL_ROUTE:
     case OC_CORE_CALL_ALERT:
@@ -427,6 +461,7 @@ void oc_core_tick(oc_core_t *k, uint64_t now_us)
         oc_core_reg_tick(k);
     }
     oc_core_peer_tick(k);
+    oc_core_visit_tick(k);
     oc_core_sw_tick(k);
 }
 

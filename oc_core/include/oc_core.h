@@ -146,7 +146,8 @@ typedef struct {
  * this core's services (no cell, no ref of its own that anyone sees), or a
  * peer core's leg over OCSS. cell is 0 for every kind but CELL (a cell id is
  * never 0), so a lookup by cell never finds another kind's leg. */
-enum { OC_CORE_LEG_CELL = 0, OC_CORE_LEG_ECHO = 1, OC_CORE_LEG_PLAY = 2, OC_CORE_LEG_PEER = 3, OC_CORE_LEG_STREAM = 4 };
+enum { OC_CORE_LEG_CELL = 0, OC_CORE_LEG_ECHO = 1, OC_CORE_LEG_PLAY = 2, OC_CORE_LEG_PEER = 3, OC_CORE_LEG_STREAM = 4,
+       OC_CORE_LEG_NONE = 5 /* not resolved yet: the call waits for LOCATE_RES (OCSS spec 2026-11-01 §4.4) */ };
 
 typedef struct {
     uint8_t  kind; /* OC_CORE_LEG_* */
@@ -173,9 +174,48 @@ typedef struct {
     uint32_t setup_tokens_x1000;
     uint64_t setup_refill_us;
     uint64_t setup_log_at; /* a "rate limited" line is logged at most once this often */
+    /* OCSS spec §4.5: the same for every mobility message it sends here */
+    uint32_t mob_tokens_x1000;
+    uint64_t mob_refill_us;
+    uint64_t mob_log_at;
+    uint32_t table_ver; /* its HELLO's (or HELLO_ACK's) table version */
 } oc_core_peer_t;
 
-enum { OC_CORE_CALL_ROUTING = 1, OC_CORE_CALL_ALERTING = 2, OC_CORE_CALL_ACTIVE = 3 };
+/* Visiting subscribers (OCSS spec 2026-11-01 §4): a request this core
+ * relayed to another core, waiting for its answer. */
+#define OC_CORE_RELAYS    32u
+#define OC_CORE_RELAY_US  3000000u /* an answer not back by then: given up */
+#define OC_CORE_TMIDS     64u      /* the TMID -> home core cache */
+#define OC_CORE_MOB_RATE_HZ 50u    /* a peer's mobility messages, a second */
+#define OC_CORE_MOB_BURST   100u
+#define OC_CORE_LIFE_MIN_S  60u     /* a relayed location's life, clamped (spec §4.3) */
+#define OC_CORE_LIFE_MAX_S  172800u
+
+enum { OC_CORE_RELAY_ACT = 1, OC_CORE_RELAY_AV = 2, OC_CORE_RELAY_LOC = 3, OC_CORE_RELAY_LOCATE = 4 };
+
+typedef struct {
+    uint8_t  used, kind;  /* OC_CORE_RELAY_* */
+    uint16_t id;          /* its req on OCSS */
+    uint16_t peer;        /* asked (AV: 0, every up peer was asked) */
+    uint32_t cell;        /* the cell that asked (ACT, AV, LOC) */
+    uint16_t cell_req;    /* ...and its req */
+    uint32_t tmid;
+    uint8_t  nwait;       /* AV: answers still to come */
+    uint8_t  best;        /* AV: the strongest non-ok status so far */
+    uint8_t  number[OC_SIG_NUMBER_LEN]; /* LOC, LOCATE */
+    uint8_t  rand[16];    /* LOC */
+    uint32_t life_s;      /* LOC */
+    uint64_t due;
+} oc_core_relay_t;
+
+typedef struct {
+    uint32_t tmid; /* 0: free */
+    uint16_t home;
+    uint64_t used; /* for least recently used out */
+} oc_core_tmid_t;
+
+enum { OC_CORE_CALL_ROUTING = 1, OC_CORE_CALL_ALERTING = 2, OC_CORE_CALL_ACTIVE = 3,
+       OC_CORE_CALL_LOCATING = 4 /* LOCATE sent to the callee's home (OCSS spec §4.4); the setup timer runs */ };
 
 typedef struct {
     int           used;
@@ -203,6 +243,7 @@ typedef struct {
     uint32_t      relay_tokens_x1000;
     uint64_t      relay_refill_us;
     uint32_t      relay_dropped;
+    uint16_t      locate;        /* LOCATING: the relay id of its LOCATE */
 } oc_core_call_t;
 
 typedef struct {
@@ -219,6 +260,10 @@ typedef struct {
     /* peer cores that refused HELLO at OC_OCSS_PROTO (HELLO_NAK version):
      * dialled at OC_OCSS_PROTO_MIN until a link at it drops (ruling R8); 0: free */
     uint16_t        ocss_old[OC_CORE_PEERS];
+    oc_core_relay_t relays[OC_CORE_RELAYS];
+    uint16_t        next_relay;
+    oc_core_tmid_t  tmids[OC_CORE_TMIDS];
+    uint32_t        table_ver; /* the root version of the signed table (0: config block lines): OCSS HELLO */
     uint32_t        next_ref; /* wraps at 2^30 (bit 31 is OC_CORE_REF_CORE, bit 30 OC_CORE_REF_DIR for a peer leg's ref: review I1); safe since calls[] does not survive a core restart (§7.10) */
 } oc_core_t;
 
@@ -254,6 +299,13 @@ void oc_core_peer_down(oc_core_t *k, uint32_t link, uint64_t now_us);
 void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64_t now_us);
 /* 1 if a link to core_id is up (HELLO done). */
 int  oc_core_peer_linked(const oc_core_t *k, uint16_t core_id);
+/* 1 if that link is up at OCSS 3 or later: it carries visiting subscribers. */
+int  oc_core_peer_mob(const oc_core_t *k, uint16_t core_id);
+/* The block table changes at runtime (a route.offer, OCSS spec §3.6): a
+ * copy of r is taken; table_ver is the signed table's root version (0:
+ * config lines), said in OCSS HELLO from the next link on. r must keep
+ * this core's core_id as its self. */
+void oc_core_route_set(oc_core_t *k, const oc_core_route_t *r, uint32_t table_ver);
 /* The form the call messages take on the up link to core_id (codec
  * negotiation spec §6.2): CODEC at OCSS 2, OLD at 1 (or with no link). */
 uint8_t oc_core_peer_form(const oc_core_t *k, uint16_t core_id);

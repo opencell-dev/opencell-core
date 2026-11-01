@@ -11,11 +11,23 @@
 #include "oc_sig_keys.h"
 
 /* A cell without a link purges on its new boot, or claims the number again
- * and is refused. 0, or -1 (oc_core_send: the cell has no link). */
-static int cancel(oc_core_t *k, uint32_t cell, uint32_t tmid, uint8_t cause, const uint8_t *rand)
+ * and is refused. core 0: this core's cell; else OCSS LOC_CANCEL to that
+ * serving core, which passes it to its cell (OCSS spec §4.3). 0, or -1
+ * (no link). */
+static int cancel(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint16_t core, uint32_t cell, uint32_t tmid,
+                  uint8_t cause, const uint8_t *rand)
 {
     oc_core_msg_t m;
     memset(&m, 0, sizeof(m));
+    if (core != 0) {
+        m.type = OC_OCSS_LOC_CANCEL;
+        m.u.peer_cancel.tmid = tmid;
+        m.u.peer_cancel.cause = cause;
+        if (rand != NULL) memcpy(m.u.peer_cancel.rand, rand, 16);
+        memcpy(m.u.peer_cancel.number, number, OC_SIG_NUMBER_LEN);
+        m.u.peer_cancel.cell = cell;
+        return oc_core_peer_mob(k, core) ? oc_core_peer_send(k, core, &m) : -1;
+    }
     m.type = OC_CORE_LOC_CANCEL;
     m.u.loc_cancel.tmid = tmid;
     m.u.loc_cancel.cause = cause;
@@ -32,26 +44,31 @@ int oc_core_loc_live(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], oc_c
     return OC_CORE_STORE_NONE;
 }
 
-void oc_core_loc_send_cancel(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint32_t cell_id, uint32_t tmid,
-                             uint8_t cause, const uint8_t *rand, const char *why)
+void oc_core_loc_send_cancel(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], uint16_t core, uint32_t cell_id,
+                             uint32_t tmid, uint8_t cause, const uint8_t *rand, const char *why)
 {
-    char d[48];
-    if (cancel(k, cell_id, tmid, cause, rand) != 0) {
-        oc_core_logf(k, "cell %u: LOC_CANCEL send failed", (unsigned)cell_id);
+    char d[48], at[16] = "";
+    if (cancel(k, number, core, cell_id, tmid, cause, rand) != 0) {
+        oc_core_logf(k, "%s%u cell %u: LOC_CANCEL send failed", core != 0 ? "core " : "", (unsigned)core,
+                     (unsigned)cell_id);
     }
+    if (core != 0) snprintf(at, sizeof(at), ", core %u", (unsigned)core);
     if (why != NULL) {
-        snprintf(d, sizeof(d), "%s, cause %u", why, cause);
+        snprintf(d, sizeof(d), "%s, cause %u%s", why, cause, at);
     } else {
-        snprintf(d, sizeof(d), "cause %u", cause);
+        snprintf(d, sizeof(d), "cause %u%s", cause, at);
     }
     oc_core_audit(k, OC_CORE_AUDIT_LOC_CANCEL, number, tmid, cell_id, d);
 }
 
-/* §7.7-7.8, §8, §19. Single exit: every path wipes what it read. */
-static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
+/* §7.7-7.8, §8, §19; OCSS spec §4.3: "the cell" is the pair (core, cell).
+ * Single exit: every path wipes what it read. */
+int oc_core_reg_update(oc_core_t *k, uint16_t core, uint32_t cell, uint32_t tmid,
+                       const uint8_t number[OC_SIG_NUMBER_LEN], const uint8_t rand[16], const uint8_t res[8],
+                       uint32_t life_s)
 {
-    const uint8_t *num = m->u.loc_update.number;
-    uint32_t tmid = m->u.loc_update.tmid;
+    const uint8_t *num = number;
+    int ok = 0;
     oc_core_av_issued_t a;
     oc_core_sub_t s;
     oc_core_loc_t old, l;
@@ -62,8 +79,8 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     memset(&key, 0, sizeof(key));
     /* the vector read stays three-way: a stale binding is cancelled back
      * without needing the proof; only what does need it fails closed */
-    int got_av = k->st.av_get(k->st.ctx, num, m->u.loc_update.rand, &a);
-    int proven = got_av == 0 && a.cell_id == cell && oc_sig_ct_equal(m->u.loc_update.res, a.xres, 8);
+    int got_av = k->st.av_get(k->st.ctx, num, rand, &a);
+    int proven = got_av == 0 && a.core == core && a.cell_id == cell && oc_sig_ct_equal(res, a.xres, 8);
     int got = k->st.sub_get(k->st.ctx, num, &s);
     if (got == OC_CORE_STORE_FAILED) { /* fail closed (oc_core_store.h): no cancel, no location */
         oc_core_logf(k, "cell %u: location claim for %08x: subscriber read FAILED", (unsigned)cell, (unsigned)tmid);
@@ -91,8 +108,8 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         const char *why = proven                             ? NULL
                           : got_av == OC_CORE_STORE_FAILED ? "stale claim, proof unknown"
                                                            : "unproven stale claim";
-        oc_core_loc_send_cancel(k, num, cell, tmid, off ? OC_CORE_CANCEL_DISABLED : OC_CORE_CANCEL_REACTIVATED, NULL,
-                                why);
+        oc_core_loc_send_cancel(k, num, core, cell, tmid, off ? OC_CORE_CANCEL_DISABLED : OC_CORE_CANCEL_REACTIVATED,
+                                NULL, why);
         goto done;
     }
     if (!proven) {
@@ -106,7 +123,8 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         goto done;
     }
     int had = got == 0;
-    if (!had || old.cell_id != cell) {
+    int here = had && old.core == core && old.cell_id == cell;
+    if (!here) {
         /* §19.2: not older than the location, nor than any vector another
          * cell has proved (those rows outlive a purged or expired location
          * as long as this claim's vector can be replayed) */
@@ -115,7 +133,7 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
          * stale replay the other floor alone might miss (e.g. no confirmed
          * row survives a purge) - do not "simplify" this away. */
         if (had) floor = old.sqn;
-        got = k->st.av_newest_confirmed(k->st.ctx, num, 0, cell, &top);
+        got = k->st.av_newest_confirmed(k->st.ctx, num, core, cell, &top);
         if (got == OC_CORE_STORE_FAILED) { /* no floor known: refused, not waved through */
             oc_core_logf(k, "cell %u: location claim for %08x: vector read FAILED", (unsigned)cell,
                          (unsigned)tmid);
@@ -130,12 +148,11 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
             /* the claim's own RAND: a newer registration there stays. Its
              * own audit detail, apart from a normal move's cancel, so an
              * operator can alert on replays */
-            oc_core_loc_send_cancel(k, num, cell, tmid, OC_CORE_CANCEL_MOVED, m->u.loc_update.rand,
-                                    "older claim refused");
+            oc_core_loc_send_cancel(k, num, core, cell, tmid, OC_CORE_CANCEL_MOVED, rand, "older claim refused");
             goto done;
         }
     }
-    int moved = had && (old.cell_id != cell || old.tmid != tmid);
+    int moved = had && (!here || old.tmid != tmid);
     /* REGISTER is audited when the location changes - the first one, a
      * move or a new binding, or one that had lapsed (a new boot purged it,
      * or it expired) - or when a fresh authentication proves it (the
@@ -150,17 +167,23 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     memcpy(l.number, num, OC_SIG_NUMBER_LEN);
     l.cell_id = cell;
     l.tmid = tmid;
+    l.core = core;
     got = k->st.netkey_get(k->st.ctx, k->cfg.key_id, &key);
     if (got == OC_CORE_STORE_FAILED) { /* the period the location lasts: refused, not guessed */
         oc_core_logf(k, "cell %u: location claim for %08x: network key read FAILED", (unsigned)cell, (unsigned)tmid);
         goto done;
     }
-    l.expires = oc_core_unix(k) + 2u * (got == 0 ? key.period_s : 1800u);
+    if (core != 0) { /* the serving core's period, not this one's (OCSS spec §4.3) */
+        life_s = life_s < OC_CORE_LIFE_MIN_S ? OC_CORE_LIFE_MIN_S : life_s > OC_CORE_LIFE_MAX_S ? OC_CORE_LIFE_MAX_S : life_s;
+        l.expires = oc_core_unix(k) + life_s;
+    } else {
+        l.expires = oc_core_unix(k) + 2u * (got == 0 ? key.period_s : 1800u);
+    }
     /* the newest vector that proved it: the same cell re-sending an older
      * claim refreshes the location without lowering it */
     int keep = had && !moved && old.sqn > a.sqn;
     l.sqn = keep ? old.sqn : a.sqn;
-    memcpy(l.rand, keep ? old.rand : m->u.loc_update.rand, 16);
+    memcpy(l.rand, keep ? old.rand : rand, 16);
     a.confirmed = 1;
     if (oc_core_begin(k) != 0) goto done;
     k->st.av_put(k->st.ctx, &a);
@@ -171,34 +194,33 @@ static void on_loc_update(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     }
     /* §7.8, naming the registration it cancels: if the terminal has since
      * registered there again (a LOC_UPDATE still on its way), that one stays */
-    if (moved) oc_core_loc_send_cancel(k, num, old.cell_id, old.tmid, OC_CORE_CANCEL_MOVED, old.rand, NULL);
-    if (changed) oc_core_audit(k, OC_CORE_AUDIT_REGISTER, num, tmid, cell, NULL);
+    ok = 1;
+    if (moved) oc_core_loc_send_cancel(k, num, old.core, old.cell_id, old.tmid, OC_CORE_CANCEL_MOVED, old.rand, NULL);
+    if (changed) {
+        char d[32];
+        if (core != 0) snprintf(d, sizeof(d), "via core %u", (unsigned)core);
+        oc_core_audit(k, OC_CORE_AUDIT_REGISTER, num, tmid, cell, core != 0 ? d : NULL);
+    }
 done:
     oc_sig_wipe(a.xres, sizeof(a.xres));
     oc_sig_wipe(s.k, sizeof(s.k));
     oc_sig_wipe(s.opc, sizeof(s.opc));
     oc_sig_wipe(key.sk, sizeof(key.sk));
+    return ok;
 }
 
 /* Not wrapped in begin/commit: one write, already durable on its own
  * (oc_core_store.h). loc_del's result is checked: a genuine failure (not
  * "nothing to delete", since loc_get above just found it) is logged rather
  * than silently believed. */
-static void on_loc_purge(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
+void oc_core_reg_purge(oc_core_t *k, uint16_t core, uint32_t cell, uint32_t tmid, const uint8_t number[OC_SIG_NUMBER_LEN])
 {
     oc_core_loc_t l;
-    if (k->st.loc_get(k->st.ctx, m->u.loc_purge.number, &l) == 0 && l.cell_id == cell &&
-        l.tmid == m->u.loc_purge.tmid) {
-        if (k->st.loc_del(k->st.ctx, m->u.loc_purge.number) != 0) {
+    if (k->st.loc_get(k->st.ctx, number, &l) == 0 && l.core == core && l.cell_id == cell && l.tmid == tmid) {
+        if (k->st.loc_del(k->st.ctx, number) != 0) {
             oc_core_logf(k, "cell %u: LOC_PURGE: location delete failed", (unsigned)cell);
         }
     }
-}
-
-void oc_core_reg_rx(oc_core_t *k, uint32_t cell_id, const oc_core_msg_t *m)
-{
-    if (m->type == OC_CORE_LOC_UPDATE) on_loc_update(k, cell_id, m);
-    if (m->type == OC_CORE_LOC_PURGE) on_loc_purge(k, cell_id, m);
 }
 
 void oc_core_reg_tick(oc_core_t *k)

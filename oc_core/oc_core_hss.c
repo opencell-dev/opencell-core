@@ -10,9 +10,33 @@
 #include "oc_sig_hss.h"
 #include "oc_sig_keys.h" /* oc_sig_wipe */
 
-static int home_number(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN])
+int oc_core_home_number(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN])
 {
     return oc_core_route_home(&k->route, oc_core_route_find(&k->route, number));
+}
+#define home_number oc_core_home_number
+
+/* An answer (ACT_RES, AV_RES; m->type the §6 one) to whoever asked: the
+ * cell, or over OCSS to the serving core that relayed it (OCSS spec §4.2:
+ * the same body, the OCSS type). */
+static void reply(oc_core_t *k, const oc_core_src_t *src, oc_core_msg_t *m)
+{
+    if (src->core == 0) {
+        oc_core_send(k, src->cell, m);
+        return;
+    }
+    m->type = (uint8_t)(m->type + OC_OCSS_OFFSET);
+    if (oc_core_peer_send(k, src->core, m) != 0) {
+        oc_core_logf(k, "peer %u: answer %02x not sent (no link)", (unsigned)src->core, (unsigned)m->type);
+    }
+}
+
+/* The audit's detail for a request a serving core relayed. */
+static const char *via(const oc_core_src_t *src, char *buf, size_t cap)
+{
+    if (src->core == 0) return NULL;
+    snprintf(buf, cap, "via core %u", (unsigned)src->core);
+    return buf;
 }
 
 /* Single exit: the record read to check for a duplicate (its K and OPc)
@@ -162,7 +186,7 @@ int oc_core_sub_disable(oc_core_t *k, const uint8_t number[OC_SIG_NUMBER_LEN], u
         oc_core_logf(k, "sub_disable %08x: location delete failed", (unsigned)l.tmid);
     }
     if (k->st.commit(k->st.ctx) != 0) goto done;
-    if (had_loc) oc_core_loc_send_cancel(k, number, l.cell_id, l.tmid, OC_CORE_CANCEL_DISABLED, NULL, NULL);
+    if (had_loc) oc_core_loc_send_cancel(k, number, l.core, l.cell_id, l.tmid, OC_CORE_CANCEL_DISABLED, NULL, NULL);
     oc_core_audit(k, OC_CORE_AUDIT_SUB_DISABLE, number, s.tmid, 0, NULL);
     ret = 0;
 done:
@@ -276,11 +300,14 @@ static int num_eq(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, OC_S
  * old session once the bind that replaces it is durable, and never on a
  * bind that the store then failed to keep). Single exit: every path wipes
  * the key material it touched. */
-static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
+void oc_core_hss_act(oc_core_t *k, const oc_core_src_t *src, uint32_t tmid, const uint8_t token_id[8],
+                     const uint8_t pkt[32], const uint8_t tag[8])
 {
     static const uint8_t none[OC_SIG_NUMBER_LEN] = { 0 };
-    const uint8_t *tid = m->u.act_fwd.token_id;
-    uint32_t tmid = m->u.act_fwd.tmid;
+    const uint8_t *tid = token_id;
+    uint32_t cell = src->cell;
+    char vbuf[24];
+    const char *vd = via(src, vbuf, sizeof(vbuf));
     oc_core_token_t tok;
     oc_core_sub_t sub, other;
     oc_core_netkey_t key;
@@ -334,13 +361,14 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
         memcpy(t.bound_k, sub.k, 16);
     }
     r.type = OC_CORE_ACT_RES;
-    r.u.act_res.req = m->u.act_fwd.req;
+    r.u.act_res.req = src->req;
     r.u.act_res.tmid = tmid;
-    int res = oc_sig_act_answer(&t, key.sk, oc_core_unix(k), tmid, tid, m->u.act_fwd.pkt, m->u.act_fwd.tag,
+    int res = oc_sig_act_answer(&t, key.sk, oc_core_unix(k), tmid, tid, pkt, tag,
                                 known ? sub.number : none, &r.u.act_res.msg, kk, opc);
     if (res == OC_SIG_ACT_REFUSED) {
         char d[48];
-        snprintf(d, sizeof(d), "reason %u", r.u.act_res.msg.u.act_nak.reason);
+        snprintf(d, sizeof(d), "reason %u%s%s", r.u.act_res.msg.u.act_nak.reason, vd != NULL ? ", " : "",
+                 vd != NULL ? vd : "");
         oc_core_audit(k, OC_CORE_AUDIT_ACT_FAIL, known ? sub.number : NULL, tmid, cell, d);
     } else if (res == OC_SIG_ACT_FRESH) {
         int got_tmid = k->st.sub_by_tmid(k->st.ctx, tmid, &other);
@@ -395,20 +423,22 @@ static void on_act_fwd(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
             goto done; /* the terminal retries; no LOC_CANCEL either: nothing actually changed */
         }
         if (had_loc_other) {
-            oc_core_loc_send_cancel(k, other.number, loc_other.cell_id, loc_other.tmid, OC_CORE_CANCEL_REACTIVATED,
-                                    NULL, NULL);
+            oc_core_loc_send_cancel(k, other.number, loc_other.core, loc_other.cell_id, loc_other.tmid,
+                                    OC_CORE_CANCEL_REACTIVATED, NULL, NULL);
         }
         if (had_loc_self) {
-            oc_core_loc_send_cancel(k, sub.number, loc_self.cell_id, loc_self.tmid, OC_CORE_CANCEL_REACTIVATED, NULL,
-                                    NULL);
+            oc_core_loc_send_cancel(k, sub.number, loc_self.core, loc_self.cell_id, loc_self.tmid,
+                                    OC_CORE_CANCEL_REACTIVATED, NULL, NULL);
         }
-        oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, NULL);
+        oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, vd);
+        oc_core_tmid_learn(k, tmid, k->cfg.core_id);
+        oc_core_visit_bound(k, tmid); /* another core that had it bound lets it go (OCSS spec §4.2) */
     } else if (res == OC_SIG_ACT_AGAIN) {
         /* the bound terminal asking again (its ACT_ACK was lost): nothing
          * changes, but the answer it gets is on record */
-        oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, "again");
+        oc_core_audit(k, OC_CORE_AUDIT_ACTIVATE, sub.number, tmid, cell, vd != NULL ? "again, relayed" : "again");
     }
-    oc_core_send(k, cell, &r);
+    reply(k, src, &r);
 done:
     oc_sig_wipe(kk, sizeof(kk));
     oc_sig_wipe(opc, sizeof(opc));
@@ -446,9 +476,11 @@ static uint8_t av_status(oc_core_t *k, uint32_t tmid, oc_core_sub_t *sub)
  * core issued to the number, and SQN_HE
  * only ever moves forward, never back to a replayed (RAND, AUTS). Single
  * exit: every path wipes the key material it touched. */
-static void answer_av(oc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, unsigned count, const uint8_t *rand,
-                      const uint8_t *auts)
+void oc_core_hss_av(oc_core_t *k, const oc_core_src_t *src, uint32_t tmid, unsigned count, const uint8_t *rand,
+                    const uint8_t *auts)
 {
+    uint32_t cell = src->cell;
+    uint16_t req = src->req;
     oc_core_msg_t r;
     oc_core_sub_t sub;
     oc_core_av_issued_t iss[OC_CORE_AV_MAX];
@@ -507,6 +539,7 @@ static void answer_av(oc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
             oc_sig_wipe(&full, sizeof(full));
             iss[i].sqn = sqn;
             iss[i].cell_id = cell;
+            iss[i].core = src->core;
             iss[i].issued = oc_core_unix(k);
         }
         if (!ok) {
@@ -533,7 +566,7 @@ static void answer_av(oc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
         }
     }
     r.u.av_res.status = st;
-    oc_core_send(k, cell, &r);
+    reply(k, src, &r);
     oc_sig_wipe(sub.k, sizeof(sub.k));
     oc_sig_wipe(sub.opc, sizeof(sub.opc));
     oc_sig_wipe(ms, sizeof(ms));
@@ -543,22 +576,5 @@ static void answer_av(oc_core_t *k, uint32_t cell, uint16_t req, uint32_t tmid, 
         oc_sig_wipe(r.u.av_res.av[i].hxres, sizeof(r.u.av_res.av[i].hxres));
         oc_sig_wipe(r.u.av_res.av[i].ck, sizeof(r.u.av_res.av[i].ck));
         oc_sig_wipe(r.u.av_res.av[i].ik, sizeof(r.u.av_res.av[i].ik));
-    }
-}
-
-void oc_core_hss_rx(oc_core_t *k, uint32_t cell_id, const oc_core_msg_t *m)
-{
-    switch (m->type) {
-    case OC_CORE_ACT_FWD:
-        on_act_fwd(k, cell_id, m);
-        break;
-    case OC_CORE_AV_REQ:
-        answer_av(k, cell_id, m->u.av_req.req, m->u.av_req.tmid, m->u.av_req.count, NULL, NULL);
-        break;
-    case OC_CORE_RESYNC:
-        answer_av(k, cell_id, m->u.resync.req, m->u.resync.tmid, 1, m->u.resync.rand, m->u.resync.auts);
-        break;
-    default:
-        break;
     }
 }

@@ -47,6 +47,45 @@ static oc_core_peer_t *peer_by_id(oc_core_t *k, uint16_t core_id)
     return NULL;
 }
 
+int oc_core_peer_mob(const oc_core_t *k, uint16_t core_id)
+{
+    const oc_core_peer_t *p = peer_by_id((oc_core_t *)k, core_id);
+    return p != NULL && p->proto >= OC_OCSS_PROTO_MOB;
+}
+
+/* A token bucket (rate a second, burst) in x1000 units; first use starts
+ * full. 1: a token spent. */
+static int bucket(uint64_t now, uint32_t *tokens, uint64_t *refill, uint32_t rate, uint32_t burst)
+{
+    const uint32_t max_x1000 = burst * 1000u;
+    if (*refill == 0) {
+        *refill = now;
+        *tokens = max_x1000;
+    } else if (now > *refill) {
+        uint64_t add = (now - *refill) * rate / 1000u;
+        if (add > 0) {
+            *tokens = add >= max_x1000 - *tokens ? max_x1000 : *tokens + (uint32_t)add;
+            *refill = now;
+        }
+    }
+    if (*tokens < 1000u) return 0;
+    *tokens -= 1000u;
+    return 1;
+}
+
+int oc_core_peer_mob_allowed(oc_core_t *k, uint16_t core_id)
+{
+    oc_core_peer_t *p = peer_by_id(k, core_id);
+    if (p == NULL) return 0;
+    if (bucket(k->now, &p->mob_tokens_x1000, &p->mob_refill_us, OC_CORE_MOB_RATE_HZ, OC_CORE_MOB_BURST)) return 1;
+    if (k->now >= p->mob_log_at) {
+        oc_core_logf(k, "peer %u: mobility rate limit (%u/s, burst %u): dropping until it slows down",
+                     (unsigned)core_id, OC_CORE_MOB_RATE_HZ, OC_CORE_MOB_BURST);
+        p->mob_log_at = k->now + 1000000ull;
+    }
+    return 0;
+}
+
 uint8_t oc_core_peer_form(const oc_core_t *k, uint16_t core_id)
 {
     /* peer_by_id is the one lookup and is shared with writers; this reads only */
@@ -132,7 +171,7 @@ static void hello_out(oc_core_t *k, oc_core_peer_t *p, uint8_t type)
         m.u.peer_hello.proto = p->proto;
     }
     m.u.peer_hello.core_id = k->cfg.core_id;
-    m.u.peer_hello.table_ver = 0; /* the block table is the config's: no signed table yet */
+    m.u.peer_hello.table_ver = k->table_ver; /* the signed table's root version; 0: config lines (OCSS spec §3.6) */
     send_peer(k, p, &m);
 }
 
@@ -176,6 +215,10 @@ static void up(oc_core_t *k, oc_core_peer_t *p)
     p->up = 1;
     oc_core_logf(k, "peer %u: up (link %u, %s, OCSS %u)", (unsigned)p->core_id, (unsigned)p->link,
                  p->dialer ? "dialled" : "accepted", (unsigned)p->proto);
+    if (p->table_ver != k->table_ver) { /* not passed between cores yet (OCSS spec §12 ruling 6) */
+        oc_core_logf(k, "peer %u: routing table %u here, %u there", (unsigned)p->core_id, (unsigned)k->table_ver,
+                     (unsigned)p->table_ver);
+    }
 }
 
 static void refuse(oc_core_t *k, oc_core_peer_t *p, uint8_t reason, unsigned claimed)
@@ -207,6 +250,7 @@ void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64
             refuse(k, p, OC_OCSS_NAK_WRONG_CORE, m->u.peer_hello.core_id);
         } else {
             p->proto = m->u.peer_hello.proto;
+            p->table_ver = m->u.peer_hello.table_ver;
             hello_out(k, p, OC_OCSS_HELLO_ACK);
             up(k, p);
         }
@@ -216,6 +260,7 @@ void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64
         if (m->u.peer_hello.core_id != p->core_id) {
             refuse(k, p, OC_OCSS_NAK_WRONG_CORE, m->u.peer_hello.core_id);
         } else {
+            p->table_ver = m->u.peer_hello.table_ver;
             up(k, p);
         }
         return;
@@ -241,6 +286,22 @@ void oc_core_peer_rx(oc_core_t *k, uint32_t link, const oc_core_msg_t *m, uint64
     case OC_OCSS_CALL_RELEASE:
     case OC_OCSS_MEDIA:
         if (p->up) oc_core_sw_peer_rx(k, p->core_id, m);
+        return;
+    case OC_OCSS_TMID_BOUND:
+    case OC_OCSS_ACT_RELAY:
+    case OC_OCSS_ACT_RES:
+    case OC_OCSS_AV_RELAY:
+    case OC_OCSS_AV_RES:
+    case OC_OCSS_RESYNC_RELAY:
+    case OC_OCSS_LOC_UPDATE:
+    case OC_OCSS_LOC_PURGE:
+    case OC_OCSS_LOC_CANCEL:
+    case OC_OCSS_LOC_ACK:
+    case OC_OCSS_LOCATE:
+    case OC_OCSS_LOCATE_RES:
+    case OC_OCSS_CDR:
+        /* OCSS 3 (OCSS spec §4): only from an up link that said so */
+        if (p->up && p->proto >= OC_OCSS_PROTO_MOB) oc_core_visit_peer_rx(k, p->core_id, m);
         return;
     default:
         return; /* PONG, and anything that is not OCSS */

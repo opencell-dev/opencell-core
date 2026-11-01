@@ -124,7 +124,7 @@ static uint8_t leg_form(const oc_core_t *k, const oc_core_leg_t *leg)
 static int leg_send(oc_core_t *k, const oc_core_leg_t *leg, oc_core_msg_t *m)
 {
     int r;
-    if (is_service(leg)) return 0;
+    if (is_service(leg) || leg->kind == OC_CORE_LEG_NONE) return 0;
     m->form = leg_form(k, leg);
     if (leg->kind == OC_CORE_LEG_PEER) {
         m->type = (uint8_t)(m->type + OC_OCSS_OFFSET);
@@ -233,6 +233,7 @@ static void end_call(oc_core_t *k, oc_core_call_t *c, uint8_t cause)
                      (unsigned)c->relay_dropped);
     }
     cdr(k, c, cause);
+    if (c->used) oc_core_visit_cdr(k, c, cause); /* the parties' home cores get a copy (OCSS spec §4.4) */
     oc_core_logf(k, "call %08x/%08x ended, cause %u", (unsigned)c->a.ref, (unsigned)c->b.ref, cause);
     c->used = 0;
 }
@@ -313,24 +314,43 @@ static oc_core_call_t *new_call(oc_core_t *k, oc_core_call_t *full, const uint8_
     return c;
 }
 
-/* Where a call to `called` goes from this core (core test services spec
- * §6.3): 0 with to's kind (and its cell or peer) set, or the cause to
- * release the call with. A call that came over OCSS (from_peer) is never
- * sent on to another core: a number whose block this core is not home for
- * is unreachable then, so no call can loop between cores. */
-static uint8_t resolve(oc_core_t *k, const uint8_t *called, int from_peer, oc_core_leg_t *to)
+/* Where a call to `called` goes from this core (OCSS spec 2026-11-01 §4.4,
+ * the table there): 0 with to's kind (and its cell or peer) set, or the
+ * cause to release the call with. *locate set: to is OC_CORE_LEG_NONE and
+ * the callee's home (*locate) must be asked where it is first. A call that
+ * came over OCSS (from_peer) is never sent on to another core, so no call
+ * can loop between cores. X's own location row for the callee is either
+ * its own subscriber's (on one of its cells, core 0, or on another core),
+ * or a visitor row (core 0, a number homed elsewhere). */
+static uint8_t resolve(oc_core_t *k, const uint8_t *called, int from_peer, oc_core_leg_t *to, uint16_t *locate)
 {
     oc_core_sub_t s;
     oc_core_loc_t l;
     int got;
     uint8_t why = 0;
+    *locate = 0;
     if ((to->kind = service(k, called)) != 0) return 0;
     const oc_core_block_t *b = oc_core_route_find(&k->route, called);
     if (b == NULL) return OC_SIG_CAUSE_UNREACHABLE; /* no route: not 883, or no block */
     if (!oc_core_route_home(&k->route, b)) {
+        got = oc_core_loc_live(k, called, &l);
+        if (got == OC_CORE_STORE_FAILED) {
+            oc_core_logf(k, "route: visitor location read FAILED");
+            return OC_SIG_CAUSE_NET_FAILURE;
+        }
+        if (got == 0 && l.core == 0) { /* a visitor on one of this core's cells */
+            if (!oc_core_linked(k, l.cell_id)) return OC_SIG_CAUSE_NET_FAILURE;
+            to->cell = l.cell_id;
+            return 0;
+        }
         if (from_peer) return OC_SIG_CAUSE_UNREACHABLE;
         if (!oc_core_peer_linked(k, b->home_core)) return OC_SIG_CAUSE_NET_FAILURE; /* its home core is cut off */
-        to->kind = OC_CORE_LEG_PEER;
+        if (oc_core_peer_mob(k, b->home_core)) {
+            to->kind = OC_CORE_LEG_NONE;
+            *locate = b->home_core;
+            return 0;
+        }
+        to->kind = OC_CORE_LEG_PEER; /* an OCSS 1-2 home: straight to it, as v0.6.0 */
         to->peer = b->home_core;
         return 0;
     }
@@ -345,6 +365,15 @@ static uint8_t resolve(oc_core_t *k, const uint8_t *called, int from_peer, oc_co
         why = OC_SIG_CAUSE_NET_FAILURE;
     } else if (got != 0) {
         why = OC_SIG_CAUSE_UNREACHABLE; /* registered nowhere */
+    } else if (l.core != 0) { /* visiting another core */
+        if (from_peer) {
+            why = OC_SIG_CAUSE_UNREACHABLE; /* never sent on */
+        } else if (!oc_core_peer_linked(k, l.core)) {
+            why = OC_SIG_CAUSE_NET_FAILURE;
+        } else {
+            to->kind = OC_CORE_LEG_PEER;
+            to->peer = l.core;
+        }
     } else if (!oc_core_linked(k, l.cell_id)) {
         why = OC_SIG_CAUSE_NET_FAILURE; /* the callee's cell is cut off */
     } else {
@@ -385,11 +414,23 @@ static uint8_t service_codec(const oc_core_t *k, oc_core_call_t *c)
 }
 
 /* Leg b is resolved: a service rings at once; a cell is offered the call;
- * a peer is asked to set it up. */
-static void start_b(oc_core_t *k, oc_core_call_t *c)
+ * a peer is asked to set it up. locate: b is not resolved yet, the home
+ * core is asked where the callee is (OCSS spec §4.4). */
+static void start_b(oc_core_t *k, oc_core_call_t *c, uint16_t locate)
 {
     oc_core_msg_t o;
     memset(&o, 0, sizeof(o));
+    if (locate != 0) {
+        c->b.kind = OC_CORE_LEG_NONE;
+        c->locate = oc_core_visit_locate(k, locate, c->called);
+        if (c->locate == 0) {
+            refused(k, c, OC_SIG_CAUSE_NET_FAILURE);
+            return;
+        }
+        c->state = OC_CORE_CALL_LOCATING;
+        c->due = k->now + OC_CORE_SETUP_US;
+        return;
+    }
     if (is_service(&c->b)) {
         if (c->b.kind == OC_CORE_LEG_STREAM) c->stream = (uint8_t)stream_of(k, c->called);
         if ((c->codec = service_codec(k, c)) == OC_CODEC_NONE) {
@@ -449,6 +490,7 @@ static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
 {
     oc_core_leg_t *leg, *other;
     oc_core_loc_t la;
+    uint16_t locate = 0;
     if ((m->u.call_route.leg_ref & OC_CORE_REF_CORE) != 0 || find(k, cell, m->u.call_route.leg_ref, &leg, &other)) {
         return; /* not a cell's ref, or a leg already routed */
     }
@@ -459,20 +501,20 @@ static void on_route(oc_core_t *k, uint32_t cell, const oc_core_msg_t *m)
     uint8_t why = 0;
     if (c == &full) {
         why = OC_SIG_CAUSE_NET_FAILURE;
-    } else if (oc_core_loc_live(k, c->caller, &la) != 0 || la.cell_id != cell) {
+    } else if (oc_core_loc_live(k, c->caller, &la) != 0 || la.core != 0 || la.cell_id != cell) {
         /* a cell calls only as a subscriber registered on it */
         oc_core_logf(k, "cell %u: CALL_ROUTE from a caller not registered there", (unsigned)cell);
         why = OC_SIG_CAUSE_NET_FAILURE;
     } else if (c->caps == 0) {
         why = OC_SIG_CAUSE_NO_CODEC; /* nothing offered (ruling R6) */
     } else {
-        why = resolve(k, c->called, 0, &c->b);
+        why = resolve(k, c->called, 0, &c->b, &locate);
     }
     if (why != 0) {
         refused(k, c, why);
         return;
     }
-    start_b(k, c);
+    start_b(k, c, locate);
 }
 
 /* 1 if ref is a call_ref the peer (the calling core here) could legitimately
@@ -515,9 +557,17 @@ static void on_setup(oc_core_t *k, uint16_t peer, const oc_core_msg_t *m)
         reject_setup(k, peer, m->u.setup.call_ref, OC_SIG_CAUSE_NET_FAILURE, "bad call_ref (review I1)");
         return;
     }
+    /* the peer vouches for its own subscriber; this core's own subscriber
+     * only if this core has it located on that peer (OCSS spec §4.4) */
     const oc_core_block_t *cb = oc_core_route_find(&k->route, m->u.setup.caller);
-    if (cb == NULL || cb->home_core != peer) {
-        reject_setup(k, peer, m->u.setup.call_ref, OC_SIG_CAUSE_NET_FAILURE, "caller not in the peer's block (review M1)");
+    int admit = cb != NULL && cb->home_core == peer;
+    if (!admit && oc_core_route_home(&k->route, cb)) {
+        oc_core_loc_t lc;
+        admit = oc_core_loc_live(k, m->u.setup.caller, &lc) == 0 && lc.core == peer;
+    }
+    if (!admit) {
+        reject_setup(k, peer, m->u.setup.call_ref, OC_SIG_CAUSE_NET_FAILURE,
+                     "caller neither the peer's nor located on it (review M1, OCSS spec §4.4)");
         return;
     }
     if (!oc_core_peer_setup_allowed(k, peer)) { /* already logged, at most once a second (review M3) */
@@ -538,13 +588,14 @@ static void on_setup(oc_core_t *k, uint16_t peer, const oc_core_msg_t *m)
     } else if (c->caps == 0) {
         why = OC_SIG_CAUSE_NO_CODEC;
     } else {
-        why = resolve(k, c->called, 1, &c->b);
+        uint16_t locate = 0; /* from a peer: never (resolve sends nothing on) */
+        why = resolve(k, c->called, 1, &c->b, &locate);
     }
     if (why != 0) {
         refused(k, c, why);
         return;
     }
-    start_b(k, c);
+    start_b(k, c, 0);
 }
 
 /* A message about an existing leg, whoever sent it; type is the §6 type
@@ -771,7 +822,10 @@ static uint64_t call_due(const oc_core_t *k, const oc_core_call_t *c)
         }
         return c->due;
     }
-    if (c->state == OC_CORE_CALL_ROUTING || (c->state == OC_CORE_CALL_ALERTING && is_service(&c->b))) return c->due;
+    if (c->state == OC_CORE_CALL_ROUTING || c->state == OC_CORE_CALL_LOCATING ||
+        (c->state == OC_CORE_CALL_ALERTING && is_service(&c->b))) {
+        return c->due;
+    }
     if (c->state == OC_CORE_CALL_ACTIVE && (c->b.kind == OC_CORE_LEG_PLAY || c->b.kind == OC_CORE_LEG_STREAM)) {
         return c->play_next < c->due ? c->play_next : c->due;
     }
@@ -801,7 +855,8 @@ uint64_t oc_core_due(const oc_core_t *k)
         uint64_t d = stream_due(k, ch);
         if (d < due) due = d;
     }
-    return due;
+    uint64_t d = oc_core_visit_due(k);
+    return d < due ? d : due;
 }
 
 void oc_core_sw_tick(oc_core_t *k)
@@ -813,7 +868,7 @@ void oc_core_sw_tick(oc_core_t *k)
     for (unsigned i = 0; i < OC_CORE_CALLS; i++) {
         oc_core_call_t *c = &k->calls[i];
         if (k->now < call_due(k, c)) continue; /* also: not used, or nothing to do */
-        if (c->state == OC_CORE_CALL_ROUTING) { /* no alert or release from the callee's side in 10 s */
+        if (c->state == OC_CORE_CALL_ROUTING || c->state == OC_CORE_CALL_LOCATING) { /* no alert or release from the callee's side in 10 s */
             to_leg(k, &c->a, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NET_FAILURE);
             to_leg(k, &c->b, OC_CORE_CALL_RELEASE, OC_SIG_CAUSE_NET_FAILURE);
             end_call(k, c, OC_SIG_CAUSE_NET_FAILURE);
@@ -855,4 +910,36 @@ static int on_cell(const oc_core_leg_t *l, uint32_t id) { return l->kind == OC_C
 static int on_peer(const oc_core_leg_t *l, uint32_t id) { return l->kind == OC_CORE_LEG_PEER && l->peer == id; }
 
 void oc_core_sw_cell_gone(oc_core_t *k, uint32_t cell_id) { gone(k, on_cell, cell_id); }
+
+void oc_core_sw_located(oc_core_t *k, uint16_t req, uint8_t status, uint16_t core, uint32_t cell)
+{
+    oc_core_call_t *c = NULL;
+    for (unsigned i = 0; i < OC_CORE_CALLS && c == NULL; i++) {
+        oc_core_call_t *x = &k->calls[i];
+        if (x->used && x->state == OC_CORE_CALL_LOCATING && x->locate == req) c = x;
+    }
+    if (c == NULL) return; /* ended meanwhile */
+    c->locate = 0;
+    uint8_t why = 0;
+    if (status == OC_OCSS_LOC_NOT_REACHABLE || status == OC_OCSS_LOC_NOT_HOME) {
+        why = OC_SIG_CAUSE_UNREACHABLE;
+    } else if (status != OC_OCSS_LOC_OK) {
+        why = OC_SIG_CAUSE_NET_FAILURE;
+    } else if (core == k->cfg.core_id) { /* on one of this core's cells */
+        c->b.kind = OC_CORE_LEG_CELL;
+        c->b.cell = cell;
+        if (cell == 0 || !oc_core_linked(k, cell)) why = cell == 0 ? OC_SIG_CAUSE_UNREACHABLE : OC_SIG_CAUSE_NET_FAILURE;
+    } else {
+        c->b.kind = OC_CORE_LEG_PEER;
+        c->b.cell = 0;
+        c->b.peer = core;
+        if (!oc_core_peer_linked(k, core)) why = OC_SIG_CAUSE_NET_FAILURE;
+    }
+    if (why != 0) {
+        c->b.kind = OC_CORE_LEG_NONE;
+        refused(k, c, why);
+        return;
+    }
+    start_b(k, c, 0);
+}
 void oc_core_sw_peer_gone(oc_core_t *k, uint16_t core_id) { gone(k, on_peer, core_id); }
